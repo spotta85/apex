@@ -40,15 +40,15 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from apex.backends.fake_backend import FakeBackend
-from apex.checkpoint_index import get_tensor_shape, read_safetensors_index
 from apex.dequant import dequantize_bundle
 from apex.moe_layer import route, run_moe_layer
 from apex.quantized_safetensors_store import QuantizedSafetensorsExpertStore
-from apex.safetensors_loader import load_tensor
 from apex.weight_layout import get_layout
-
-
-DEFAULT_PATH = "/Users/spotta/Desktop/models/Gemma-4-26B-A4B-NVFP4"
+from scripts._real_moe_helpers import (
+    add_real_moe_args,
+    load_router,
+    nvfp4_matmul_warnings,
+)
 
 
 def main():
@@ -67,17 +67,10 @@ def main():
     # config.json `ignore` list) and probe its shape so we can build a
     # matching fake hidden state without hard-coding hidden_dim.
     router_name = layout.gate_weight(args.layer)
-    router_shape = get_tensor_shape(path, router_name)  # (num_experts, hidden)
-    num_experts, hidden_dim = router_shape
-    print(f"[load] router {router_name!r} shape={router_shape}")
-
-    # Resolve which shard owns the router and load it. load_tensor only
-    # accepts a single .safetensors file path, so we go through the
-    # checkpoint index helper to find the right shard ourselves.
-    weight_map = read_safetensors_index(path)
-    router_path = path / weight_map[router_name]
     t0 = time.perf_counter()
-    router = load_tensor(router_path, router_name)
+    router, num_experts, hidden_dim = load_router(path, layout, args.layer)
+    router_shape = (num_experts, hidden_dim)
+    print(f"[load] router {router_name!r} shape={router_shape}")
     print(f"[load] router fp32 shape={router.shape} dtype={router.dtype} "
           f"in {(time.perf_counter() - t0) * 1000:.1f} ms")
 
@@ -91,7 +84,7 @@ def main():
     # filter is for the same reason as the expert SwiGLU below: a real
     # BF16 router has a wide enough dynamic range to trip transient
     # over/underflow warnings even though the final logits are finite.
-    with np.errstate(over="ignore", under="ignore", invalid="ignore", divide="ignore"):
+    with nvfp4_matmul_warnings():
         expert_ids, weights = route(hidden, router, top_k=args.top_k)
     selected = expert_ids[0].tolist()
     routing_weights = weights[0]
@@ -121,7 +114,7 @@ def main():
     # Without this filter the smoke output is unreadable.
     backend = FakeBackend()
     t0 = time.perf_counter()
-    with np.errstate(over="ignore", under="ignore", invalid="ignore", divide="ignore"):
+    with nvfp4_matmul_warnings():
         out = run_moe_layer(hidden, selected, routing_weights, expert_loader, backend)
     layer_ms = (time.perf_counter() - t0) * 1000
 
@@ -156,14 +149,7 @@ def main():
 
 def _parse_args():
     p = argparse.ArgumentParser(description=__doc__.split("\n", 1)[0])
-    p.add_argument("--path", default=DEFAULT_PATH,
-                   help=f"checkpoint directory (default: {DEFAULT_PATH})")
-    p.add_argument("--layer", type=int, default=0,
-                   help="layer index to drive end-to-end (default: 0)")
-    p.add_argument("--top-k", type=int, default=8,
-                   help="experts to route to (default: 8, matches Gemma 4)")
-    p.add_argument("--seed", type=int, default=0,
-                   help="RNG seed for the fake hidden state (default: 0)")
+    add_real_moe_args(p, include_max_memory=False)
     return p.parse_args()
 
 

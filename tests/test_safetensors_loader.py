@@ -5,39 +5,12 @@ write BF16 / F8_E4M3) and checks the loader returns the right ndarray
 for each dtype, including the "exotic" ones.
 """
 
-import json
-
 import numpy as np
 import pytest
 from safetensors.numpy import save_file
 
 from apex.safetensors_loader import load_tensor
-
-
-def _write_minimal_safetensors(path, tensors_meta_and_bytes):
-    """Write a hand-built .safetensors file.
-
-    `tensors_meta_and_bytes` is an ordered list of
-        (name, dtype_str, shape_list, raw_bytes)
-    The bytes are written contiguously after the header in order.
-    """
-    header = {}
-    cursor = 0
-    payload = bytearray()
-    for name, dtype, shape, raw in tensors_meta_and_bytes:
-        size = len(raw)
-        header[name] = {
-            "dtype": dtype,
-            "shape": shape,
-            "data_offsets": [cursor, cursor + size],
-        }
-        payload.extend(raw)
-        cursor += size
-    header_json = json.dumps(header).encode()
-    with open(path, "wb") as f:
-        f.write(len(header_json).to_bytes(8, "little"))
-        f.write(header_json)
-        f.write(bytes(payload))
+from tests._synthetic_nvfp4 import write_safetensors
 
 
 def test_load_fp32_tensor(tmp_path):
@@ -59,7 +32,7 @@ def test_load_bf16_tensor(tmp_path):
     # fp32(0.0) = 0x00000000  → upper 16 = 0x0000
     bits = np.array([0x3F80, 0xC000, 0x4060, 0x0000], dtype=np.uint16)
     path = tmp_path / "bf16.safetensors"
-    _write_minimal_safetensors(
+    write_safetensors(
         path, [("router.weight", "BF16", [4], bits.tobytes())],
     )
 
@@ -74,7 +47,7 @@ def test_load_f8_e4m3_returns_uint8_view(tmp_path):
     # F8_E4M3 is left as uint8 for the caller (NVFP4 dequant decodes it).
     bytes_in = np.array([0x38, 0x40, 0x00, 0xB8], dtype=np.uint8)  # 1, 2, 0, -1
     path = tmp_path / "f8.safetensors"
-    _write_minimal_safetensors(
+    write_safetensors(
         path, [("scale.weight", "F8_E4M3", [4], bytes_in.tobytes())],
     )
 
@@ -109,7 +82,7 @@ def test_unsupported_dtype_raises_value_error(tmp_path):
     # itself wouldn't write this, but we want a clear failure mode if
     # a future format extends the dtype set unexpectedly.
     path = tmp_path / "weird.safetensors"
-    _write_minimal_safetensors(
+    write_safetensors(
         path, [("x", "F128_FANCY", [1], b"\x00" * 4)],
     )
 

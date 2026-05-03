@@ -39,7 +39,6 @@ class Runtime:
         prefetcher=None,
         predictor=None,
         trace_recorder=None,
-        verbose_router: bool = True,
         num_layers: int = 2,
     ):
         # Decides which experts run at each layer (ground truth).
@@ -58,10 +57,6 @@ class Runtime:
         self.predictor = predictor
         # Optional: TraceRecorder that captures real transitions to disk.
         self.trace_recorder = trace_recorder
-        # When False, suppress the per-layer "router selected experts"
-        # print. Other prints (predictor, prefetch, hits/misses) are
-        # unaffected. Default True keeps existing demo output.
-        self.verbose_router = verbose_router
         # Number of layers in the toy model. Default 2 keeps every
         # existing demo unchanged; future real-model layouts can pass
         # whatever the model actually has.
@@ -91,11 +86,10 @@ class Runtime:
             # mx.array). So we pass `hidden` directly and let the
             # router decide what to do with it.
             expert_ids = self.router.route(layer_id, hidden)
-            if self.verbose_router:
-                # `router.name` lets demos see which routing path is in
-                # use ("numpy" vs "mlx"). All routers declare a name.
-                print(f"router backend: {self.router.name}")
-                print(f"router selected experts: {list(expert_ids)}")
+            # `router.name` lets demos see which routing path is in
+            # use ("numpy" vs "mlx"). All routers declare a name.
+            print(f"router backend: {self.router.name}")
+            print(f"router selected experts: {list(expert_ids)}")
 
             # Run each chosen expert and collect its output.
             outputs = []

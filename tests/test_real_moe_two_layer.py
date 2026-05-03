@@ -21,18 +21,10 @@ Two flavors here, same pattern as tests/test_real_moe_cache.py:
      `REAL_MOE_PATH` env var (or the default download path) resolves.
 """
 
-import json
-import os
-from pathlib import Path
-
 import numpy as np
-import pytest
 
 from apex.backends.fake_backend import FakeBackend
-from apex.dequant import (
-    NVFP4_GROUP_SIZE,
-    DequantizingExpertStore,
-)
+from apex.dequant import DequantizingExpertStore
 from apex.expert_cache import ExpertCache
 from apex.expert_manager import ExpertManager
 from apex.metrics import Metrics
@@ -40,66 +32,11 @@ from apex.moe_layer import route, run_moe_layer
 from apex.quantized_safetensors_store import QuantizedSafetensorsExpertStore
 from apex.types import ExpertWeights
 from apex.weight_layout import FakeMoELayout, get_layout
-
-
-# --- synthetic-NVFP4 helpers (parallel to test_real_moe_cache.py) ---------
-
-_E4M3_ONE = 0x38
-_FP4_PACKED_ONE = 0x22
-
-
-def _write_safetensors(path: Path, items):
-    """Write a multi-tensor safetensors file with hand-built bytes."""
-    header = {}
-    cursor = 0
-    payload = bytearray()
-    for name, dtype, shape, raw in items:
-        size = len(raw)
-        header[name] = {
-            "dtype": dtype,
-            "shape": shape,
-            "data_offsets": [cursor, cursor + size],
-        }
-        payload.extend(raw)
-        cursor += size
-    header_json = json.dumps(header).encode()
-    with open(path, "wb") as f:
-        f.write(len(header_json).to_bytes(8, "little"))
-        f.write(header_json)
-        f.write(bytes(payload))
-
-
-def _build_two_layer_checkpoint(
-    path: Path, layout, num_layers: int, num_experts: int,
-    hidden: int, intermediate: int,
-):
-    """Build a single-file NVFP4 checkpoint with `num_layers` × `num_experts`.
-
-    Every expert is a "ones expert" (FP4 code 0x2 + scale 1.0 +
-    weight_scale_2 1.0) so dequant produces all-ones matrices and
-    SwiGLU output is deterministic per (hidden, intermediate, hidden_dim).
-    """
-    items = []
-    for layer_id in range(num_layers):
-        for expert_id in range(num_experts):
-            names = layout.expert_tensors(layer_id, expert_id)
-            for proj_key, weight_name in names.items():
-                if proj_key == "down_proj":
-                    rows, cols = hidden, intermediate
-                else:
-                    rows, cols = intermediate, hidden
-                prefix = weight_name[: -len(".weight")]
-                packed = np.full((rows, cols // 2), _FP4_PACKED_ONE, dtype=np.uint8)
-                scales = np.full(
-                    (rows, cols // NVFP4_GROUP_SIZE), _E4M3_ONE, dtype=np.uint8,
-                )
-                items.extend([
-                    (weight_name, "U8", list(packed.shape), packed.tobytes()),
-                    (f"{prefix}.weight_scale", "F8_E4M3", list(scales.shape), scales.tobytes()),
-                    (f"{prefix}.weight_scale_2", "F32", [], np.float32(1.0).tobytes()),
-                    (f"{prefix}.input_scale", "F32", [], np.float32(1.0).tobytes()),
-                ])
-    _write_safetensors(path, items)
+from tests._synthetic_nvfp4 import (
+    build_multi_layer_checkpoint,
+    real_checkpoint_path,
+    skip_if_no_real_checkpoint,
+)
 
 
 def _make_two_layer_stack(tmp_path, num_layers=2, num_experts=4,
@@ -107,7 +44,7 @@ def _make_two_layer_stack(tmp_path, num_layers=2, num_experts=4,
     """Wire the demo stack against a synthetic multi-layer NVFP4 checkpoint."""
     layout = FakeMoELayout()
     path = tmp_path / "two_layer_nvfp4.safetensors"
-    _build_two_layer_checkpoint(
+    build_multi_layer_checkpoint(
         path, layout, num_layers, num_experts, hidden, intermediate,
     )
 
@@ -271,29 +208,13 @@ def test_tight_budget_evicts_layer_0_when_layer_1_loads(tmp_path):
 
 # --- real-checkpoint test (skipped if missing) -----------------------------
 
-REAL_PATH_ENV = "REAL_MOE_PATH"
-DEFAULT_REAL_PATH = "/Users/spotta/Desktop/models/Gemma-4-26B-A4B-NVFP4"
-
-
-def _real_checkpoint_path():
-    candidate = os.environ.get(REAL_PATH_ENV, DEFAULT_REAL_PATH)
-    p = Path(candidate)
-    return p if p.is_dir() else None
-
-
-@pytest.mark.skipif(
-    _real_checkpoint_path() is None,
-    reason=(
-        f"real Gemma 4 NVFP4 checkpoint not found at "
-        f"{DEFAULT_REAL_PATH} (set ${REAL_PATH_ENV} to override)"
-    ),
-)
+@skip_if_no_real_checkpoint()
 def test_real_gemma_two_layer_pass_caches_correctly():
     """End-to-end on real Gemma 4 NVFP4: two layers, two passes, finite output."""
     from apex.checkpoint_index import get_tensor_shape, read_safetensors_index
     from apex.safetensors_loader import load_tensor
 
-    path = _real_checkpoint_path()
+    path = real_checkpoint_path()
     layout = get_layout("gemma-moe")
     layers = [0, 1]
     top_k = 8

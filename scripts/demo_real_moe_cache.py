@@ -37,18 +37,18 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from apex.backends.fake_backend import FakeBackend
-from apex.checkpoint_index import get_tensor_shape, read_safetensors_index
 from apex.dequant import DequantizingExpertStore
 from apex.expert_cache import ExpertCache
 from apex.expert_manager import ExpertManager
 from apex.metrics import Metrics
 from apex.moe_layer import route, run_moe_layer
 from apex.quantized_safetensors_store import QuantizedSafetensorsExpertStore
-from apex.safetensors_loader import load_tensor
 from apex.weight_layout import get_layout
-
-
-DEFAULT_PATH = "/Users/spotta/Desktop/models/Gemma-4-26B-A4B-NVFP4"
+from scripts._real_moe_helpers import (
+    add_real_moe_args,
+    load_router,
+    nvfp4_matmul_warnings,
+)
 
 
 def main():
@@ -66,10 +66,7 @@ def main():
     # --- 1. Resolve router shard + load BF16 router as fp32. The
     # router is in the model's `ignore` list so it's NOT NVFP4-quantized;
     # safetensors_loader auto-converts BF16 to fp32 on read.
-    router_name = layout.gate_weight(args.layer)
-    num_experts, hidden_dim = get_tensor_shape(path, router_name)
-    weight_map = read_safetensors_index(path)
-    router = load_tensor(path / weight_map[router_name], router_name)
+    router, _, hidden_dim = load_router(path, layout, args.layer)
     print(f"real layer {args.layer}")
 
     # --- 2. Seeded fake hidden state so routing is reproducible across
@@ -77,7 +74,7 @@ def main():
     # selection — otherwise we'd get all-misses both times).
     rng = np.random.default_rng(args.seed)
     hidden = rng.standard_normal((1, hidden_dim)).astype(np.float32)
-    with np.errstate(over="ignore", under="ignore", invalid="ignore", divide="ignore"):
+    with nvfp4_matmul_warnings():
         expert_ids, weights = route(hidden, router, top_k=args.top_k)
     selected = expert_ids[0].tolist()
     routing_weights = weights[0]
@@ -159,7 +156,7 @@ def _time_layer(hidden, selected, routing_weights, expert_loader, backend):
     # Same warning filter as smoke_real_moe_layer.py: real NVFP4 weights
     # span a wide dynamic range and trip transient overflow warnings
     # during partial sums even though the final output is finite.
-    with np.errstate(over="ignore", under="ignore", invalid="ignore", divide="ignore"):
+    with nvfp4_matmul_warnings():
         out = run_moe_layer(hidden, selected, routing_weights, expert_loader, backend)
     return out, time.perf_counter() - t0
 
@@ -172,16 +169,7 @@ def _print_run_summary(out, wall_seconds: float) -> None:
 
 def _parse_args():
     p = argparse.ArgumentParser(description=__doc__.split("\n", 1)[0])
-    p.add_argument("--path", default=DEFAULT_PATH,
-                   help=f"checkpoint directory (default: {DEFAULT_PATH})")
-    p.add_argument("--layer", type=int, default=0,
-                   help="layer index to drive end-to-end (default: 0)")
-    p.add_argument("--top-k", type=int, default=8,
-                   help="experts to route to (default: 8, matches Gemma 4)")
-    p.add_argument("--seed", type=int, default=0,
-                   help="RNG seed for the fake hidden state (default: 0)")
-    p.add_argument("--max-memory-mb", type=float, default=256,
-                   help="cache budget (default: 256 MB, fits 8 fp32 experts)")
+    add_real_moe_args(p)
     return p.parse_args()
 
 

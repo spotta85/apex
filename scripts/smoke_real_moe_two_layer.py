@@ -41,18 +41,18 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from apex.backends.fake_backend import FakeBackend
-from apex.checkpoint_index import get_tensor_shape, read_safetensors_index
 from apex.dequant import DequantizingExpertStore
 from apex.expert_cache import ExpertCache
 from apex.expert_manager import ExpertManager
 from apex.metrics import Metrics
 from apex.moe_layer import route, run_moe_layer
 from apex.quantized_safetensors_store import QuantizedSafetensorsExpertStore
-from apex.safetensors_loader import load_tensor
 from apex.weight_layout import get_layout
-
-
-DEFAULT_PATH = "/Users/spotta/Desktop/models/Gemma-4-26B-A4B-NVFP4"
+from scripts._real_moe_helpers import (
+    add_real_moe_args,
+    load_router,
+    nvfp4_matmul_warnings,
+)
 
 
 def main():
@@ -66,19 +66,17 @@ def main():
         )
 
     layout = get_layout("gemma-moe")
-    weight_map = read_safetensors_index(path)
 
     # --- 1. Pre-load both layer routers (BF16 → fp32 inside the loader).
     # Done up front so we can establish hidden_dim before the loop and
     # so router-load timing isn't tangled with per-layer compute timing.
     routers = {}
     for layer_id in args.layers:
-        name = layout.gate_weight(layer_id)
-        routers[layer_id] = load_tensor(path / weight_map[name], name)
+        routers[layer_id], num_experts, hidden_dim = load_router(path, layout, layer_id)
         if layer_id == args.layers[0]:
-            num_experts, hidden_dim = routers[layer_id].shape
+            first_num_experts, first_hidden_dim = num_experts, hidden_dim
     print(f"[load] {len(routers)} routers loaded "
-          f"(num_experts={num_experts}, hidden_dim={hidden_dim})")
+          f"(num_experts={first_num_experts}, hidden_dim={first_hidden_dim})")
 
     # --- 2. One shared cache + manager for both layers. Budget sized
     # for top_k * num_layers fp32 experts (~24 MB each on Gemma 4 ⇒
@@ -92,7 +90,7 @@ def main():
 
     # --- 3. Seeded fake hidden state (reproducible routing).
     rng = np.random.default_rng(args.seed)
-    hidden_initial = rng.standard_normal((1, hidden_dim)).astype(np.float32)
+    hidden_initial = rng.standard_normal((1, first_hidden_dim)).astype(np.float32)
 
     # --- 4. First pass: thread hidden through the layers; each layer's
     # router decides which experts to load on demand.
@@ -109,7 +107,7 @@ def main():
     assert metrics.evictions == 0, (
         f"first pass evicted {metrics.evictions} experts — bump --max-memory-mb"
     )
-    assert out_first.shape == (1, hidden_dim)
+    assert out_first.shape == (1, first_hidden_dim)
     assert np.all(np.isfinite(out_first))
     print(f"[ok] first pass: {metrics.cache_misses} misses, "
           f"{metrics.cache_hits} hits, {metrics.evictions} evictions")
@@ -158,7 +156,7 @@ def _two_layer_pass(hidden, layers, routers, manager, backend, top_k):
         # NVFP4 weights have a wide dynamic range; transient over/underflow
         # during partial sums is benign (final accum is finite). Same
         # filter pattern as scripts/smoke_real_moe_layer.py.
-        with np.errstate(over="ignore", under="ignore", invalid="ignore", divide="ignore"):
+        with nvfp4_matmul_warnings():
             ids, weights = route(hidden, routers[layer_id], top_k=top_k)
         selected = ids[0].tolist()
         routing_weights = weights[0]
@@ -166,7 +164,7 @@ def _two_layer_pass(hidden, layers, routers, manager, backend, top_k):
 
         expert_loader = lambda eid, lid=layer_id: manager.ensure_loaded(lid, eid)
         t0 = time.perf_counter()
-        with np.errstate(over="ignore", under="ignore", invalid="ignore", divide="ignore"):
+        with nvfp4_matmul_warnings():
             out = run_moe_layer(hidden, selected, routing_weights, expert_loader, backend)
         elapsed_ms = (time.perf_counter() - t0) * 1000
         print(f"  layer {layer_id}: selected={selected[:4]}... "
@@ -181,16 +179,9 @@ def _two_layer_pass(hidden, layers, routers, manager, backend, top_k):
 
 def _parse_args():
     p = argparse.ArgumentParser(description=__doc__.split("\n", 1)[0])
-    p.add_argument("--path", default=DEFAULT_PATH,
-                   help=f"checkpoint directory (default: {DEFAULT_PATH})")
+    add_real_moe_args(p, include_layer=False, default_max_memory_mb=512)
     p.add_argument("--layers", type=int, nargs="+", default=[0, 1],
                    help="layer indices to drive in sequence (default: 0 1)")
-    p.add_argument("--top-k", type=int, default=8,
-                   help="experts per layer (default: 8)")
-    p.add_argument("--seed", type=int, default=0,
-                   help="RNG seed for the fake initial hidden (default: 0)")
-    p.add_argument("--max-memory-mb", type=float, default=512,
-                   help="cache budget (default: 512 MB ⇒ holds 16 fp32 experts)")
     return p.parse_args()
 
 
