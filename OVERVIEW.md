@@ -5,7 +5,7 @@ APEX is a from-scratch Mixture-of-Experts (MoE) inference runtime focused on **b
 ## How to test
 
 ```bash
-# Full unit suite (226 tests, real-checkpoint tests skip if absent)
+# Full unit suite (234 tests, real-checkpoint tests skip if absent)
 uv run pytest -q
 
 # Seven fake-MoE demos — each exercises a different combination of
@@ -23,6 +23,8 @@ uv run python scripts/smoke_real_moe_layer.py        # one layer
 uv run python scripts/smoke_real_moe_two_layer.py    # two layers in sequence
 uv run python scripts/demo_real_moe_cache.py         # load-once / reuse-many
 uv run python scripts/demo_real_runtime.py           # real layers through Runtime
+uv run python scripts/demo_real_memory_budget.py     # tight budget + LRU eviction
+uv run python scripts/demo_real_prefetch.py          # AsyncPrefetcher on real layers
 ```
 
 Diagnostic scripts:
@@ -111,6 +113,7 @@ weighted-combine via apex.moe_layer.run_moe_layer
 | `gate_router.py` | Real top-k routing via `hidden @ gate.npy` | `GateRouter` |
 | `real_router.py` | Lazy per-layer router loading/dequant from real sharded safetensors | `MultiLayerRealRouter` |
 | `metrics.py` | Counters (cache_hit/miss/eviction, prefetch_hit/miss) | `Metrics` |
+| `memory.py` | `MemoryReport` + `snapshot(cache, metrics)` — joined budget/peak/hits/misses/evictions report with `budget_respected` predicate | `MemoryReport`, `snapshot` |
 | `trace_recorder.py` | Append-only JSONL transition log for predictor training | `TraceRecorder` |
 | `types.py` | `ExpertWeights(gate_proj, up_proj, down_proj)` | dataclass |
 
@@ -165,14 +168,16 @@ weighted-combine via apex.moe_layer.run_moe_layer
 | `demo_real_moe_cache.py` | First-run misses + second-run hits on real Gemma 4 layer 0 (step 10) — ~167x speedup |
 | `smoke_real_moe_two_layer.py` | Drives two real MoE layers in sequence; cache key disambiguates by `(layer, expert)` (step 11) |
 | `demo_real_runtime.py` | Drives real Gemma 4 MoE layers through `Runtime` with cold/warm cache checks (step 12) |
+| `demo_real_memory_budget.py` | Drives real Gemma under a small `--max-memory-mb`; LRU eviction enforces the budget; final `MemoryReport` reports peak vs budget (step 14) |
+| `demo_real_prefetch.py` | Drives real Gemma 2 layers through `Runtime` with `AsyncPrefetcher`; layer 1 served from prefetched cache; reports `prefetch_hit_rate` (step 15) |
 
 ### `tests/`
 
-34 test modules, 226 tests total. `tests/_world.py` provides `FakeStore` + re-exports the fake-world writers from `apex._fake_weights`. `tests/test_real_moe_cache.py`, `tests/test_real_moe_two_layer.py`, and `tests/test_runtime_real_integration.py` include real-Gemma tests that auto-skip unless `REAL_MOE_PATH` (or a known local default path) resolves.
+36 test modules, 234 tests total. `tests/_world.py` provides `FakeStore` + re-exports the fake-world writers from `apex._fake_weights`. `tests/test_real_moe_cache.py`, `tests/test_real_moe_two_layer.py`, and `tests/test_runtime_real_integration.py` include real-Gemma tests that auto-skip unless `REAL_MOE_PATH` (or a known local default path) resolves.
 
 ---
 
-## What's done (steps 1–13)
+## What's done (steps 1–15)
 
 1–3. Bounded LRU cache, prefetcher, Markov predictor, metrics.
 4. SwiGLU FFN experts (gate/up/down bundles via `ExpertWeights`).
@@ -185,6 +190,8 @@ weighted-combine via apex.moe_layer.run_moe_layer
 11. Two-layer real smoke: `smoke_real_moe_two_layer.py`. Cache key disambiguates by `(layer, expert)`; cross-layer cache state survives intact; ~200x cold→warm speedup.
 12. Runtime integration: routers return `(ids, weights)`, `Runtime` calls `run_moe_layer`, accepts `initial_hidden`, and `MultiLayerRealRouter` lets `scripts/demo_real_runtime.py` drive real Gemma MoE layers through the main orchestrator.
 13. Lowercase HF/MLX Gemma checkpoint support: `GemmaHFMoELayout`, stacked expert slicing via `GemmaHFQuantizedExpertStore`, U32-packed expert/router dequantization, layout auto-detection in `demo_real_runtime.py`, and real Runtime validation against the local `gemma-4-26b-a4b-it-nvfp4` checkpoint.
+14. Real memory-budget enforcement: `ExpertCache.peak_bytes` high-water tracking + `apex/memory.py` (`MemoryReport`, `snapshot`) joining cache/budget/peak with hits/misses/evictions and a `budget_respected` predicate. `demo_real_memory_budget.py` drives real Gemma under a 256 MB budget, forcing LRU eviction (peak 249.6 MB, 5 evictions, finite output, budget respected).
+15. Real prefetch on real Runtime: `demo_real_prefetch.py` wires `AsyncPrefetcher` into the production stack — layer 0 cold-misses 8 experts, the worker thread loads layer 1's 8 experts in the background while we wait at `wait_for_layer(1)`, and layer 1 hits the cache on every lookup (prefetch hit rate 100% in the deterministic case, 0% when a misaligned predictor schedules wrong experts).
 
 ---
 
@@ -193,7 +200,7 @@ weighted-combine via apex.moe_layer.run_moe_layer
 ### Near term
 
 - **MLX path for real weights** — `MLXBackend` already does SwiGLU; needs a `dequantize` step that produces `mx.array` directly to avoid the numpy round-trip.
-- **Predictor + prefetcher for real layers** — step 11 proved 200x speedup once cached; the pre-cache work could happen in the background while attention runs. Wire `Prefetcher` into the demo to overlap layer N+1's expert loads with layer N's compute.
+- **Trained predictor on real-Gemma traces** — step 15 proved the prefetch path works on real layers; an actual trained `MarkovPredictor` (instead of the router-peek fallback) would let prefetch overlap with attention/norm in a real model loop. Needs trace data we don't have yet.
 
 ### Medium term
 
