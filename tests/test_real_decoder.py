@@ -11,7 +11,8 @@ import contextlib
 import numpy as np
 
 from apex.attention import single_token_attention
-from apex.decoder import single_token_decoder_layer
+from apex.decoder import decoder_decode_step, single_token_decoder_layer
+from apex.kv_cache import KVCache
 from apex.ops import rms_norm
 from tests._synthetic_nvfp4 import skip_if_no_real_checkpoint
 
@@ -124,6 +125,138 @@ def test_decoder_calls_moe_callable_with_normalized_hidden():
     assert "arg" in captured
     assert captured["arg"].shape == hidden.shape
     assert not np.allclose(captured["arg"], hidden)
+
+
+# --- decoder_decode_step (with KVCache) ---------------------------------
+
+def test_decoder_decode_step_first_call_matches_single_token_layer():
+    """First call (empty cache, RoPE = identity) ⇒ identical output."""
+    rng = np.random.default_rng(10)
+    hidden = rng.standard_normal((1, 64)).astype(np.float32)
+    norms = _zero_norms(64)
+    attn_kwargs = _attn_kwargs(rng)
+
+    cache = KVCache(num_layers=1)
+    moe = lambda h: np.zeros_like(h)
+
+    with _silence_matmul_warnings():
+        decode_out = decoder_decode_step(
+            hidden,
+            norms=norms,
+            attn_kwargs=attn_kwargs,
+            moe_call=moe,
+            kv_cache=cache,
+            layer_id=0,
+        )
+        single_out = single_token_decoder_layer(
+            hidden,
+            norms=norms,
+            attn_kwargs=attn_kwargs,
+            moe_call=moe,
+        )
+    np.testing.assert_allclose(decode_out, single_out, rtol=1e-5)
+    # And the cache must have grown by exactly one entry.
+    assert cache.length(0) == 1
+
+
+def test_decoder_decode_step_grows_kv_cache_per_call():
+    rng = np.random.default_rng(11)
+    norms = _zero_norms(64)
+    attn_kwargs = _attn_kwargs(rng)
+    cache = KVCache(num_layers=1)
+    moe = lambda h: np.zeros_like(h)
+
+    with _silence_matmul_warnings():
+        for step in range(4):
+            hidden = rng.standard_normal((1, 64)).astype(np.float32)
+            out = decoder_decode_step(
+                hidden,
+                norms=norms,
+                attn_kwargs=attn_kwargs,
+                moe_call=moe,
+                kv_cache=cache,
+                layer_id=0,
+            )
+            assert out.shape == (1, 64)
+            assert np.all(np.isfinite(out))
+            assert cache.length(0) == step + 1
+
+
+@skip_if_no_real_checkpoint()
+def test_real_gemma_layer0_decoder_decode_step_grows_cache():
+    """3 decode steps on real Gemma 4 layer 0 with KV cache."""
+    from apex.backends.fake_backend import FakeBackend
+    from apex.dequant import DequantizingExpertStore
+    from apex.expert_cache import ExpertCache
+    from apex.expert_manager import ExpertManager
+    from apex.metrics import Metrics
+    from apex.moe_layer import run_moe_layer
+    from apex.real_router import MultiLayerRealRouter
+    from scripts._real_moe_helpers import (
+        load_attention_weights,
+        load_layer_norms,
+        quantized_store_for_layout,
+        read_text_config,
+    )
+    from tests._synthetic_nvfp4 import (
+        real_checkpoint_path,
+        real_layout_and_quant_store,
+    )
+
+    path = real_checkpoint_path()
+    layout, _ = real_layout_and_quant_store(path)
+    text_cfg = read_text_config(path)
+
+    metrics = Metrics()
+    cache = ExpertCache(max_memory_mb=512, verbose=False, metrics=metrics)
+    quant_store = quantized_store_for_layout(path, layout)
+    store = DequantizingExpertStore(quant_store, verbose=False)
+    manager = ExpertManager(store=store, cache=cache, metrics=metrics)
+    backend = FakeBackend()
+    router = MultiLayerRealRouter(path, layout, top_k=8)
+
+    attn_weights = load_attention_weights(path, layout, layer_id=0)
+    norms = load_layer_norms(path, layout, layer_id=0)
+    attn_kwargs = dict(
+        q_weight=attn_weights["q_weight"], k_weight=attn_weights["k_weight"],
+        v_weight=attn_weights["v_weight"], o_weight=attn_weights["o_weight"],
+        num_heads=text_cfg["num_attention_heads"],
+        num_kv_heads=text_cfg["num_key_value_heads"],
+        head_dim=text_cfg["head_dim"],
+        q_norm_weight=attn_weights["q_norm"],
+        k_norm_weight=attn_weights["k_norm"],
+        rms_eps=text_cfg["rms_norm_eps"],
+        rope_theta=10000.0,
+    )
+
+    def moe_call(h):
+        with _silence_matmul_warnings():
+            ids, weights = router.route(0, h)
+            return run_moe_layer(
+                h, ids, weights,
+                lambda eid: manager.ensure_loaded(0, eid),
+                backend,
+            )
+
+    kv = KVCache(num_layers=1)
+    rng = np.random.default_rng(0)
+    for step in range(3):
+        hidden = rng.standard_normal(
+            (1, text_cfg["hidden_size"]),
+        ).astype(np.float32)
+        with _silence_matmul_warnings():
+            out = decoder_decode_step(
+                hidden,
+                norms=norms,
+                attn_kwargs=attn_kwargs,
+                moe_call=moe_call,
+                kv_cache=kv,
+                layer_id=0,
+                rms_eps=text_cfg["rms_norm_eps"],
+            )
+        assert out.shape == (1, text_cfg["hidden_size"])
+        assert np.all(np.isfinite(out))
+        assert kv.length(0) == step + 1
 
 
 @skip_if_no_real_checkpoint()

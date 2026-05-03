@@ -1,8 +1,20 @@
-"""Single-token decoder layer: norms + attention + residual + MoE + residual.
+"""Decoder layer: norms + attention + residual + MoE + residual.
 
-One callable, `single_token_decoder_layer`, that composes the
-building blocks from steps 16A-16C into the standard Gemma-4-style
-"sandwich norm" decoder block:
+Two callables:
+
+  - `single_token_decoder_layer` — pre-step-17 surface. One token,
+    no KV cache, no RoPE (RoPE at position 0 is identity). Stays
+    useful as the simplest "decoder block works on real weights"
+    smoke and remains the path the 16D smoke / tests exercise.
+
+  - `decoder_decode_step` — same sandwich-norm composition but uses
+    `attention_decode_step` (with a KVCache + RoPE) so it can drive
+    actual multi-token generation. The first call with an empty
+    cache is mathematically equivalent to `single_token_decoder_layer`
+    (RoPE position 0 is identity), so both surfaces remain correct
+    against the same numerical baseline.
+
+Both compose into the standard Gemma-4 sandwich-norm decoder block:
 
   residual = hidden
   hidden = input_layernorm(hidden)
@@ -37,7 +49,7 @@ What this is NOT (intentional gaps for now):
 
 import numpy as np
 
-from apex.attention import single_token_attention
+from apex.attention import attention_decode_step, single_token_attention
 from apex.ops import rms_norm
 
 
@@ -74,6 +86,42 @@ def single_token_decoder_layer(
 
     # Feedforward sub-block. Same sandwich-norm structure with the
     # MoE block in place of the dense MLP.
+    residual = hidden
+    h = rms_norm(hidden, norms["pre_ffn"], eps=rms_eps, gemma_unit_offset=True)
+    h = moe_call(h)
+    h = rms_norm(h, norms["post_ffn"], eps=rms_eps, gemma_unit_offset=True)
+    return residual + h
+
+
+def decoder_decode_step(
+    hidden,
+    *,
+    norms: dict,
+    attn_kwargs: dict,
+    moe_call,
+    kv_cache,
+    layer_id: int,
+    rms_eps: float = 1e-6,
+):
+    """One decode step of the sandwich-norm decoder block with a KVCache.
+
+    Identical structure to `single_token_decoder_layer` — the only
+    change is calling `attention_decode_step` (which reads / writes
+    `kv_cache` and applies RoPE at the current position) instead of
+    `single_token_attention`.
+
+    `attn_kwargs` MUST NOT contain `kv_cache` or `layer_id` — those
+    are threaded through here so callers can't accidentally pass two
+    layer ids that disagree.
+    """
+    residual = hidden
+    h = rms_norm(hidden, norms["input"], eps=rms_eps, gemma_unit_offset=True)
+    h = attention_decode_step(
+        h, **attn_kwargs, kv_cache=kv_cache, layer_id=layer_id,
+    )
+    h = rms_norm(h, norms["post_attn"], eps=rms_eps, gemma_unit_offset=True)
+    hidden = residual + h
+
     residual = hidden
     h = rms_norm(hidden, norms["pre_ffn"], eps=rms_eps, gemma_unit_offset=True)
     h = moe_call(h)
