@@ -1,24 +1,22 @@
-"""Self-attention — single-token (no cache) and decode-step (KV cache + RoPE).
+"""Self-attention — single canonical implementation, two convenience wrappers.
 
-Two callables for two stages of the generation pipeline:
+`attention_decode_step` is the canonical implementation: one new
+token, with a `KVCache` for past K/V and RoPE applied at the cache's
+current length. It supports GQA via `num_kv_heads < num_heads` and
+optional per-head q_norm / k_norm with the Gemma `+1` RMSNorm
+convention.
 
-  - `single_token_attention`: pre-step-17 smoke surface. One token
-    at position 0, no cache, no RoPE (cos(0)=1 / sin(0)=0 makes RoPE
-    identity at position 0). Kept because it's the simplest possible
-    "attention works on real weights" test and remains useful for
-    isolating regressions.
+`single_token_attention` is a thin wrapper that constructs a fresh
+1-layer KVCache, calls `attention_decode_step` at layer 0, and
+discards the cache. RoPE at position 0 is the identity rotation
+(cos(0)=1, sin(0)=0) so this is mathematically equivalent to "no
+RoPE, no cache" — the simplest possible smoke surface, kept for
+the position-0 tests in step 16C / 16D / 16E.
 
-  - `attention_decode_step`: one new token with a KVCache. Reads
-    `kv_cache.length(layer_id)` for the RoPE position, applies RoPE
-    to q/k, appends k/v, then attends over the full cached history.
-    No causal mask needed — seq_q is 1, so the new token's softmax
-    over `[past..., current]` is unambiguous. Multi-token prefill
-    (seq_q > 1) needs a causal mask + a different code path; not
-    implemented yet.
-
-Both support GQA via num_kv_heads < num_heads (Gemma 4 sliding:
-16 Q heads share 8 KV heads, q_per_kv=2) and optional per-head
-q_norm / k_norm with the Gemma `+1` RMSNorm convention.
+Why one implementation instead of two: the previous code path
+duplicated ~30 lines (project + reshape + per-head norm + GQA repeat
++ scaled-dot-product) between the two surfaces. Centralising avoids
+the two paths drifting on a future shape / norm tweak.
 
 What is intentionally NOT here:
   - Multi-token prefill with causal mask. Decode-only is the
@@ -34,67 +32,8 @@ What is intentionally NOT here:
 
 import numpy as np
 
+from apex.kv_cache import KVCache
 from apex.ops import apply_rope, linear, rms_norm, softmax
-
-
-def single_token_attention(
-    hidden,
-    *,
-    q_weight,
-    k_weight,
-    v_weight,
-    o_weight,
-    num_heads: int,
-    num_kv_heads: int,
-    head_dim: int,
-    q_norm_weight=None,
-    k_norm_weight=None,
-    rms_eps: float = 1e-6,
-):
-    """Run one token of self-attention; return shape (1, hidden_size).
-
-    `hidden` is (1, hidden_size). All weights are HF-orientation
-    `(out_features, hidden_size)` for projections (q/k/v have
-    out=num_heads_x*head_dim, o has out=hidden_size). Norm weights
-    are 1-D `(head_dim,)` and apply per-head along the last axis.
-    """
-    # Project — each result is (1, num_heads_x * head_dim).
-    q = linear(hidden, q_weight)
-    k = linear(hidden, k_weight)
-    v = linear(hidden, v_weight)
-
-    # Per-head split. (1, num_heads_x, head_dim).
-    q = q.reshape(1, num_heads, head_dim)
-    k = k.reshape(1, num_kv_heads, head_dim)
-    v = v.reshape(1, num_kv_heads, head_dim)
-
-    # Per-head Q/K RMSNorm along the head_dim axis. Gemma 4 stores
-    # these and they control attention-score magnitude — without them
-    # logits explode but stay finite (the smoke contract still passes,
-    # so a missing q_norm/k_norm would slip past unless we run the
-    # full numerical check, which is 16D's job).
-    if q_norm_weight is not None:
-        q = rms_norm(q, q_norm_weight, eps=rms_eps, gemma_unit_offset=True)
-    if k_norm_weight is not None:
-        k = rms_norm(k, k_norm_weight, eps=rms_eps, gemma_unit_offset=True)
-
-    # GQA: repeat each KV head q_per_kv times so Q and K/V align on
-    # the head axis. For full equality (q_per_kv == 1) this is a
-    # no-op; for Gemma 4 sliding (q_per_kv == 2) every KV head is
-    # duplicated.
-    q_per_kv = num_heads // num_kv_heads
-    if q_per_kv > 1:
-        k = np.repeat(k, q_per_kv, axis=1)
-        v = np.repeat(v, q_per_kv, axis=1)
-
-    # Scaled dot-product. seq_q=1, seq_k=1 ⇒ scores shape (1, num_heads, 1, 1).
-    # softmax along the last axis ⇒ exactly [1.0] per head.
-    scores = (q[:, :, None, :] @ k[:, :, :, None]) / np.sqrt(head_dim)
-    weights = softmax(scores, axis=-1)
-    attn = weights @ v[:, :, None, :]            # (1, num_heads, 1, head_dim)
-    attn = attn.reshape(1, num_heads * head_dim)
-
-    return linear(attn, o_weight)
 
 
 def attention_decode_step(
@@ -143,6 +82,11 @@ def attention_decode_step(
     k = k.reshape(1, num_kv_heads, 1, head_dim)
     v = v.reshape(1, num_kv_heads, 1, head_dim)
 
+    # Per-head Q/K RMSNorm along the head_dim axis. Gemma 4 stores
+    # these and they control attention-score magnitude — without them
+    # logits explode but stay finite (the smoke contract still passes,
+    # so a missing q_norm/k_norm would slip past unless we run the
+    # full numerical check, which is a downstream concern).
     if q_norm_weight is not None:
         q = rms_norm(q, q_norm_weight, eps=rms_eps, gemma_unit_offset=True)
     if k_norm_weight is not None:
@@ -164,7 +108,7 @@ def attention_decode_step(
     # k_all / v_all: (1, num_kv_heads, seq_total, head_dim).
 
     # GQA: replicate each KV head q_per_kv times so the per-head
-    # einsum lines up with q.
+    # einsum lines up with q. q_per_kv == 1 ⇒ no-op.
     q_per_kv = num_heads // num_kv_heads
     if q_per_kv > 1:
         k_all = np.repeat(k_all, q_per_kv, axis=1)
@@ -177,3 +121,25 @@ def attention_decode_step(
     attn = weights @ v_all                          # (1, H, 1, D)
     attn = attn.transpose(0, 2, 1, 3).reshape(1, num_heads * head_dim)
     return linear(attn, o_weight)
+
+
+def single_token_attention(hidden, **kwargs):
+    """Position-0, no-cache wrapper over `attention_decode_step`.
+
+    Equivalent to constructing a fresh `KVCache(num_layers=1)`,
+    calling `attention_decode_step` at layer 0, and dropping the
+    cache. RoPE position 0 is the identity rotation (cos(0)=1,
+    sin(0)=0), so the result is the same as "no RoPE, no cache" —
+    matching the step 16C smoke contract.
+
+    Useful for tests + demos that want to exercise the attention
+    math without managing a cache. Don't pass `kv_cache`, `layer_id`,
+    or `rope_theta` here — those belong on `attention_decode_step`
+    directly when callers need them.
+    """
+    return attention_decode_step(
+        hidden,
+        **kwargs,
+        kv_cache=KVCache(num_layers=1),
+        layer_id=0,
+    )
