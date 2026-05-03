@@ -15,6 +15,7 @@ from apex.types import ExpertWeights
 from apex.weight_layout import FakeMoELayout
 from tests._synthetic_nvfp4 import (
     build_one_layer_checkpoint,
+    real_layout_and_quant_store,
     real_checkpoint_path,
     skip_if_no_real_checkpoint,
     write_safetensors,
@@ -145,18 +146,45 @@ def test_multi_layer_real_router_routes_from_sharded_index(tmp_path):
     np.testing.assert_allclose(sum(weights), 1.0, rtol=1e-6)
 
 
+def test_real_router_dequantizes_gemma_hf_affine_router(tmp_path):
+    from apex.real_router import MultiLayerRealRouter
+    from apex.weight_layout import GemmaHFMoELayout
+
+    layout = GemmaHFMoELayout()
+    names = layout.router_tensors(0)
+    router_weight = np.array([[1], [5], [3]], dtype=np.uint32)
+    scales = np.ones((3, 1), dtype=np.float32)
+    biases = np.zeros((3, 1), dtype=np.float32)
+    shard = tmp_path / "router.safetensors"
+    items = [
+        (names["weight"], "U32", list(router_weight.shape), router_weight.tobytes()),
+        (names["scales"], "F32", list(scales.shape), scales.tobytes()),
+        (names["biases"], "F32", list(biases.shape), biases.tobytes()),
+    ]
+    write_safetensors(shard, items)
+    (tmp_path / "model.safetensors.index.json").write_text(
+        json.dumps({"metadata": {"total_size": 0}, "weight_map": {
+            name: shard.name for name, *_ in items
+        }})
+    )
+
+    router = MultiLayerRealRouter(tmp_path, layout, top_k=2)
+    ids, weights = router.route(0, np.array([[1, 0, 0, 0]], dtype=np.float32))
+
+    assert router.shape_for_layer(0) == (3, 4)
+    assert ids == [1, 2]
+    np.testing.assert_allclose(sum(weights), 1.0, rtol=1e-6)
+
+
 @skip_if_no_real_checkpoint()
 def test_real_gemma_two_layer_runtime_run_then_run():
     """Real Gemma 4 NVFP4 goes through Runtime, not just smoke scripts."""
     from apex.real_router import MultiLayerRealRouter
-    from apex.weight_layout import get_layout
 
     path = real_checkpoint_path()
-    layout = get_layout("gemma-moe")
+    layout, quant_store = real_layout_and_quant_store(path)
     router = MultiLayerRealRouter(path, layout, top_k=8)
-    store = DequantizingExpertStore(
-        QuantizedSafetensorsExpertStore(path, layout=layout), verbose=False,
-    )
+    store = DequantizingExpertStore(quant_store, verbose=False)
     metrics = Metrics()
     cache = ExpertCache(max_memory_mb=512, verbose=False, metrics=metrics)
     manager = ExpertManager(store=store, cache=cache, metrics=metrics)
@@ -171,14 +199,16 @@ def test_real_gemma_two_layer_runtime_run_then_run():
         initial_hidden=initial,
     )
 
-    out_first = runtime.run()
+    with np.errstate(over="ignore", under="ignore", invalid="ignore", divide="ignore"):
+        out_first = runtime.run()
     assert metrics.cache_misses == 16
     assert metrics.cache_hits == 0
     assert metrics.evictions == 0
     assert out_first.shape == (1, hidden_dim)
     assert np.all(np.isfinite(out_first))
 
-    out_second = runtime.run()
+    with np.errstate(over="ignore", under="ignore", invalid="ignore", divide="ignore"):
+        out_second = runtime.run()
     assert metrics.cache_misses == 16
     assert metrics.cache_hits == 16
     assert metrics.evictions == 0

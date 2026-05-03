@@ -42,12 +42,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from apex.backends.fake_backend import FakeBackend
 from apex.dequant import dequantize_bundle
 from apex.moe_layer import route, run_moe_layer
-from apex.quantized_safetensors_store import QuantizedSafetensorsExpertStore
-from apex.weight_layout import get_layout
 from scripts._real_moe_helpers import (
     add_real_moe_args,
+    detect_real_moe_layout,
     load_router,
     nvfp4_matmul_warnings,
+    quantized_store_for_layout,
 )
 
 
@@ -61,7 +61,8 @@ def main():
             f"or pass --path"
         )
 
-    layout = get_layout("gemma-moe")
+    layout_name, layout = detect_real_moe_layout(path)
+    print(f"[layout] {layout_name}")
 
     # --- 1. Load the router (BF16, NOT quantized — appears in the
     # config.json `ignore` list) and probe its shape so we can build a
@@ -97,7 +98,7 @@ def main():
     # dequantize all three projections, hand back a SwiGLU-ready bundle.
     # Wrapping with timing so we can see how expensive a real expert
     # load is end-to-end (load + 3x NVFP4 dequant per expert).
-    store = QuantizedSafetensorsExpertStore(path, layout=layout)
+    store = quantized_store_for_layout(path, layout)
     load_times_ms = []
 
     def expert_loader(expert_id: int):

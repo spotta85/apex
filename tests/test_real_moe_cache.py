@@ -33,12 +33,13 @@ from apex.dequant import (
 from apex.expert_cache import ExpertCache
 from apex.expert_manager import ExpertManager
 from apex.metrics import Metrics
-from apex.moe_layer import route, run_moe_layer
+from apex.moe_layer import run_moe_layer
 from apex.quantized_safetensors_store import QuantizedSafetensorsExpertStore
 from apex.types import ExpertWeights
 from apex.weight_layout import FakeMoELayout, get_layout
 from tests._synthetic_nvfp4 import (
     build_one_layer_checkpoint,
+    real_layout_and_quant_store,
     real_checkpoint_path,
     skip_if_no_real_checkpoint,
 )
@@ -242,27 +243,20 @@ def test_cache_print_lines_match_demo_spec(tmp_path, capsys):
 @skip_if_no_real_checkpoint()
 def test_real_gemma_layer_caches_top_8_then_reuses():
     """End-to-end on real weights: route → load+cache 8 → reuse 8."""
-    from apex.checkpoint_index import get_tensor_shape, read_safetensors_index
-    from apex.safetensors_loader import load_tensor
+    from apex.real_router import MultiLayerRealRouter
 
     path = real_checkpoint_path()
-    layout = get_layout("gemma-moe")
+    layout, quant_store = real_layout_and_quant_store(path)
     layer_id = 0
     top_k = 8
 
-    router_name = layout.gate_weight(layer_id)
-    _, hidden_dim = get_tensor_shape(path, router_name)
-    weight_map = read_safetensors_index(path)
-    router = load_tensor(path / weight_map[router_name], router_name)
-
+    router = MultiLayerRealRouter(path, layout, top_k=top_k)
+    hidden_dim = router.shape_for_layer(layer_id)[1]
     rng = np.random.default_rng(0)
     hidden = rng.standard_normal((1, hidden_dim)).astype(np.float32)
     with np.errstate(over="ignore", under="ignore", invalid="ignore", divide="ignore"):
-        ids, weights = route(hidden, router, top_k=top_k)
-    selected = ids[0].tolist()
-    routing_weights = weights[0]
+        selected, routing_weights = router.route(layer_id, hidden)
 
-    quant_store = QuantizedSafetensorsExpertStore(path, layout=layout)
     store = DequantizingExpertStore(quant_store, verbose=False)
     metrics = Metrics()
     cache = ExpertCache(max_memory_mb=256, verbose=False, metrics=metrics)

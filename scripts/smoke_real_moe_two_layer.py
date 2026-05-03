@@ -46,12 +46,12 @@ from apex.expert_cache import ExpertCache
 from apex.expert_manager import ExpertManager
 from apex.metrics import Metrics
 from apex.moe_layer import route, run_moe_layer
-from apex.quantized_safetensors_store import QuantizedSafetensorsExpertStore
-from apex.weight_layout import get_layout
 from scripts._real_moe_helpers import (
     add_real_moe_args,
+    detect_real_moe_layout,
     load_router,
     nvfp4_matmul_warnings,
+    quantized_store_for_layout,
 )
 
 
@@ -65,7 +65,8 @@ def main():
             f"or pass --path"
         )
 
-    layout = get_layout("gemma-moe")
+    layout_name, layout = detect_real_moe_layout(path)
+    print(f"[layout] {layout_name}")
 
     # --- 1. Pre-load both layer routers (BF16 → fp32 inside the loader).
     # Done up front so we can establish hidden_dim before the loop and
@@ -81,7 +82,7 @@ def main():
     # --- 2. One shared cache + manager for both layers. Budget sized
     # for top_k * num_layers fp32 experts (~24 MB each on Gemma 4 ⇒
     # ~384 MB for 16; default 512 MB has slack).
-    quant_store = QuantizedSafetensorsExpertStore(path, layout=layout)
+    quant_store = quantized_store_for_layout(path, layout)
     store = DequantizingExpertStore(quant_store, verbose=False)
     metrics = Metrics()
     cache = ExpertCache(max_memory_mb=args.max_memory_mb, verbose=False, metrics=metrics)

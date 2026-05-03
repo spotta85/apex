@@ -42,12 +42,12 @@ from apex.expert_cache import ExpertCache
 from apex.expert_manager import ExpertManager
 from apex.metrics import Metrics
 from apex.moe_layer import route, run_moe_layer
-from apex.quantized_safetensors_store import QuantizedSafetensorsExpertStore
-from apex.weight_layout import get_layout
 from scripts._real_moe_helpers import (
     add_real_moe_args,
+    detect_real_moe_layout,
     load_router,
     nvfp4_matmul_warnings,
+    quantized_store_for_layout,
 )
 
 
@@ -61,7 +61,8 @@ def main():
             f"or pass --path"
         )
 
-    layout = get_layout("gemma-moe")
+    layout_name, layout = detect_real_moe_layout(path)
+    print(f"layout: {layout_name}")
 
     # --- 1. Resolve router shard + load BF16 router as fp32. The
     # router is in the model's `ignore` list so it's NOT NVFP4-quantized;
@@ -84,7 +85,7 @@ def main():
     # --- 3. Wire the cache stack: NVFP4 store → dequantizing wrapper →
     # cache + manager. Cache budget is sized for ~8 dequantized experts
     # (each ~24 MB at fp32 for Gemma 4's intermediate=704, hidden=2816).
-    quant_store = QuantizedSafetensorsExpertStore(path, layout=layout)
+    quant_store = quantized_store_for_layout(path, layout)
     store = DequantizingExpertStore(quant_store, verbose=True)
     metrics = Metrics()
     # verbose=False on the cache: the per-put "current cache memory" lines

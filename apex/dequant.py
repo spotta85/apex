@@ -93,6 +93,10 @@ def dequantize(t: Any, *, name: str = "<unnamed>") -> np.ndarray:
     if isinstance(t, QuantizedTensor):
         if t.dtype == "NVFP4":
             return _dequantize_nvfp4(t, name=name)
+        if t.dtype == "NVFP4_U32":
+            return _dequantize_nvfp4_u32(t, name=name)
+        if t.dtype == "AFFINE_UINT8_U32":
+            return _dequantize_affine_uint8_u32(t, name=name)
         raise UnsupportedQuantizationError(
             tensor=name,
             dtype=t.dtype,
@@ -241,6 +245,109 @@ def _dequantize_nvfp4(t: QuantizedTensor, *, name: str) -> np.ndarray:
     # Apply two-level scaling.
     weight_scale_2 = float(np.asarray(t.weight_scale_2).item())
     return fp4_values * block_scales_expanded * weight_scale_2
+
+
+def _dequantize_nvfp4_u32(t: QuantizedTensor, *, name: str) -> np.ndarray:
+    """Dequantize mlx-community U32-packed NVFP4 weights.
+
+    The local lowercase Gemma checkpoint stores eight 4-bit FP values in
+    each uint32 and keeps one F8_E4M3 scale per 16 unpacked values. It
+    has no tensor-wide `weight_scale_2` sidecar, unlike the NVIDIA-style
+    path above.
+    """
+    if t.weight_scale is None:
+        raise UnsupportedQuantizationError(
+            tensor=name,
+            dtype=t.dtype,
+            shape=t.shape,
+            message="NVFP4_U32 dequant requires a .scales sidecar",
+        )
+
+    packed = np.asarray(t.data, dtype=np.uint32)
+    if packed.ndim < 1:
+        raise UnsupportedQuantizationError(
+            tensor=name,
+            dtype=t.dtype,
+            shape=t.shape,
+            message="NVFP4_U32 dequant expects at least 1-D packed data",
+        )
+
+    nibbles = _unpack_u32_nibbles(packed)
+    fp4_values = NVFP4_LOOKUP[nibbles]
+
+    block_scales_u8 = np.asarray(t.weight_scale, dtype=np.uint8)
+    expected = packed.shape[:-1] + (nibbles.shape[-1] // NVFP4_GROUP_SIZE,)
+    if block_scales_u8.shape != expected:
+        raise UnsupportedQuantizationError(
+            tensor=name,
+            dtype=t.dtype,
+            shape=t.shape,
+            message=(
+                f"NVFP4_U32 scales shape {block_scales_u8.shape} does not match "
+                f"expected {expected}"
+            ),
+        )
+    block_scales = _decode_e4m3(block_scales_u8)
+    return fp4_values * np.repeat(block_scales, NVFP4_GROUP_SIZE, axis=-1)
+
+
+def _dequantize_affine_uint8_u32(t: QuantizedTensor, *, name: str) -> np.ndarray:
+    """Dequantize U32-packed affine uint8 weights.
+
+    Used by the lowercase Gemma router projection. Each uint32 stores
+    four quantized bytes. Per-group BF16 sidecars are represented on the
+    wrapper as `weight_scale` (.scales) and `weight_scale_2` (.biases),
+    with reconstruction `q * scale + bias`.
+    """
+    if t.weight_scale is None or t.weight_scale_2 is None:
+        raise UnsupportedQuantizationError(
+            tensor=name,
+            dtype=t.dtype,
+            shape=t.shape,
+            message="AFFINE_UINT8_U32 dequant requires .scales and .biases sidecars",
+        )
+
+    packed = np.asarray(t.data, dtype=np.uint32)
+    q = _unpack_u32_bytes(packed).astype(np.float32)
+    scales = np.asarray(t.weight_scale, dtype=np.float32)
+    biases = np.asarray(t.weight_scale_2, dtype=np.float32)
+    if scales.shape != biases.shape:
+        raise UnsupportedQuantizationError(
+            tensor=name,
+            dtype=t.dtype,
+            shape=t.shape,
+            message=f"scales shape {scales.shape} != biases shape {biases.shape}",
+        )
+    if q.shape[-1] % scales.shape[-1] != 0:
+        raise UnsupportedQuantizationError(
+            tensor=name,
+            dtype=t.dtype,
+            shape=t.shape,
+            message=(
+                f"unpacked width {q.shape[-1]} is not divisible by "
+                f"scale groups {scales.shape[-1]}"
+            ),
+        )
+    group_size = q.shape[-1] // scales.shape[-1]
+    return q * np.repeat(scales, group_size, axis=-1) + np.repeat(
+        biases, group_size, axis=-1,
+    )
+
+
+def _unpack_u32_nibbles(packed: np.ndarray) -> np.ndarray:
+    """Unpack little-endian uint32 words into eight low-to-high nibbles."""
+    out = np.empty(packed.shape[:-1] + (packed.shape[-1] * 8,), dtype=np.uint8)
+    for i in range(8):
+        out[..., i::8] = ((packed >> (4 * i)) & 0x0F).astype(np.uint8)
+    return out
+
+
+def _unpack_u32_bytes(packed: np.ndarray) -> np.ndarray:
+    """Unpack little-endian uint32 words into four low-to-high bytes."""
+    out = np.empty(packed.shape[:-1] + (packed.shape[-1] * 4,), dtype=np.uint8)
+    for i in range(4):
+        out[..., i::4] = ((packed >> (8 * i)) & 0xFF).astype(np.uint8)
+    return out
 
 
 def _decode_e4m3(u8: np.ndarray) -> np.ndarray:

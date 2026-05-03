@@ -28,12 +28,13 @@ from apex.dequant import DequantizingExpertStore
 from apex.expert_cache import ExpertCache
 from apex.expert_manager import ExpertManager
 from apex.metrics import Metrics
-from apex.moe_layer import route, run_moe_layer
+from apex.moe_layer import run_moe_layer
 from apex.quantized_safetensors_store import QuantizedSafetensorsExpertStore
 from apex.types import ExpertWeights
 from apex.weight_layout import FakeMoELayout, get_layout
 from tests._synthetic_nvfp4 import (
     build_multi_layer_checkpoint,
+    real_layout_and_quant_store,
     real_checkpoint_path,
     skip_if_no_real_checkpoint,
 )
@@ -211,22 +212,16 @@ def test_tight_budget_evicts_layer_0_when_layer_1_loads(tmp_path):
 @skip_if_no_real_checkpoint()
 def test_real_gemma_two_layer_pass_caches_correctly():
     """End-to-end on real Gemma 4 NVFP4: two layers, two passes, finite output."""
-    from apex.checkpoint_index import get_tensor_shape, read_safetensors_index
-    from apex.safetensors_loader import load_tensor
+    from apex.real_router import MultiLayerRealRouter
 
     path = real_checkpoint_path()
-    layout = get_layout("gemma-moe")
+    layout, quant_store = real_layout_and_quant_store(path)
     layers = [0, 1]
     top_k = 8
 
-    weight_map = read_safetensors_index(path)
-    routers = {}
-    for layer_id in layers:
-        name = layout.gate_weight(layer_id)
-        routers[layer_id] = load_tensor(path / weight_map[name], name)
-    _, hidden_dim = get_tensor_shape(path, layout.gate_weight(layers[0]))
+    router = MultiLayerRealRouter(path, layout, top_k=top_k)
+    hidden_dim = router.shape_for_layer(layers[0])[1]
 
-    quant_store = QuantizedSafetensorsExpertStore(path, layout=layout)
     store = DequantizingExpertStore(quant_store, verbose=False)
     metrics = Metrics()
     # Sized for 16 fp32 experts (~24 MB each on Gemma 4); 512 MB has slack.
@@ -239,15 +234,14 @@ def test_real_gemma_two_layer_pass_caches_correctly():
 
     # --- first pass: route + run each layer in sequence.
     h = hidden
-    selections = []
+    selections = {}
     for layer_id in layers:
         with np.errstate(over="ignore", under="ignore", invalid="ignore", divide="ignore"):
-            ids, weights = route(h, routers[layer_id], top_k=top_k)
-        selected = ids[0].tolist()
-        selections.append(selected)
+            selected, routing_weights = router.route(layer_id, h)
+        selections[layer_id] = selected
         expert_loader = lambda eid, lid=layer_id: manager.ensure_loaded(lid, eid)
         with np.errstate(over="ignore", under="ignore", invalid="ignore", divide="ignore"):
-            h = run_moe_layer(h, selected, weights[0], expert_loader, backend)
+            h = run_moe_layer(h, selected, routing_weights, expert_loader, backend)
         assert np.all(np.isfinite(h))
     out_first = h
     assert metrics.cache_misses == top_k * len(layers)
@@ -258,14 +252,13 @@ def test_real_gemma_two_layer_pass_caches_correctly():
     h = hidden
     for layer_id in layers:
         with np.errstate(over="ignore", under="ignore", invalid="ignore", divide="ignore"):
-            ids, weights = route(h, routers[layer_id], top_k=top_k)
-        selected = ids[0].tolist()
+            selected, routing_weights = router.route(layer_id, h)
         # Routing must be deterministic across passes for the cache
         # claim to hold — otherwise the "all hits" assertion is moot.
         assert selected == selections[layer_id]
         expert_loader = lambda eid, lid=layer_id: manager.ensure_loaded(lid, eid)
         with np.errstate(over="ignore", under="ignore", invalid="ignore", divide="ignore"):
-            h = run_moe_layer(h, selected, weights[0], expert_loader, backend)
+            h = run_moe_layer(h, selected, routing_weights, expert_loader, backend)
     out_second = h
     assert metrics.cache_misses == top_k * len(layers), "second pass shouldn't re-load"
     assert metrics.cache_hits == top_k * len(layers)

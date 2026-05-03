@@ -59,6 +59,11 @@ def find_last_layer(layout, names_set: set) -> int:
 
 def find_last_expert(layout, names_set: set, layer: int) -> int:
     """Largest E with layout.expert_gate_proj(layer, E) in `names_set`, else -1."""
+    if getattr(layout, "stacked_experts", False):
+        if layout.expert_gate_proj(layer, 0) not in names_set:
+            return -1
+        return getattr(layout, "num_experts", 1) - 1
+
     last = -1
     for E in range(_MAX_PROBE_EXPERTS):
         if layout.expert_gate_proj(layer, E) in names_set:
@@ -90,10 +95,10 @@ def _check_shapes(path: Path, layout, last_layer: int, last_expert: int) -> bool
     print(f"  down_proj  {down_proj_shape}")
     print(f"  gate       {gate_shape}")
 
-    # The SwiGLU FFN math (gate*up then *down) requires:
-    #   - up_proj has the same shape as gate_proj
-    #   - down_proj is the transpose of gate_proj
-    # If either fails the bundle can't be consumed by run_expert at all.
+    # The SwiGLU FFN math (gate*up then *down) requires up_proj to match
+    # gate_proj, and down_proj to reverse the logical projection shape.
+    # Stacked packed layouts include an expert axis and store multiple
+    # values per last-axis element, so compare their unpacked shapes.
     ok = True
     if up_proj_shape != gate_proj_shape:
         print(
@@ -101,10 +106,22 @@ def _check_shapes(path: Path, layout, last_layer: int, last_expert: int) -> bool
             file=sys.stderr,
         )
         ok = False
-    if down_proj_shape != tuple(reversed(gate_proj_shape)):
+    if getattr(layout, "stacked_experts", False):
+        pack = getattr(layout, "expert_pack_factor", 1)
+        logical_gate = (gate_proj_shape[1], gate_proj_shape[2] * pack)
+        logical_down = (down_proj_shape[1], down_proj_shape[2] * pack)
+        router_pack = getattr(layout, "router_pack_factor", 1)
+        logical_router = (gate_shape[0], gate_shape[1] * router_pack)
+        down_ok = logical_down == tuple(reversed(logical_gate))
+    else:
+        logical_gate = gate_proj_shape
+        logical_down = down_proj_shape
+        logical_router = gate_shape
+        down_ok = down_proj_shape == tuple(reversed(gate_proj_shape))
+    if not down_ok:
         print(
-            f"  [MISMATCH] down_proj {down_proj_shape} is not the transpose of "
-            f"gate_proj {gate_proj_shape}",
+            f"  [MISMATCH] down_proj logical {logical_down} is not the transpose of "
+            f"gate_proj logical {logical_gate}",
             file=sys.stderr,
         )
         ok = False
@@ -113,16 +130,16 @@ def _check_shapes(path: Path, layout, last_layer: int, last_expert: int) -> bool
     # hidden_size). Real MoEs differ on which dim is which (HF-Mixtral
     # gate is (num_experts, hidden), APEX-fake gate is (hidden, num_experts)),
     # so we don't enforce orientation — just share-a-dim.
-    if not (set(gate_shape) & set(gate_proj_shape)):
+    if not (set(logical_router) & set(logical_gate)):
         print(
-            f"  [WARN] gate {gate_shape} doesn't share a dim with "
-            f"gate_proj {gate_proj_shape}; check that --layout matches the model",
+            f"  [WARN] gate logical {logical_router} doesn't share a dim with "
+            f"gate_proj logical {logical_gate}; check that --layout matches the model",
             file=sys.stderr,
         )
 
     # Brief inferred-shape summary so the caller knows what they got.
     print(
-        f"  inferred: hidden∈{set(gate_proj_shape) & set(gate_shape) or '?'}, "
+        f"  inferred: hidden∈{set(logical_gate) & set(logical_router) or '?'}, "
         f"layers={last_layer + 1}, experts={last_expert + 1}"
     )
     return ok

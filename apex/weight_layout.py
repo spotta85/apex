@@ -26,7 +26,8 @@ Layouts shipped here:
   - FakeMoELayout    APEX's own fake checkpoints (used by demos / tests)
   - MixtralLayout    mistralai/Mixtral-8x7B-v0.1
   - QwenMoELayout    Qwen/Qwen1.5-MoE-A2.7B
-  - GemmaMoELayout   google/gemma-4-26B-A4B-it (multimodal wrapper)
+  - GemmaMoELayout   NVIDIA-style Gemma 4 NVFP4 tensor names
+  - GemmaHFMoELayout mlx-community lowercase Gemma 4 checkpoint names
 
 Use `get_layout(name)` to look one up by short name.
 """
@@ -186,10 +187,47 @@ class GemmaMoELayout(_MoELayoutBase):
         return f"model.language_model.layers.{layer_id}.experts.{expert_id}.down_proj.weight"
 
 
+class GemmaHFMoELayout(_MoELayoutBase):
+    """mlx-community/gemma-4-26b-a4b-it-nvfp4 stacked expert layout.
+
+    This is deliberately separate from `GemmaMoELayout`: the local
+    lowercase checkpoint uses different names and stores every layer's
+    routed experts in one stacked `experts.switch_glu.*` tensor rather
+    than one tensor per expert. Stores that support this layout must
+    slice axis 0 by expert id before dequantizing.
+    """
+
+    stacked_experts = True
+    num_experts = 128
+    expert_pack_factor = 8
+    router_pack_factor = 4
+
+    def gate_weight(self, layer_id: int) -> str:
+        return f"language_model.model.layers.{layer_id}.router.proj.weight"
+
+    def router_tensors(self, layer_id: int) -> dict:
+        prefix = f"language_model.model.layers.{layer_id}.router.proj"
+        return {
+            "weight": f"{prefix}.weight",
+            "scales": f"{prefix}.scales",
+            "biases": f"{prefix}.biases",
+        }
+
+    def expert_gate_proj(self, layer_id: int, expert_id: int) -> str:
+        return f"language_model.model.layers.{layer_id}.experts.switch_glu.gate_proj.weight"
+
+    def expert_up_proj(self, layer_id: int, expert_id: int) -> str:
+        return f"language_model.model.layers.{layer_id}.experts.switch_glu.up_proj.weight"
+
+    def expert_down_proj(self, layer_id: int, expert_id: int) -> str:
+        return f"language_model.model.layers.{layer_id}.experts.switch_glu.down_proj.weight"
+
+
 # Registry: short name -> layout class. Private because extension is
 # class-level (just import the class), not registration-level.
 _LAYOUTS = {
     "fake": FakeMoELayout,
+    "gemma-hf-moe": GemmaHFMoELayout,
     "mixtral": MixtralLayout,
     "qwen-moe": QwenMoELayout,
     "gemma-moe": GemmaMoELayout,

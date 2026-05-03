@@ -11,8 +11,10 @@ from pathlib import Path
 import numpy as np
 
 from apex.checkpoint_index import read_safetensors_index
+from apex.dequant import dequantize
 from apex.moe_layer import route
 from apex.safetensors_loader import load_tensor
+from apex.tensor_types import QuantizedTensor
 
 
 class MultiLayerRealRouter:
@@ -31,15 +33,35 @@ class MultiLayerRealRouter:
 
     def _load_for_layer(self, layer_id: int):
         if layer_id not in self._weights:
-            name = self.layout.gate_weight(layer_id)
-            self._weights[layer_id] = load_tensor(
-                self.path / self._weight_map[name], name,
-            )
+            self._weights[layer_id] = self._load_router_weight(layer_id)
         return self._weights[layer_id]
+
+    def _load_router_weight(self, layer_id: int):
+        if hasattr(self.layout, "router_tensors"):
+            names = self.layout.router_tensors(layer_id)
+            data = self._load_one(names["weight"])
+            tensor = QuantizedTensor(
+                data=data,
+                dtype="AFFINE_UINT8_U32",
+                shape=tuple(data.shape),
+                weight_scale=self._load_one(names["scales"]),
+                weight_scale_2=self._load_one(names["biases"]),
+            )
+            return dequantize(tensor, name=names["weight"])
+
+        name = self.layout.gate_weight(layer_id)
+        return self._load_one(name)
+
+    def _load_one(self, name: str):
+        return load_tensor(self.path / self._weight_map[name], name)
 
     def shape_for_layer(self, layer_id: int):
         """Return (num_experts, hidden_dim) for a layer's router weight."""
         return self._load_for_layer(layer_id).shape
+
+    def weight_for_layer(self, layer_id: int):
+        """Return a layer's dequantized router projection."""
+        return self._load_for_layer(layer_id)
 
     def route(self, layer_id: int, hidden_state):
         router_weight = self._load_for_layer(layer_id)

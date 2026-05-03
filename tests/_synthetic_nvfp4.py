@@ -112,3 +112,21 @@ def skip_if_no_real_checkpoint():
             f"{DEFAULT_REAL_PATH} (set ${REAL_PATH_ENV} to override)"
         ),
     )
+
+
+def real_layout_and_quant_store(path):
+    """Return the supported Gemma layout + quantized store for `path`."""
+    from apex.checkpoint_index import read_safetensors_index
+    from apex.gemma_hf_store import GemmaHFQuantizedExpertStore
+    from apex.quantized_safetensors_store import QuantizedSafetensorsExpertStore
+    from apex.weight_layout import get_layout
+
+    weight_map = read_safetensors_index(path)
+    for layout_name, store_cls in [
+        ("gemma-moe", QuantizedSafetensorsExpertStore),
+        ("gemma-hf-moe", GemmaHFQuantizedExpertStore),
+    ]:
+        layout = get_layout(layout_name)
+        if layout.gate_weight(0) in weight_map:
+            return layout, store_cls(path, layout=layout)
+    raise AssertionError(f"no supported Gemma MoE layout matched {path}")

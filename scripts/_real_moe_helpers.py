@@ -7,7 +7,6 @@ from pathlib import Path
 import numpy as np
 
 from apex.checkpoint_index import read_safetensors_index
-from apex.safetensors_loader import load_tensor
 
 
 _GEMMA_PATH_CANDIDATES = (
@@ -29,15 +28,38 @@ def nvfp4_matmul_warnings():
 
 def load_router(path, layout, layer_id):
     """Return (router_weight_fp32, num_experts, hidden_dim) for one layer."""
+    from apex.real_router import MultiLayerRealRouter
+
+    router_loader = MultiLayerRealRouter(path, layout, top_k=1)
+    router = router_loader.weight_for_layer(layer_id)
+    num_experts, hidden_dim = router.shape
+    return router, num_experts, hidden_dim
+
+
+def detect_real_moe_layout(path):
+    """Return a supported Gemma layout for a sharded checkpoint path."""
+    from apex.weight_layout import get_layout
+
     path = Path(path)
-    name = layout.gate_weight(layer_id)
     cache_key = path.resolve()
     if cache_key not in _WEIGHT_MAP_CACHE:
         _WEIGHT_MAP_CACHE[cache_key] = read_safetensors_index(cache_key)
     weight_map = _WEIGHT_MAP_CACHE[cache_key]
-    router = load_tensor(path / weight_map[name], name)
-    num_experts, hidden_dim = router.shape
-    return router, num_experts, hidden_dim
+    for name in ("gemma-moe", "gemma-hf-moe"):
+        layout = get_layout(name)
+        if layout.gate_weight(0) in weight_map:
+            return name, layout
+    raise SystemExit(f"could not detect a supported Gemma MoE layout for {path}")
+
+
+def quantized_store_for_layout(path, layout):
+    """Return the quantized expert store matching `layout`."""
+    from apex.gemma_hf_store import GemmaHFQuantizedExpertStore
+    from apex.quantized_safetensors_store import QuantizedSafetensorsExpertStore
+
+    if getattr(layout, "stacked_experts", False):
+        return GemmaHFQuantizedExpertStore(path, layout=layout)
+    return QuantizedSafetensorsExpertStore(path, layout=layout)
 
 
 def add_real_moe_args(

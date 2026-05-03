@@ -83,6 +83,20 @@ def _nibble_pack(low_codes, high_codes) -> np.ndarray:
             np.asarray(low_codes, dtype=np.uint8)).astype(np.uint8)
 
 
+def _u32_pack_nibbles(codes) -> np.ndarray:
+    """Pack eight 4-bit codes into little-endian uint32 words."""
+    codes = np.asarray(codes, dtype=np.uint32)
+    assert codes.size % 8 == 0
+    return sum(codes[i::8] << (4 * i) for i in range(8)).astype(np.uint32)
+
+
+def _u32_pack_bytes(values) -> np.ndarray:
+    """Pack four uint8 values into little-endian uint32 words."""
+    values = np.asarray(values, dtype=np.uint32)
+    assert values.size % 4 == 0
+    return sum(values[i::4] << (8 * i) for i in range(4)).astype(np.uint32)
+
+
 def _build_nvfp4_tensor(rows, codes_per_row, block_scale_byte, weight_scale_2):
     """Build a small NVFP4 QuantizedTensor with controlled inputs.
 
@@ -187,6 +201,36 @@ def test_nvfp4_negative_codes_decode_to_negative_values():
     np.testing.assert_array_equal(
         out, np.full((1, NVFP4_GROUP_SIZE), -1.0, dtype=np.float32),
     )
+
+
+def test_nvfp4_u32_unpacks_eight_codes_per_word():
+    codes = [0x2, 0x4] * (NVFP4_GROUP_SIZE // 2)
+    qt = QuantizedTensor(
+        data=_u32_pack_nibbles(codes).reshape(1, -1),
+        dtype="NVFP4_U32",
+        shape=(1, 2),
+        weight_scale=np.array([[0x38]], dtype=np.uint8),
+    )
+
+    out = dequantize(qt)
+
+    expected = np.tile([1.0, 2.0], NVFP4_GROUP_SIZE // 2).astype(np.float32)
+    np.testing.assert_array_equal(out, expected.reshape(1, -1))
+
+
+def test_affine_uint8_u32_unpacks_bytes_and_applies_groups():
+    qt = QuantizedTensor(
+        data=_u32_pack_bytes([0, 1, 2, 3, 4, 5, 6, 7]).reshape(1, -1),
+        dtype="AFFINE_UINT8_U32",
+        shape=(1, 2),
+        weight_scale=np.array([[0.5, -1.0]], dtype=np.float32),
+        weight_scale_2=np.array([[10.0, 20.0]], dtype=np.float32),
+    )
+
+    out = dequantize(qt)
+
+    expected = np.array([[10.0, 10.5, 11.0, 11.5, 16.0, 15.0, 14.0, 13.0]])
+    np.testing.assert_array_equal(out, expected.astype(np.float32))
 
 
 # --- NVFP4 failure paths --------------------------------------------------

@@ -5,7 +5,7 @@ APEX is a from-scratch Mixture-of-Experts (MoE) inference runtime focused on **b
 ## How to test
 
 ```bash
-# Full unit suite (220 tests, real-checkpoint tests skip if absent)
+# Full unit suite (226 tests, real-checkpoint tests skip if absent)
 uv run pytest -q
 
 # Seven fake-MoE demos — each exercises a different combination of
@@ -30,6 +30,7 @@ Diagnostic scripts:
 ```bash
 uv run python scripts/inspect_weight_names.py <path>          # list tensor names
 uv run python scripts/validate_layout.py <path> --layout gemma-moe [--check-shapes]
+uv run python scripts/validate_layout.py <path> --layout gemma-hf-moe [--check-shapes]
 ```
 
 ---
@@ -108,7 +109,7 @@ weighted-combine via apex.moe_layer.run_moe_layer
 | `predictor.py` | Markov predictor over `(layer, experts) → next_experts` | `MarkovPredictor` |
 | `router.py` | `FakeRouter` returns hand-coded picks (no math) | `FakeRouter` |
 | `gate_router.py` | Real top-k routing via `hidden @ gate.npy` | `GateRouter` |
-| `real_router.py` | Lazy per-layer router loading from real sharded safetensors | `MultiLayerRealRouter` |
+| `real_router.py` | Lazy per-layer router loading/dequant from real sharded safetensors | `MultiLayerRealRouter` |
 | `metrics.py` | Counters (cache_hit/miss/eviction, prefetch_hit/miss) | `Metrics` |
 | `trace_recorder.py` | Append-only JSONL transition log for predictor training | `TraceRecorder` |
 | `types.py` | `ExpertWeights(gate_proj, up_proj, down_proj)` | dataclass |
@@ -135,19 +136,20 @@ weighted-combine via apex.moe_layer.run_moe_layer
 | `safetensors_expert_store.py` | safetensors (single file) | uses `safetensors.numpy` |
 | `gguf_expert_store.py` | GGUF (mmap-backed) | fp32 unquantized only |
 | `quantized_safetensors_store.py` | NVFP4 sharded safetensors | returns `QuantizedTensor` bundles |
+| `gemma_hf_store.py` | Lowercase HF/MLX Gemma stacked safetensors | slices stacked experts before dequant |
 | `safetensors_gate_router.py` / `gguf_gate_router.py` / `mlx_gate_router.py` | Router-weight loaders | Return `(ids, None)` for uniform combine |
 
 ### `apex/` — naming + format helpers
 
 | File | What it does |
 |------|--------------|
-| `weight_layout.py` | `FakeMoELayout`, `MixtralLayout`, `QwenMoELayout`, `GemmaMoELayout` + `get_layout(name)` registry |
+| `weight_layout.py` | `FakeMoELayout`, `MixtralLayout`, `QwenMoELayout`, `GemmaMoELayout`, `GemmaHFMoELayout` + `get_layout(name)` registry |
 | `checkpoint_index.py` | Metadata-only queries: `list_tensor_names`, `get_tensor_shape`, `read_safetensors_index` (handles single file / sharded dir / gguf) |
 | `safetensors_loader.py` | `load_tensor(path, name)` — manual header parsing so BF16 / F8 work without torch |
 | `gguf_tensor_index.py` | Lightweight wrapper around `gguf.GGUFReader` with shape-corrected metadata |
 | `tensor_types.py` | `RawTensor`, `QuantizedTensor` dataclasses (sidecars for dequant) |
 | `tensor_utils.py` | `tensor_nbytes(x)` — single source of truth for cache budget accounting |
-| `dequant.py` | `dequantize(t)` + `dequantize_bundle(b)` — NVFP4 (E2M1 lookup + F8_E4M3 block scale + F32 scalar), BF16. Also `DequantizingExpertStore(base)` — wraps any quantized store so the cache holds fp32 bundles |
+| `dequant.py` | `dequantize(t)` + `dequantize_bundle(b)` — NVFP4 uint8, U32-packed NVFP4, U32-packed affine uint8 router weights, BF16. Also `DequantizingExpertStore(base)` — wraps any quantized store so the cache holds fp32 bundles |
 | `_fake_weights.py` | `write_npy_world` / `write_safetensors_world` / `write_gguf_world` + `make_expert_bundle` + size constants |
 | `_numpy_gate_router_base.py` | `BaseNumpyGateRouter` — shared top-k math for the three numpy routers |
 | `demo_modes.py` | `RuntimeBundle` dataclass + factory funcs that wire up each demo |
@@ -166,11 +168,11 @@ weighted-combine via apex.moe_layer.run_moe_layer
 
 ### `tests/`
 
-32 test modules, 220 tests total. `tests/_world.py` provides `FakeStore` + re-exports the fake-world writers from `apex._fake_weights`. `tests/test_real_moe_cache.py`, `tests/test_real_moe_two_layer.py`, and `tests/test_runtime_real_integration.py` include real-Gemma tests that auto-skip unless `REAL_MOE_PATH` (or a known local default path) resolves.
+34 test modules, 226 tests total. `tests/_world.py` provides `FakeStore` + re-exports the fake-world writers from `apex._fake_weights`. `tests/test_real_moe_cache.py`, `tests/test_real_moe_two_layer.py`, and `tests/test_runtime_real_integration.py` include real-Gemma tests that auto-skip unless `REAL_MOE_PATH` (or a known local default path) resolves.
 
 ---
 
-## What's done (steps 1–12)
+## What's done (steps 1–13)
 
 1–3. Bounded LRU cache, prefetcher, Markov predictor, metrics.
 4. SwiGLU FFN experts (gate/up/down bundles via `ExpertWeights`).
@@ -182,6 +184,7 @@ weighted-combine via apex.moe_layer.run_moe_layer
 10. Real MoE cache integration: `DequantizingExpertStore` + `demo_real_moe_cache.py`. First pass: 8 misses + 8 dequants. Second pass: 8 hits, ~167x speedup.
 11. Two-layer real smoke: `smoke_real_moe_two_layer.py`. Cache key disambiguates by `(layer, expert)`; cross-layer cache state survives intact; ~200x cold→warm speedup.
 12. Runtime integration: routers return `(ids, weights)`, `Runtime` calls `run_moe_layer`, accepts `initial_hidden`, and `MultiLayerRealRouter` lets `scripts/demo_real_runtime.py` drive real Gemma MoE layers through the main orchestrator.
+13. Lowercase HF/MLX Gemma checkpoint support: `GemmaHFMoELayout`, stacked expert slicing via `GemmaHFQuantizedExpertStore`, U32-packed expert/router dequantization, layout auto-detection in `demo_real_runtime.py`, and real Runtime validation against the local `gemma-4-26b-a4b-it-nvfp4` checkpoint.
 
 ---
 

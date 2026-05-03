@@ -77,7 +77,7 @@ uv run python scripts/smoke_real_moe_two_layer.py \
 
 ### Phase 3 — Runtime Drives Real Gemma MoE Layers
 
-Implemented in the working tree.
+Completed in commit `40d40f9`.
 
 Core changes:
 
@@ -124,22 +124,67 @@ Fake-demo compatibility:
 
 Real-runtime verification status:
 
-- `scripts/demo_real_runtime.py --help` imports cleanly.
-- The real Runtime test exists and auto-skips when no compatible
-  checkpoint is present.
-- The compatible NVIDIA-style checkpoint used during Phase 2 is not
-  currently present in this workspace.
-- The only current checkpoint found at
-  `/Users/spotta/Desktop/models/gemma4/gemma-4-26b-a4b-it-nvfp4` does
-  not match `GemmaMoELayout`; `validate_layout` fails on:
+- NVIDIA-style `GemmaMoELayout` remains supported.
+- The lowercase local checkpoint is handled by Step 13 below.
+
+### Step 13 — Current Local Gemma Checkpoint Support
+
+Implemented.
+
+The currently available checkpoint is:
 
 ```text
-model.language_model.layers.0.router.proj.weight
+/Users/spotta/Desktop/models/gemma4/gemma-4-26b-a4b-it-nvfp4
 ```
 
-So real Runtime execution still needs to be re-run once a compatible
-`nvidia/Gemma-4-26B-A4B-NVFP4` style checkpoint path is restored or
-provided via `REAL_MOE_PATH`.
+It uses lowercase HF/MLX names and stacked expert tensors, so it is not
+compatible with the NVIDIA-style `GemmaMoELayout`.
+
+Core changes:
+
+- Added `GemmaHFMoELayout` under layout key `gemma-hf-moe`.
+- Updated `validate_layout.py` to understand stacked packed experts.
+- Added U32-packed NVFP4 expert dequantization.
+- Added U32-packed affine uint8 router dequantization.
+- Added `GemmaHFQuantizedExpertStore`, which slices one expert from the
+  stacked layer tensor before dequantization.
+- Updated `MultiLayerRealRouter` to dequantize quantized router
+  projections when the layout exposes router sidecars.
+- Updated `scripts/demo_real_runtime.py` to auto-detect `gemma-moe` vs
+  `gemma-hf-moe`.
+
+Verification:
+
+```bash
+uv run python scripts/validate_layout.py \
+  /Users/spotta/Desktop/models/gemma4/gemma-4-26b-a4b-it-nvfp4 \
+  --layout gemma-hf-moe --check-shapes
+# Result: layout validation passed; detected 30 layers x 128 experts.
+
+uv run python scripts/demo_real_runtime.py \
+  --path /Users/spotta/Desktop/models/gemma4/gemma-4-26b-a4b-it-nvfp4
+# Result: first run 16 misses; second run 16 hits; finite output.
+
+uv run python scripts/smoke_real_moe_layer.py \
+  --path /Users/spotta/Desktop/models/gemma4/gemma-4-26b-a4b-it-nvfp4
+uv run python scripts/demo_real_moe_cache.py \
+  --path /Users/spotta/Desktop/models/gemma4/gemma-4-26b-a4b-it-nvfp4
+uv run python scripts/smoke_real_moe_two_layer.py \
+  --path /Users/spotta/Desktop/models/gemma4/gemma-4-26b-a4b-it-nvfp4
+# Result: all passed with auto-detected gemma-hf-moe layout.
+
+REAL_MOE_PATH=/Users/spotta/Desktop/models/gemma4/gemma-4-26b-a4b-it-nvfp4 \
+  uv run pytest \
+  tests/test_runtime_real_integration.py::test_real_gemma_two_layer_runtime_run_then_run -q
+# Result: 1 passed
+
+uv run pytest -q
+# Result: 226 passed, 3 skipped
+
+REAL_MOE_PATH=/Users/spotta/Desktop/models/gemma4/gemma-4-26b-a4b-it-nvfp4 \
+  uv run pytest -q
+# Result: 229 passed
+```
 
 ## What This Means
 
@@ -181,24 +226,15 @@ Full Gemma generation remains out of scope. Missing pieces:
 
 ## Next Recommended Steps
 
-1. Restore or point `REAL_MOE_PATH` at a compatible NVIDIA-style Gemma 4
-   NVFP4 checkpoint, then run:
-
-```bash
-uv run python scripts/demo_real_runtime.py --path "$REAL_MOE_PATH"
-REAL_MOE_PATH="$REAL_MOE_PATH" \
-  uv run pytest tests/test_runtime_real_integration.py::test_real_gemma_two_layer_runtime_run_then_run -q
-```
-
-2. Commit Phase 3 once the current working tree is reviewed.
+1. Commit Step 13 after review.
 
 Suggested commit message:
 
 ```text
-step 12: drive real Gemma MoE layers through Runtime
+step 13: support lowercase Gemma MoE checkpoint
 ```
 
-3. Decide the next product direction:
+2. Decide the next product direction:
 
 - If the goal is stronger MoE-runtime correctness: add Gemma router
   scale / per-expert-scale support.
@@ -208,7 +244,8 @@ step 12: drive real Gemma MoE layers through Runtime
 
 ## Current Known Limitation
 
-The local checkpoint path changed during verification. Phase 2 ran on a
-compatible path, but the currently available checkpoint uses different
-tensor names and shapes. Do not treat the current skipped real Runtime
-test as proof of failure; it is a layout/checkpoint mismatch.
+- The local lowercase checkpoint now runs through `Runtime`, but APEX
+  still ignores Gemma's `router.scale` and `router.per_expert_scale`
+  tensors.
+- The always-on dense/shared MLP path is still not executed.
+- This is still MoE-block execution, not full Gemma text generation.

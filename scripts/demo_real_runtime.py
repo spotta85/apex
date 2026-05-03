@@ -14,11 +14,15 @@ from apex.dequant import DequantizingExpertStore
 from apex.expert_cache import ExpertCache
 from apex.expert_manager import ExpertManager
 from apex.metrics import Metrics
-from apex.quantized_safetensors_store import QuantizedSafetensorsExpertStore
 from apex.real_router import MultiLayerRealRouter
 from apex.runtime import Runtime
-from apex.weight_layout import get_layout
-from scripts._real_moe_helpers import add_real_moe_args, nvfp4_matmul_warnings
+from apex.weight_layout import available_layouts, get_layout
+from scripts._real_moe_helpers import (
+    add_real_moe_args,
+    detect_real_moe_layout,
+    nvfp4_matmul_warnings,
+    quantized_store_for_layout,
+)
 
 
 def main():
@@ -30,15 +34,24 @@ def main():
         default=2,
         help="number of real MoE layers to drive (default: 2)",
     )
+    parser.add_argument(
+        "--layout",
+        choices=available_layouts(),
+        default=None,
+        help="checkpoint layout; omitted means auto-detect Gemma layouts",
+    )
     args = parser.parse_args()
 
     path = Path(args.path)
     if not path.is_dir():
         raise SystemExit(f"checkpoint directory not found: {path}")
 
-    layout = get_layout("gemma-moe")
+    layout_name, layout = (args.layout, get_layout(args.layout)) if args.layout else (
+        detect_real_moe_layout(path)
+    )
+    print(f"layout: {layout_name}")
     router = MultiLayerRealRouter(path, layout, top_k=args.top_k)
-    quant_store = QuantizedSafetensorsExpertStore(path, layout=layout)
+    quant_store = quantized_store_for_layout(path, layout)
     store = DequantizingExpertStore(quant_store, verbose=False)
     metrics = Metrics()
     cache = ExpertCache(max_memory_mb=args.max_memory_mb, verbose=False, metrics=metrics)

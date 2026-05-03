@@ -13,6 +13,7 @@ import pytest
 
 from apex.weight_layout import (
     FakeMoELayout,
+    GemmaHFMoELayout,
     GemmaMoELayout,
     MixtralLayout,
     QwenMoELayout,
@@ -149,11 +150,44 @@ def test_gemma_expert_tensors_returns_canonical_keys():
     assert set(names) == {"gate_proj", "up_proj", "down_proj"}
 
 
+# --- GemmaHFMoELayout ------------------------------------------------------
+
+def test_gemma_hf_gate_weight_format():
+    assert (
+        GemmaHFMoELayout().gate_weight(0)
+        == "language_model.model.layers.0.router.proj.weight"
+    )
+
+
+def test_gemma_hf_stacked_expert_projection_formats():
+    layout = GemmaHFMoELayout()
+    base = "language_model.model.layers.0.experts.switch_glu"
+    assert layout.expert_gate_proj(0, 7) == f"{base}.gate_proj.weight"
+    assert layout.expert_up_proj(0, 7) == f"{base}.up_proj.weight"
+    assert layout.expert_down_proj(0, 7) == f"{base}.down_proj.weight"
+
+
+def test_gemma_hf_router_sidecar_formats():
+    assert GemmaHFMoELayout().router_tensors(3) == {
+        "weight": "language_model.model.layers.3.router.proj.weight",
+        "scales": "language_model.model.layers.3.router.proj.scales",
+        "biases": "language_model.model.layers.3.router.proj.biases",
+    }
+
+
+def test_gemma_hf_marks_stacked_experts():
+    layout = GemmaHFMoELayout()
+    assert layout.stacked_experts is True
+    assert layout.num_experts == 128
+    assert layout.expert_pack_factor == 8
+    assert layout.router_pack_factor == 4
+
+
 # --- Cross-layout sanity ---------------------------------------------------
 
 @pytest.mark.parametrize(
     "layout_cls",
-    [FakeMoELayout, MixtralLayout, QwenMoELayout, GemmaMoELayout],
+    [FakeMoELayout, MixtralLayout, QwenMoELayout, GemmaMoELayout, GemmaHFMoELayout],
 )
 def test_all_layouts_share_expert_tensors_contract(layout_cls):
     # Every layout must return the same three keys from expert_tensors.
