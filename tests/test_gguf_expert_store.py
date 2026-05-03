@@ -10,14 +10,16 @@ from tests._world import write_gguf_world
 
 
 def test_loads_expert_as_bundle(tmp_path):
+    # HF-orientation SwiGLU shapes — gate/up are (intermediate, hidden),
+    # down is (hidden, intermediate).
     path = write_gguf_world(tmp_path / "x.gguf")
 
     bundle = GGUFExpertStore(str(path), FakeMoELayout()).load(0, 1)
 
     assert isinstance(bundle, ExpertWeights)
-    assert bundle.gate_proj.shape == (8, 16)
-    assert bundle.up_proj.shape == (8, 16)
-    assert bundle.down_proj.shape == (16, 8)
+    assert bundle.gate_proj.shape == (16, 8)
+    assert bundle.up_proj.shape == (16, 8)
+    assert bundle.down_proj.shape == (8, 16)
     assert bundle.gate_proj.dtype == np.float32
 
 
@@ -35,16 +37,16 @@ def test_uses_layout_for_tensor_naming(tmp_path):
 
     path = tmp_path / "x.gguf"
     writer = GGUFWriter(str(path), "probe")
-    writer.add_tensor("weird/0/1/g", np.full((8, 16), 9.0, dtype="float32"))
-    writer.add_tensor("weird/0/1/u", np.full((8, 16), 9.0, dtype="float32"))
-    writer.add_tensor("weird/0/1/d", np.full((16, 8), 9.0, dtype="float32"))
+    writer.add_tensor("weird/0/1/g", np.full((16, 8), 9.0, dtype="float32"))
+    writer.add_tensor("weird/0/1/u", np.full((16, 8), 9.0, dtype="float32"))
+    writer.add_tensor("weird/0/1/d", np.full((8, 16), 9.0, dtype="float32"))
     writer.write_header_to_file()
     writer.write_kv_data_to_file()
     writer.write_tensors_to_file()
     writer.close()
 
     bundle = GGUFExpertStore(str(path), WeirdLayout()).load(0, 1)
-    assert bundle.gate_proj.shape == (8, 16)
+    assert bundle.gate_proj.shape == (16, 8)
 
 
 def test_missing_projection_raises_key_error(tmp_path):

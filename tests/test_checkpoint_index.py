@@ -95,9 +95,10 @@ def test_get_tensor_shape_safetensors(tmp_path):
     path = tmp_path / "fake.safetensors"
     write_safetensors_world(path)
 
-    # write_safetensors_world produces gate_proj (hidden=8) x (intermediate=16).
-    assert get_tensor_shape(path, "layers.0.experts.0.gate_proj.weight") == (8, 16)
-    assert get_tensor_shape(path, "layers.0.experts.0.down_proj.weight") == (16, 8)
+    # write_safetensors_world produces HF-oriented projections:
+    # gate/up are (intermediate=16, hidden=8); down is (8, 16).
+    assert get_tensor_shape(path, "layers.0.experts.0.gate_proj.weight") == (16, 8)
+    assert get_tensor_shape(path, "layers.0.experts.0.down_proj.weight") == (8, 16)
     assert get_tensor_shape(path, "layers.0.gate.weight") == (8, 4)
 
 
@@ -105,8 +106,8 @@ def test_get_tensor_shape_gguf(tmp_path):
     path = tmp_path / "fake.gguf"
     write_gguf_world(path)
 
-    assert get_tensor_shape(path, "layers.0.experts.0.gate_proj.weight") == (8, 16)
-    assert get_tensor_shape(path, "layers.0.experts.0.down_proj.weight") == (16, 8)
+    assert get_tensor_shape(path, "layers.0.experts.0.gate_proj.weight") == (16, 8)
+    assert get_tensor_shape(path, "layers.0.experts.0.down_proj.weight") == (8, 16)
 
 
 def test_get_tensor_shape_sharded(tmp_path):

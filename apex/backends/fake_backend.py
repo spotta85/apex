@@ -4,10 +4,12 @@ A real backend would call into MLX, llama.cpp, a CUDA kernel, etc.
 For the MVP we just do NumPy matmul / silu so the runtime can move
 data through the pipeline and produce real arrays.
 
-Step 4 changed `run_expert` from a single matmul to the standard
-SwiGLU FFN:
+Step 4 made `run_expert` a SwiGLU FFN; the HF-orientation refactor
+flipped the projection shapes so APEX matches every public Transformer
+checkpoint (Mixtral, Qwen MoE, Gemma 4, etc.) without per-load
+transposes:
 
-    out = (silu(h @ gate_proj) * (h @ up_proj)) @ down_proj
+    out = (silu(h @ gate_proj.T) * (h @ up_proj.T)) @ down_proj.T
 
 Backend interface:
   - name                          string, used in trace lines
@@ -36,20 +38,23 @@ class FakeBackend:
         return hidden_state
 
     def run_expert(self, hidden_state, expert_weights):
-        # SwiGLU FFN, the standard MoE expert shape:
-        #   out = (silu(h @ W_gate) * (h @ W_up)) @ W_down
+        # SwiGLU FFN with HF (PyTorch) weight orientation: each
+        # projection's weight is stored as (out_features, in_features),
+        # so projecting with the input requires multiplying against the
+        # transpose. This is what every public HF MoE checkpoint
+        # (Mixtral, Qwen MoE, Gemma 4) lays out, so APEX needs no
+        # per-load transpose to consume real weights.
         # Shapes:
         #   h:        (batch, hidden)
-        #   W_gate:   (hidden, intermediate)
-        #   W_up:     (hidden, intermediate)
-        #   W_down:   (intermediate, hidden)
-        #   out:      (batch, hidden)  -- same as input, so layers chain
-        gate = hidden_state @ expert_weights.gate_proj
-        up = hidden_state @ expert_weights.up_proj
+        #   gate_proj: (intermediate, hidden)   -> h @ gate_proj.T -> (batch, intermediate)
+        #   up_proj:   (intermediate, hidden)   -> h @ up_proj.T   -> (batch, intermediate)
+        #   down_proj: (hidden, intermediate)   -> ... @ down_proj.T -> (batch, hidden)
+        gate = hidden_state @ expert_weights.gate_proj.T
+        up = hidden_state @ expert_weights.up_proj.T
         # silu(x) = x * sigmoid(x) = x / (1 + exp(-x)).
         # Compact form; numerically OK for our small fake values.
         gate_silu = gate / (1.0 + np.exp(-gate))
-        return (gate_silu * up) @ expert_weights.down_proj
+        return (gate_silu * up) @ expert_weights.down_proj.T
 
     def combine_outputs(self, outputs):
         # Uniform mean across the per-expert outputs. Real MoE uses

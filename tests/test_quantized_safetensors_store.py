@@ -67,14 +67,18 @@ def _build_fake_nvfp4_expert(path, layout, layer_id, expert_id, hidden, intermed
 
     All FP4 codes are 1.0 (0x2), all block scales are 1.0 (E4M3 0x38),
     weight_scale_2 is 1.0 — so dequantization yields all-ones matrices.
+
+    Shapes follow HF orientation: gate_proj/up_proj are (intermediate,
+    hidden); down_proj is (hidden, intermediate). After dequant the
+    backend multiplies against `.T`.
     """
     names = layout.expert_tensors(layer_id, expert_id)
     items = []
     for proj_key, weight_name in names.items():
         if proj_key == "down_proj":
-            rows, cols = intermediate, hidden
-        else:
             rows, cols = hidden, intermediate
+        else:
+            rows, cols = intermediate, hidden
         prefix = weight_name[: -len(".weight")]
         packed = _nvfp4_packed_ones(rows, cols)
         scales = np.full(
@@ -180,10 +184,11 @@ def test_sharded_directory_load(tmp_path):
     shard_a_items = []
     shard_b_items = []
     for proj_key, weight_name in names.items():
+        # HF orientation: gate/up are (intermediate, hidden); down is reversed.
         if proj_key == "down_proj":
-            rows, cols = intermediate, hidden
-        else:
             rows, cols = hidden, intermediate
+        else:
+            rows, cols = intermediate, hidden
         prefix = weight_name[: -len(".weight")]
         packed = _nvfp4_packed_ones(rows, cols)
         scales = np.full(

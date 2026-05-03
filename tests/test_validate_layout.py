@@ -70,7 +70,8 @@ def test_passes_on_sharded_directory(tmp_path):
         for E in range(4):
             for proj_key, name in layout.expert_tensors(L, E).items():
                 # All experts go to shard B; gate stays in shard A.
-                shape = (8, 16) if proj_key in ("gate_proj", "up_proj") else (16, 8)
+                # HF orientation: gate/up are (intermediate, hidden); down is reversed.
+                shape = (16, 8) if proj_key in ("gate_proj", "up_proj") else (8, 16)
                 shard_b_tensors[name] = rng.standard_normal(shape).astype("float32")
         if L == 1:
             shard_a_tensors[layout.gate_weight(L)] = rng.standard_normal((8, 4)).astype("float32")
@@ -98,10 +99,10 @@ def test_check_shapes_reports_shapes(tmp_path):
     rc, stdout, _ = run_validate(path, "--layout", "fake", "--check-shapes")
     assert rc == 0
     # Spot-check that the shapes section landed and contains the
-    # canonical fake-world dimensions.
+    # canonical fake-world dimensions in HF orientation.
     assert "shapes (expert 0,0):" in stdout
-    assert "(8, 16)" in stdout  # gate_proj / up_proj
-    assert "(16, 8)" in stdout  # down_proj
+    assert "(16, 8)" in stdout  # gate_proj / up_proj: (intermediate, hidden)
+    assert "(8, 16)" in stdout  # down_proj: (hidden, intermediate)
     assert "(8, 4)" in stdout   # gate router (hidden=8, num_experts=4)
 
 
@@ -114,10 +115,11 @@ def test_check_shapes_fails_on_inconsistent_projections(tmp_path):
     tensors = {layout.gate_weight(0): rng.standard_normal((8, 4)).astype("float32")}
     for E in range(4):
         names = layout.expert_tensors(0, E)
-        tensors[names["gate_proj"]] = rng.standard_normal((8, 16)).astype("float32")
-        # WRONG: up_proj smaller than gate_proj.
-        tensors[names["up_proj"]] = rng.standard_normal((8, 12)).astype("float32")
-        tensors[names["down_proj"]] = rng.standard_normal((16, 8)).astype("float32")
+        # HF orientation: gate/up are (intermediate=16, hidden=8); down is (8, 16).
+        tensors[names["gate_proj"]] = rng.standard_normal((16, 8)).astype("float32")
+        # WRONG: up_proj has the wrong intermediate dim.
+        tensors[names["up_proj"]] = rng.standard_normal((12, 8)).astype("float32")
+        tensors[names["down_proj"]] = rng.standard_normal((8, 16)).astype("float32")
 
     path = tmp_path / "broken.safetensors"
     save_file(tensors, str(path))
@@ -128,8 +130,8 @@ def test_check_shapes_fails_on_inconsistent_projections(tmp_path):
     # failure is purely about shape consistency.
     assert "[ok]" in stdout
     assert "MISMATCH" in stderr
-    assert "(8, 12)" in stderr
-    assert "(8, 16)" in stderr
+    assert "(12, 8)" in stderr
+    assert "(16, 8)" in stderr
 
 
 # --- failure paths ---------------------------------------------------------
@@ -160,9 +162,10 @@ def test_fails_when_one_expert_projection_is_missing(tmp_path):
         tensors[layout.gate_weight(L)] = rng.standard_normal((8, 4)).astype("float32")
         for E in range(4):
             names = layout.expert_tensors(L, E)
-            tensors[names["gate_proj"]] = rng.standard_normal((8, 16)).astype("float32")
-            tensors[names["up_proj"]] = rng.standard_normal((8, 16)).astype("float32")
-            tensors[names["down_proj"]] = rng.standard_normal((16, 8)).astype("float32")
+            # HF orientation: gate/up are (intermediate, hidden); down is reversed.
+            tensors[names["gate_proj"]] = rng.standard_normal((16, 8)).astype("float32")
+            tensors[names["up_proj"]] = rng.standard_normal((16, 8)).astype("float32")
+            tensors[names["down_proj"]] = rng.standard_normal((8, 16)).astype("float32")
 
     missing_name = layout.expert_down_proj(1, 3)
     del tensors[missing_name]
@@ -189,9 +192,10 @@ def test_fails_when_layer_zero_gate_missing(tmp_path):
     tensors = {layout.gate_weight(1): rng.standard_normal((8, 4)).astype("float32")}
     for E in range(4):
         names = layout.expert_tensors(1, E)
-        tensors[names["gate_proj"]] = rng.standard_normal((8, 16)).astype("float32")
-        tensors[names["up_proj"]] = rng.standard_normal((8, 16)).astype("float32")
-        tensors[names["down_proj"]] = rng.standard_normal((16, 8)).astype("float32")
+        # HF orientation: gate/up are (intermediate, hidden); down is reversed.
+        tensors[names["gate_proj"]] = rng.standard_normal((16, 8)).astype("float32")
+        tensors[names["up_proj"]] = rng.standard_normal((16, 8)).astype("float32")
+        tensors[names["down_proj"]] = rng.standard_normal((8, 16)).astype("float32")
 
     path = tmp_path / "no_layer_zero.safetensors"
     save_file(tensors, str(path))
