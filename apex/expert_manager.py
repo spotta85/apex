@@ -66,7 +66,7 @@ class ExpertManager:
         # preferred form so the cache holds compute-ready objects. We
         # only print when prep actually transformed the array — the
         # `is`-check avoids noise when prep is a passthrough (NumPy).
-        if self.backend is not None and hasattr(self.backend, "prepare_expert"):
+        if self.backend is not None:
             prepared = self.backend.prepare_expert(expert)
             if prepared is not expert:
                 print(f"prepared expert for backend: {self.backend.name}")
