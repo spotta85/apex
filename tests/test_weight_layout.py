@@ -200,3 +200,128 @@ def test_all_layouts_share_expert_tensors_contract(layout_cls):
     assert names["gate_proj"] == layout.expert_gate_proj(0, 1)
     assert names["up_proj"] == layout.expert_up_proj(0, 1)
     assert names["down_proj"] == layout.expert_down_proj(0, 1)
+
+
+# --- Optional non-MoE methods ---------------------------------------------
+# These are present on layouts that drive a *full* decoder. Verified
+# against literal tensor names in the local Gemma 4 26B-A4B-IT NVFP4
+# safetensors index (mlx-community lowercase variant) so the GemmaHF
+# expectations are not aspirational. FakeMoELayout names are
+# synthetic-only and exercise the contract without touching disk.
+
+def test_gemma_hf_attn_q_proj_includes_scales_sidecar():
+    layout = GemmaHFMoELayout()
+    assert layout.attn_q_proj_tensors(0) == {
+        "weight": "language_model.model.layers.0.self_attn.q_proj.weight",
+        "scales": "language_model.model.layers.0.self_attn.q_proj.scales",
+    }
+
+
+def test_gemma_hf_attn_kvo_proj_format():
+    layout = GemmaHFMoELayout()
+    base = "language_model.model.layers.5.self_attn"
+    assert layout.attn_k_proj_tensors(5) == {
+        "weight": f"{base}.k_proj.weight", "scales": f"{base}.k_proj.scales",
+    }
+    assert layout.attn_v_proj_tensors(5) == {
+        "weight": f"{base}.v_proj.weight", "scales": f"{base}.v_proj.scales",
+    }
+    assert layout.attn_o_proj_tensors(5) == {
+        "weight": f"{base}.o_proj.weight", "scales": f"{base}.o_proj.scales",
+    }
+
+
+def test_gemma_hf_attn_qk_norm_format():
+    layout = GemmaHFMoELayout()
+    base = "language_model.model.layers.7.self_attn"
+    assert layout.attn_q_norm(7) == f"{base}.q_norm.weight"
+    assert layout.attn_k_norm(7) == f"{base}.k_norm.weight"
+
+
+def test_gemma_hf_layernorm_formats():
+    layout = GemmaHFMoELayout()
+    assert (
+        layout.input_layernorm(0)
+        == "language_model.model.layers.0.input_layernorm.weight"
+    )
+    assert (
+        layout.post_attention_layernorm(29)
+        == "language_model.model.layers.29.post_attention_layernorm.weight"
+    )
+
+
+def test_gemma_hf_embedding_and_final_norm():
+    layout = GemmaHFMoELayout()
+    assert layout.embedding_tensors() == {
+        "weight": "language_model.model.embed_tokens.weight",
+        "scales": "language_model.model.embed_tokens.scales",
+    }
+    assert layout.final_norm() == "language_model.model.norm.weight"
+
+
+def test_gemma_hf_lm_head_is_tied_to_embeddings():
+    # tie_word_embeddings=True in the local checkpoint config; there is
+    # literally no lm_head.weight on disk. None signals callers to
+    # reuse the embedding tensor transposed.
+    assert GemmaHFMoELayout().lm_head_tensors() is None
+
+
+def test_gemma_attn_q_proj_uses_nvidia_prefix():
+    # NVIDIA NVFP4 variant carries the `model.language_model.` prefix
+    # and uses `weight_scale` (matching MoE-expert sidecars), not
+    # `scales`. Names taken from the model card; not validated locally
+    # but pinned so the next person who downloads it has a starting
+    # point that follows the established contract.
+    layout = GemmaMoELayout()
+    assert layout.attn_q_proj_tensors(0) == {
+        "weight": "model.language_model.layers.0.self_attn.q_proj.weight",
+        "scales": "model.language_model.layers.0.self_attn.q_proj.weight_scale",
+    }
+
+
+def test_gemma_lm_head_is_tied_to_embeddings():
+    # tie_word_embeddings=True for the published Gemma 4 weights too.
+    assert GemmaMoELayout().lm_head_tensors() is None
+
+
+def test_fake_layout_attn_names_are_synthetic():
+    # Exercising the contract surface — no real safetensors involved.
+    layout = FakeMoELayout()
+    assert layout.attn_q_proj_tensors(0) == {"weight": "layers.0.attn.q_proj.weight"}
+    assert layout.attn_k_proj_tensors(2) == {"weight": "layers.2.attn.k_proj.weight"}
+    assert layout.attn_v_proj_tensors(0) == {"weight": "layers.0.attn.v_proj.weight"}
+    assert layout.attn_o_proj_tensors(0) == {"weight": "layers.0.attn.o_proj.weight"}
+
+
+def test_fake_layout_norms_and_embeddings():
+    layout = FakeMoELayout()
+    assert layout.input_layernorm(3) == "layers.3.input_layernorm.weight"
+    assert (
+        layout.post_attention_layernorm(0)
+        == "layers.0.post_attention_layernorm.weight"
+    )
+    assert layout.attn_q_norm(0) == "layers.0.attn.q_norm.weight"
+    assert layout.attn_k_norm(0) == "layers.0.attn.k_norm.weight"
+    assert layout.embedding_tensors() == {"weight": "embed_tokens.weight"}
+    assert layout.final_norm() == "final_norm.weight"
+    # FakeMoELayout deliberately exposes a real lm_head (no tying) so
+    # the non-Gemma codepath gets exercised somewhere.
+    assert layout.lm_head_tensors() == {"weight": "lm_head.weight"}
+
+
+def test_mixtral_does_not_implement_non_moe_methods():
+    # Sanity: layouts we haven't validated end-to-end shouldn't make
+    # up names. validate_layout.py uses hasattr() to skip these.
+    layout = MixtralLayout()
+    assert not hasattr(layout, "attn_q_proj_tensors")
+    assert not hasattr(layout, "input_layernorm")
+    assert not hasattr(layout, "embedding_tensors")
+    assert not hasattr(layout, "lm_head_tensors")
+
+
+def test_qwen_does_not_implement_non_moe_methods():
+    layout = QwenMoELayout()
+    assert not hasattr(layout, "attn_q_proj_tensors")
+    assert not hasattr(layout, "input_layernorm")
+    assert not hasattr(layout, "embedding_tensors")
+    assert not hasattr(layout, "lm_head_tensors")

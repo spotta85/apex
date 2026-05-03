@@ -7,7 +7,14 @@ specific checkpoint format. The store adapter
 what string to look up; the layout returns it. Same store code,
 different model, different file — only the layout class changes.
 
-Each layout implements five methods:
+Every layout implements the MoE-core five (gate + per-expert
+projections + bundle helper). Layouts that drive a *full* decoder
+(attention, norms, embeddings, lm_head) optionally implement the
+non-MoE methods listed below — these are intentionally optional so
+adapters that only care about MoE wiring (Mixtral, Qwen) don't have to
+fabricate names they've never validated.
+
+MoE core (every layout):
 
   - gate_weight(layer_id)                  -> str
   - expert_gate_proj(layer_id, expert_id)  -> str
@@ -16,6 +23,28 @@ Each layout implements five methods:
   - expert_tensors(layer_id, expert_id)    -> {"gate_proj": str,
                                                 "up_proj":   str,
                                                 "down_proj": str}
+
+Optional non-MoE methods (implemented by layouts that drive full
+decoder layers — currently FakeMoELayout, GemmaMoELayout,
+GemmaHFMoELayout):
+
+  - attn_q_proj_tensors(layer_id) -> {"weight": str, "scales"?: str}
+  - attn_k_proj_tensors(layer_id) -> {"weight": str, "scales"?: str}
+  - attn_v_proj_tensors(layer_id) -> {"weight": str, "scales"?: str}
+  - attn_o_proj_tensors(layer_id) -> {"weight": str, "scales"?: str}
+  - attn_q_norm(layer_id)         -> str
+  - attn_k_norm(layer_id)         -> str
+  - input_layernorm(layer_id)     -> str
+  - post_attention_layernorm(layer_id) -> str
+  - embedding_tensors()           -> {"weight": str, "scales"?: str}
+  - final_norm()                  -> str
+  - lm_head_tensors()             -> dict | None  (None ⇒ tied to embeddings)
+
+Quantized-weight projections (NVFP4_U32 family) return both the base
+`weight` name and a `scales` sidecar name; pure BF16 single-tensor
+norms return a plain `str`. Callers that need to know whether to
+expect a sidecar should test `"scales" in tensors` rather than
+introspect the dtype.
 
 The bundle method is shared via `_MoELayoutBase` — every layout
 returns the same three keys (only the values change), so the store
@@ -83,6 +112,46 @@ class FakeMoELayout(_MoELayoutBase):
 
     def expert_down_proj(self, layer_id: int, expert_id: int) -> str:
         return f"layers.{layer_id}.experts.{expert_id}.down_proj.weight"
+
+    # --- Optional non-MoE methods --------------------------------------
+    # FakeMoELayout's synthetic checkpoints don't actually contain
+    # these tensors; the names exist so layout-shape tests can exercise
+    # the contract without having to depend on a real checkpoint.
+
+    def attn_q_proj_tensors(self, layer_id: int) -> dict:
+        return {"weight": f"layers.{layer_id}.attn.q_proj.weight"}
+
+    def attn_k_proj_tensors(self, layer_id: int) -> dict:
+        return {"weight": f"layers.{layer_id}.attn.k_proj.weight"}
+
+    def attn_v_proj_tensors(self, layer_id: int) -> dict:
+        return {"weight": f"layers.{layer_id}.attn.v_proj.weight"}
+
+    def attn_o_proj_tensors(self, layer_id: int) -> dict:
+        return {"weight": f"layers.{layer_id}.attn.o_proj.weight"}
+
+    def attn_q_norm(self, layer_id: int) -> str:
+        return f"layers.{layer_id}.attn.q_norm.weight"
+
+    def attn_k_norm(self, layer_id: int) -> str:
+        return f"layers.{layer_id}.attn.k_norm.weight"
+
+    def input_layernorm(self, layer_id: int) -> str:
+        return f"layers.{layer_id}.input_layernorm.weight"
+
+    def post_attention_layernorm(self, layer_id: int) -> str:
+        return f"layers.{layer_id}.post_attention_layernorm.weight"
+
+    def embedding_tensors(self) -> dict:
+        return {"weight": "embed_tokens.weight"}
+
+    def final_norm(self) -> str:
+        return "final_norm.weight"
+
+    def lm_head_tensors(self) -> dict:
+        # Synthetic fake doesn't tie embeddings — every name distinct
+        # so tests that rely on lm_head being its own tensor still work.
+        return {"weight": "lm_head.weight"}
 
 
 class MixtralLayout(_MoELayoutBase):
@@ -186,6 +255,55 @@ class GemmaMoELayout(_MoELayoutBase):
     def expert_down_proj(self, layer_id: int, expert_id: int) -> str:
         return f"model.language_model.layers.{layer_id}.experts.{expert_id}.down_proj.weight"
 
+    # --- Optional non-MoE methods --------------------------------------
+    # Names follow the NVIDIA-style `model.language_model.` prefix.
+    # Quantized projections expect a `.scales` sidecar in the NVFP4
+    # variant (and a `.weight_scale_2`/`.input_scale` pair, but the
+    # store layer queries the base name + reads sidecars by suffix
+    # already — we surface only the two the layout name layer cares
+    # about, matching how MoE projections work today).
+
+    def attn_q_proj_tensors(self, layer_id: int) -> dict:
+        prefix = f"model.language_model.layers.{layer_id}.self_attn.q_proj"
+        return {"weight": f"{prefix}.weight", "scales": f"{prefix}.weight_scale"}
+
+    def attn_k_proj_tensors(self, layer_id: int) -> dict:
+        prefix = f"model.language_model.layers.{layer_id}.self_attn.k_proj"
+        return {"weight": f"{prefix}.weight", "scales": f"{prefix}.weight_scale"}
+
+    def attn_v_proj_tensors(self, layer_id: int) -> dict:
+        prefix = f"model.language_model.layers.{layer_id}.self_attn.v_proj"
+        return {"weight": f"{prefix}.weight", "scales": f"{prefix}.weight_scale"}
+
+    def attn_o_proj_tensors(self, layer_id: int) -> dict:
+        prefix = f"model.language_model.layers.{layer_id}.self_attn.o_proj"
+        return {"weight": f"{prefix}.weight", "scales": f"{prefix}.weight_scale"}
+
+    def attn_q_norm(self, layer_id: int) -> str:
+        return f"model.language_model.layers.{layer_id}.self_attn.q_norm.weight"
+
+    def attn_k_norm(self, layer_id: int) -> str:
+        return f"model.language_model.layers.{layer_id}.self_attn.k_norm.weight"
+
+    def input_layernorm(self, layer_id: int) -> str:
+        return f"model.language_model.layers.{layer_id}.input_layernorm.weight"
+
+    def post_attention_layernorm(self, layer_id: int) -> str:
+        return f"model.language_model.layers.{layer_id}.post_attention_layernorm.weight"
+
+    def embedding_tensors(self) -> dict:
+        prefix = "model.language_model.embed_tokens"
+        return {"weight": f"{prefix}.weight", "scales": f"{prefix}.weight_scale"}
+
+    def final_norm(self) -> str:
+        return "model.language_model.norm.weight"
+
+    def lm_head_tensors(self):
+        # Gemma 4 ties lm_head to embed_tokens (tie_word_embeddings=True
+        # in the model config). Callers reuse the embedding weight
+        # transposed instead of looking up a separate tensor.
+        return None
+
 
 class GemmaHFMoELayout(_MoELayoutBase):
     """mlx-community/gemma-4-26b-a4b-it-nvfp4 stacked expert layout.
@@ -221,6 +339,52 @@ class GemmaHFMoELayout(_MoELayoutBase):
 
     def expert_down_proj(self, layer_id: int, expert_id: int) -> str:
         return f"language_model.model.layers.{layer_id}.experts.switch_glu.down_proj.weight"
+
+    # --- Optional non-MoE methods --------------------------------------
+    # Verified against the local mlx-community
+    # gemma-4-26b-a4b-it-nvfp4 safetensors index. NVFP4_U32 quantized
+    # projections pair `.weight` with a `.scales` sidecar; norms are
+    # plain BF16 single tensors.
+
+    def attn_q_proj_tensors(self, layer_id: int) -> dict:
+        prefix = f"language_model.model.layers.{layer_id}.self_attn.q_proj"
+        return {"weight": f"{prefix}.weight", "scales": f"{prefix}.scales"}
+
+    def attn_k_proj_tensors(self, layer_id: int) -> dict:
+        prefix = f"language_model.model.layers.{layer_id}.self_attn.k_proj"
+        return {"weight": f"{prefix}.weight", "scales": f"{prefix}.scales"}
+
+    def attn_v_proj_tensors(self, layer_id: int) -> dict:
+        prefix = f"language_model.model.layers.{layer_id}.self_attn.v_proj"
+        return {"weight": f"{prefix}.weight", "scales": f"{prefix}.scales"}
+
+    def attn_o_proj_tensors(self, layer_id: int) -> dict:
+        prefix = f"language_model.model.layers.{layer_id}.self_attn.o_proj"
+        return {"weight": f"{prefix}.weight", "scales": f"{prefix}.scales"}
+
+    def attn_q_norm(self, layer_id: int) -> str:
+        return f"language_model.model.layers.{layer_id}.self_attn.q_norm.weight"
+
+    def attn_k_norm(self, layer_id: int) -> str:
+        return f"language_model.model.layers.{layer_id}.self_attn.k_norm.weight"
+
+    def input_layernorm(self, layer_id: int) -> str:
+        return f"language_model.model.layers.{layer_id}.input_layernorm.weight"
+
+    def post_attention_layernorm(self, layer_id: int) -> str:
+        return f"language_model.model.layers.{layer_id}.post_attention_layernorm.weight"
+
+    def embedding_tensors(self) -> dict:
+        prefix = "language_model.model.embed_tokens"
+        return {"weight": f"{prefix}.weight", "scales": f"{prefix}.scales"}
+
+    def final_norm(self) -> str:
+        return "language_model.model.norm.weight"
+
+    def lm_head_tensors(self):
+        # tie_word_embeddings=True in this checkpoint's config — there
+        # is no lm_head.weight on disk; callers reuse embed_tokens.
+        return None
 
 
 # Registry: short name -> layout class. Private because extension is

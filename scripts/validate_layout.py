@@ -81,6 +81,74 @@ def _check_name(label: str, name: str, names_set: set) -> bool:
     return found
 
 
+def _check_non_moe(layout, names_set: set, last_layer: int) -> bool:
+    """Probe optional non-MoE methods and report per-name presence.
+
+    Methods are intentionally optional (Mixtral / Qwen don't implement
+    them). For each method the layout *does* expose, report `[ok]` or
+    `[MISSING]` against the checkpoint's tensor inventory. Layer-scoped
+    methods are checked at layer 0 and last_layer to catch off-by-one
+    naming bugs that only show up at the boundary.
+    """
+    print()
+    print("non-moe names:")
+    all_ok = True
+
+    # Single-tensor lookups (no sidecar).
+    if hasattr(layout, "final_norm"):
+        all_ok &= _check_name("final_norm", layout.final_norm(), names_set)
+
+    # Embedding bundle: (weight + optional scales sidecar).
+    if hasattr(layout, "embedding_tensors"):
+        names = layout.embedding_tensors()
+        for key, name in names.items():
+            all_ok &= _check_name(f"embedding.{key}", name, names_set)
+
+    # lm_head can be intentionally None when tied to embeddings.
+    if hasattr(layout, "lm_head_tensors"):
+        names = layout.lm_head_tensors()
+        if names is None:
+            print("  [ok] lm_head: tied to embeddings (None)")
+        else:
+            for key, name in names.items():
+                all_ok &= _check_name(f"lm_head.{key}", name, names_set)
+
+    layer_methods_dict = (
+        "attn_q_proj_tensors",
+        "attn_k_proj_tensors",
+        "attn_v_proj_tensors",
+        "attn_o_proj_tensors",
+    )
+    layer_methods_str = (
+        "attn_q_norm",
+        "attn_k_norm",
+        "input_layernorm",
+        "post_attention_layernorm",
+    )
+
+    # Probe layer 0 only. Gemma 4 has heterogeneous attention across
+    # layers (sliding_attention vs full_attention; full layers tie K=V
+    # so v_proj is absent), so blanket probing the last layer would
+    # false-positive even when the layout itself is correct. Layer 0
+    # uses the "standard" attention and is what step 16C smokes.
+    for layer_id in (0,):
+        for method_name in layer_methods_dict:
+            if hasattr(layout, method_name):
+                bundle = getattr(layout, method_name)(layer_id)
+                for key, name in bundle.items():
+                    all_ok &= _check_name(
+                        f"layer {layer_id} {method_name}.{key}", name, names_set,
+                    )
+        for method_name in layer_methods_str:
+            if hasattr(layout, method_name):
+                name = getattr(layout, method_name)(layer_id)
+                all_ok &= _check_name(
+                    f"layer {layer_id} {method_name}", name, names_set,
+                )
+
+    return all_ok
+
+
 def _check_shapes(path: Path, layout, last_layer: int, last_expert: int) -> bool:
     """Fetch shapes for one expert + gate; assert SwiGLU consistency."""
     print()
@@ -145,7 +213,12 @@ def _check_shapes(path: Path, layout, last_layer: int, last_expert: int) -> bool
     return ok
 
 
-def validate(path: Path, layout_name: str, check_shapes: bool = False) -> int:
+def validate(
+    path: Path,
+    layout_name: str,
+    check_shapes: bool = False,
+    check_non_moe: bool = False,
+) -> int:
     layout = get_layout(layout_name)
     print(f"layout: {layout_name}")
     print(f"checkpoint: {path}")
@@ -218,6 +291,15 @@ def validate(path: Path, layout_name: str, check_shapes: bool = False) -> int:
             print("\nlayout validation FAILED — shape mismatch", file=sys.stderr)
             return 1
 
+    if check_non_moe:
+        non_moe_ok = _check_non_moe(layout, names_set, last_layer)
+        if not non_moe_ok:
+            print(
+                "\nlayout validation FAILED — non-moe tensor missing",
+                file=sys.stderr,
+            )
+            return 1
+
     print("\nlayout validation passed")
     return 0
 
@@ -242,13 +324,27 @@ def main(argv) -> int:
         action="store_true",
         help="also load tensor shape metadata and check SwiGLU consistency",
     )
+    parser.add_argument(
+        "--check-non-moe",
+        action="store_true",
+        help=(
+            "also probe optional non-MoE methods (attention, norms, embeddings, "
+            "lm_head). Reports per-tensor presence; methods the layout doesn't "
+            "expose are skipped silently."
+        ),
+    )
     args = parser.parse_args(argv[1:])
 
     if not args.checkpoint.exists():
         print(f"error: path does not exist: {args.checkpoint}", file=sys.stderr)
         return 1
 
-    return validate(args.checkpoint, args.layout, check_shapes=args.check_shapes)
+    return validate(
+        args.checkpoint,
+        args.layout,
+        check_shapes=args.check_shapes,
+        check_non_moe=args.check_non_moe,
+    )
 
 
 if __name__ == "__main__":
