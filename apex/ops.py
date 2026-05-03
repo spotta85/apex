@@ -1,10 +1,11 @@
 """Tiny numerical primitives for transformer building blocks.
 
-Three pure functions, all NumPy:
+Four pure functions, all NumPy:
 
   - rms_norm(x, weight, eps, *, gemma_unit_offset=False)
   - linear(x, weight, bias=None)
   - softmax(x, axis=-1)
+  - apply_rope(x, *, position_offset, theta)
 
 Why "tiny": these are the lowest-cost layer of math that decoder layers
 need (attention pre-norm, projection matmuls, attention softmax). They
@@ -72,3 +73,59 @@ def softmax(x, axis: int = -1):
     shifted = x - np.max(x, axis=axis, keepdims=True)
     exp = np.exp(shifted)
     return exp / np.sum(exp, axis=axis, keepdims=True)
+
+
+def apply_rope(x, *, position_offset: int = 0, theta: float = 10000.0):
+    """Apply Rotary Position Embedding along the last axis (head_dim).
+
+    `x` must have shape `(..., seq, head_dim)` with `head_dim` even.
+    `position_offset` is the starting position; the rotation matrix
+    for row `i` along the seq axis uses position `position_offset + i`.
+
+    Pass the KV cache's current length as `position_offset` when
+    rotating a new decode-step token. Pass `0` to rotate a fresh
+    prompt prefix from position 0.
+
+    Convention: HF / Gemma "split half" pairing. The first `head_dim/2`
+    features pair with the second `head_dim/2` features (NOT the
+    interleaved `2i, 2i+1` pairing used by the original RoPE paper);
+    HF Gemma stores weights in the split-half convention so this
+    matches the checkpoint.
+
+    `theta` is the base of the inverse-frequency series. Gemma 4
+    sliding-attention layers use 10000.0 (the default); full-attention
+    layers use 1000000.0 with a partial_rotary_factor — those need
+    a separate code path that this primitive doesn't yet implement.
+
+    Position 0 is the identity rotation (cos(0)=1, sin(0)=0), so
+    `apply_rope(x, position_offset=0)` on a single-token tensor
+    returns x unchanged — matches the "16C is correct at position 0"
+    invariant from the smoke tests.
+    """
+    seq = x.shape[-2]
+    head_dim = x.shape[-1]
+    if head_dim % 2:
+        raise ValueError(
+            f"head_dim must be even for RoPE; got {head_dim}"
+        )
+
+    # Per-pair inverse frequencies in fp32. The doubled emb below
+    # broadcasts the same per-pair angle to both halves, which is
+    # what the split-half rotate_half expects.
+    half = head_dim // 2
+    inv_freq = 1.0 / (
+        theta ** (np.arange(half, dtype=np.float32) * 2.0 / head_dim)
+    )
+    positions = (
+        np.arange(seq, dtype=np.float32) + float(position_offset)
+    )
+    freqs = np.outer(positions, inv_freq)             # (seq, half)
+    emb = np.concatenate([freqs, freqs], axis=-1)     # (seq, head_dim)
+    cos = np.cos(emb)
+    sin = np.sin(emb)
+
+    # rotate_half(x) = cat([-x[half:], x[:half]]) — split-half pairing.
+    rotated_half = np.concatenate(
+        [-x[..., half:], x[..., :half]], axis=-1,
+    )
+    return (x * cos + rotated_half * sin).astype(x.dtype, copy=False)

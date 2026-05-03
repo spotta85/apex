@@ -8,7 +8,7 @@ cheaper than debugging a wrong attention output later.
 import numpy as np
 import pytest
 
-from apex.ops import linear, rms_norm, softmax
+from apex.ops import apply_rope, linear, rms_norm, softmax
 
 
 # --- rms_norm -------------------------------------------------------------
@@ -135,3 +135,68 @@ def test_softmax_single_element_axis_returns_unity():
     x = np.array([[[5.0]]], dtype=np.float32)  # shape (1, 1, 1)
     out = softmax(x, axis=-1)
     np.testing.assert_array_equal(out, np.array([[[1.0]]]))
+
+
+# --- apply_rope ---------------------------------------------------------
+
+def test_apply_rope_preserves_shape_and_dtype():
+    rng = np.random.default_rng(0)
+    x = rng.standard_normal((1, 4, 7, 16)).astype(np.float32)  # (B, H, S, D)
+    out = apply_rope(x, position_offset=3, theta=10000.0)
+    assert out.shape == x.shape
+    assert out.dtype == x.dtype
+
+
+def test_apply_rope_position_zero_is_identity():
+    # Position 0 ⇒ cos(0)=1, sin(0)=0 ⇒ x stays unchanged. This is
+    # the invariant the 16C single-token smoke relies on (we skipped
+    # RoPE there because position 0 is identity).
+    rng = np.random.default_rng(1)
+    x = rng.standard_normal((1, 4, 1, 16)).astype(np.float32)
+    out = apply_rope(x, position_offset=0)
+    np.testing.assert_allclose(out, x, atol=1e-6)
+
+
+def test_apply_rope_first_row_of_multi_token_prefix_unchanged_when_offset_zero():
+    # Same identity argument: row 0 of a (S, D) RoPE input at
+    # position_offset=0 is at position 0 ⇒ unchanged. Later rows
+    # do rotate. Useful sanity for the prefill code path.
+    rng = np.random.default_rng(2)
+    x = rng.standard_normal((1, 4, 5, 16)).astype(np.float32)
+    out = apply_rope(x, position_offset=0)
+    np.testing.assert_allclose(out[..., 0, :], x[..., 0, :], atol=1e-6)
+    # And the later rows must differ from input (they're at non-zero pos).
+    assert not np.allclose(out[..., 1, :], x[..., 1, :])
+
+
+def test_apply_rope_preserves_pair_norms():
+    # RoPE is a rotation in 2D pairs (one pair per inv_freq slot). The
+    # norm of each (x[..., i], x[..., i+half]) pair must be preserved
+    # exactly — that's the whole point of using a rotation rather than
+    # a scaling.
+    rng = np.random.default_rng(3)
+    head_dim = 16
+    half = head_dim // 2
+    x = rng.standard_normal((1, 2, 3, head_dim)).astype(np.float32)
+    out = apply_rope(x, position_offset=7, theta=10000.0)
+    in_pair_norms = x[..., :half] ** 2 + x[..., half:] ** 2
+    out_pair_norms = out[..., :half] ** 2 + out[..., half:] ** 2
+    np.testing.assert_allclose(in_pair_norms, out_pair_norms, rtol=1e-5)
+
+
+def test_apply_rope_different_positions_give_different_outputs():
+    # If two different position_offsets produced the same output we'd
+    # have lost positional information — defeats the whole purpose.
+    rng = np.random.default_rng(4)
+    x = rng.standard_normal((1, 1, 1, 16)).astype(np.float32)
+    out_5 = apply_rope(x, position_offset=5)
+    out_42 = apply_rope(x, position_offset=42)
+    assert not np.allclose(out_5, out_42)
+
+
+def test_apply_rope_odd_head_dim_raises():
+    # Pair-rotation requires an even head_dim; surface a clear error
+    # rather than producing a silently truncated rotation.
+    x = np.zeros((1, 1, 1, 7), dtype=np.float32)
+    with pytest.raises(ValueError, match="head_dim must be even"):
+        apply_rope(x, position_offset=0)
