@@ -72,8 +72,15 @@ def _safetensors_shape(path: Path, name: str) -> tuple:
         return tuple(f.get_slice(name).get_shape())
 
 
-def _read_safetensors_index(directory: Path) -> dict:
-    """Return the parsed `weight_map` dict from <dir>/*.safetensors.index.json."""
+def read_safetensors_index(directory) -> dict:
+    """Return the parsed `weight_map` dict from <dir>/*.safetensors.index.json.
+
+    Public so other loaders (e.g. the quantized expert store) can
+    follow the same shard mapping without re-implementing the lookup.
+    Errors are FileNotFoundError (no index) / ValueError (multiple
+    indexes or malformed index).
+    """
+    directory = Path(directory)
     indexes = list(directory.glob("*.safetensors.index.json"))
     if not indexes:
         raise FileNotFoundError(
@@ -96,11 +103,11 @@ def _read_safetensors_index(directory: Path) -> dict:
 
 
 def _list_sharded_safetensors_keys(directory: Path) -> list:
-    return sorted(_read_safetensors_index(directory))
+    return sorted(read_safetensors_index(directory))
 
 
 def _sharded_safetensors_shape(directory: Path, name: str) -> tuple:
-    weight_map = _read_safetensors_index(directory)
+    weight_map = read_safetensors_index(directory)
     if name not in weight_map:
         raise KeyError(
             f"tensor {name!r} not found in {directory}'s safetensors index"
