@@ -114,14 +114,16 @@ def test_qwen_expert_tensors_returns_canonical_keys():
 # --- GemmaMoELayout --------------------------------------------------------
 # The `model.language_model.` prefix and the missing `mlp` /
 # `block_sparse_moe` middle prefix are the two notable shape changes
-# vs Mixtral / Qwen. gate_weight is a best guess (see class docstring).
+# vs Mixtral / Qwen. gate_weight is verified against the NVIDIA NVFP4
+# checkpoint (`router.proj.weight`, not `gate.weight`).
 
 def test_gemma_gate_weight_format():
-    # Provisional — confirm against a real checkpoint via
-    # scripts/inspect_weight_names.py before relying on routing.
+    # Verified against the real nvidia/Gemma-4-26B-A4B-NVFP4 safetensors
+    # index via scripts/validate_layout.py. The name "router.proj.weight"
+    # is intentional (Gemma 4 uses 'router' rather than 'gate').
     assert (
         GemmaMoELayout().gate_weight(0)
-        == "model.language_model.layers.0.gate.weight"
+        == "model.language_model.layers.0.router.proj.weight"
     )
 
 

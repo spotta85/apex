@@ -137,35 +137,44 @@ class QwenMoELayout(_MoELayoutBase):
 
 
 class GemmaMoELayout(_MoELayoutBase):
-    """google/gemma-4-26B-A4B-it (30 layers x 128 experts, top-k=8, no shared).
+    """google/gemma-4-26B-A4B (30 layers x 128 experts, top-k=8).
 
-    Confirmed against the NVIDIA NVFP4 variant's safetensors index for
-    expert projection naming. Two notable wrinkles vs the other layouts:
+    Verified end-to-end against the NVIDIA NVFP4 variant
+    (nvidia/Gemma-4-26B-A4B-NVFP4) via scripts/validate_layout.py:
+    every name produced here exists in the real safetensors index.
+
+    Notable differences vs Mixtral/Qwen:
 
       1. The `model.language_model.` prefix exists because
          Gemma4ForConditionalGeneration is a multimodal wrapper
-         (language model + vision components); experts live under the
+         (language model + vision tower); MoE experts live under the
          language sub-module.
       2. There is no `mlp` or `block_sparse_moe` intermediate prefix —
          experts hang directly off the layer.
+      3. The router weight is `router.proj.weight` (not `gate.weight`
+         like Qwen/Mixtral). The model also stores `router.scale` and
+         `router.per_expert_scale` per layer that the basic
+         gate/expert API doesn't surface yet — they're scoring scales,
+         not routing weights, and APEX's routers don't consume them.
+      4. Each MoE layer ALSO has a dense `mlp.{gate,up,down}_proj` —
+         a "shared expert" / always-on FFN that runs alongside the
+         routed experts. APEX has no shared-expert concept yet, so
+         those tensors are loaded by neither this layout nor any
+         store. Adding shared-expert support is a runtime concern.
 
-    The router/gate tensor name (gate_weight) here is a best guess:
-    the public NVFP4 index sample we inspected didn't surface a router
-    weight in the sampled shard. Run `scripts/inspect_weight_names.py`
-    on a downloaded Gemma 4 checkpoint to confirm before relying on
-    routing — a wrong name fails loudly with KeyError on the first
-    `store.load(...)`, which is the correct fail-loud behavior.
-
-    NVFP4-quantized variants add companion tensors (.input_scale,
-    .weight_scale, .weight_scale_2) alongside each .weight; APEX only
-    asks for the .weight, so this layout works on either variant.
-    Dequantized loading itself is a future concern.
+    The NVFP4-quantized variant adds companion tensors per weight:
+      - .input_scale / .weight_scale / .weight_scale_2
+    Each `.weight` itself is a packed-int8 tensor, not float32 —
+    APEX's existing stores will load it but the contents are not
+    SwiGLU-ready until dequantized. Dequantization is out of scope
+    for this layout (which only handles tensor naming).
 
     HF model card: https://huggingface.co/google/gemma-4-26B-A4B-it
+    NVFP4 variant:  https://huggingface.co/nvidia/Gemma-4-26B-A4B-NVFP4
     """
 
     def gate_weight(self, layer_id: int) -> str:
-        return f"model.language_model.layers.{layer_id}.gate.weight"
+        return f"model.language_model.layers.{layer_id}.router.proj.weight"
 
     def expert_gate_proj(self, layer_id: int, expert_id: int) -> str:
         return f"model.language_model.layers.{layer_id}.experts.{expert_id}.gate_proj.weight"
@@ -206,3 +215,12 @@ def get_layout(name: str):
             f"unknown layout: {name!r}; known: {sorted(_LAYOUTS)}"
         )
     return cls()
+
+
+def available_layouts() -> list:
+    """Return all registered layout short names, sorted.
+
+    Used by argparse `choices=...` in scripts so the CLI advertises
+    valid names without importing the private registry directly.
+    """
+    return sorted(_LAYOUTS)
