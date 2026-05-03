@@ -19,9 +19,9 @@ class FakeRouter:
     def route(self, layer_id: int, hidden_state=None):
         # Layer 0: use experts 1 and 3.
         if layer_id == 0:
-            return [1, 3]
+            return [1, 3], None
         # All other layers: use experts 0 and 2.
         # (Two distinct expert sets per layer is what forces the cache
         # to evict when max_experts=2 — that's the behavior the original
         # MVP was meant to prove.)
-        return [0, 2]
+        return [0, 2], None

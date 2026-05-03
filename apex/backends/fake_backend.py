@@ -16,7 +16,6 @@ Backend interface:
   - prepare_expert(bundle)        cache-side conversion (passthrough here)
   - prepare_hidden(arr)           initial hidden conversion (passthrough)
   - run_expert(hidden, expert)    SwiGLU FFN over an ExpertWeights bundle
-  - combine_outputs(list)         average across selected experts
   - to_numpy(arr)                 boundary conversion to ndarray (passthrough)
 """
 
@@ -55,12 +54,6 @@ class FakeBackend:
         # Compact form; numerically OK for our small fake values.
         gate_silu = gate / (1.0 + np.exp(-gate))
         return (gate_silu * up) @ expert_weights.down_proj.T
-
-    def combine_outputs(self, outputs):
-        # Uniform mean across the per-expert outputs. Real MoE uses
-        # router-weighted combination; uniform is enough to demonstrate
-        # the loading/caching machinery.
-        return sum(outputs) / len(outputs)
 
     def to_numpy(self, arr):
         # Boundary conversion for callers / tests. NumPy is already

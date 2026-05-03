@@ -66,7 +66,7 @@ def test_selected_experts_are_loaded(tmp_path):
 
     # Pre-compute what the router will pick for layer 0 (input is ones).
     hidden0 = np.ones((1, HIDDEN), dtype="float32")
-    layer0_picks = router.route(0, hidden0)
+    layer0_picks, _ = router.route(0, hidden0)
 
     runtime = Runtime(router=router, expert_manager=manager, backend=FakeBackend())
     runtime.run()
@@ -86,7 +86,7 @@ def test_trace_recorder_captures_gate_selections(tmp_path):
     recorder = TraceRecorder(trace_path)
 
     # What the gate will pick for layer 0 with ones-hidden:
-    expected_layer0 = router.route(0, np.ones((1, HIDDEN), dtype="float32"))
+    expected_layer0, _ = router.route(0, np.ones((1, HIDDEN), dtype="float32"))
 
     runtime = Runtime(
         router=router,

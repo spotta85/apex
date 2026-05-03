@@ -9,9 +9,9 @@ so `make_mlx_runtime` swaps it in with one line. Differences:
   - Hidden state input is accepted as either np.ndarray or mx.array
     (we wrap with mx.array if needed). The backend-native runtime hands
     this router an mx.array, so the conversion is a cheap no-op there.
-  - Top-k is computed via mx.argsort, not numpy. Only the final list-of-
-    Python-ints is materialized via np.array(idx) at the end (cache
-    keys + JSON serialization need plain ints).
+  - Top-k is computed via mx.argsort, not numpy. Only the final list of
+    Python ints is materialized via np.array(idx) at the end. We return
+    weights=None so Runtime keeps the legacy uniform combine.
 
 For other on-disk formats (GGUF + MLX, npy + MLX, etc.) future work
 would add a parallel adapter or extract a generic GateLoader interface.
@@ -55,7 +55,7 @@ class MLXGateRouter:
         sorted_idx = mx.argsort(scores[0])
         topk = sorted_idx[-self.top_k :][::-1]
         mx.eval(topk)
-        return [int(i) for i in np.array(topk)]
+        return [int(i) for i in np.array(topk)], None
 
     def _load_gate(self, layer_id: int):
         if layer_id not in self.gates:

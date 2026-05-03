@@ -17,7 +17,13 @@ E4M3_ONE = 0x38
 FP4_PACKED_ONE = 0x22
 
 REAL_PATH_ENV = "REAL_MOE_PATH"
-DEFAULT_REAL_PATH = "/Users/spotta/Desktop/models/Gemma-4-26B-A4B-NVFP4"
+_REAL_PATH_CANDIDATES = (
+    Path("/Users/spotta/Desktop/models/Gemma-4-26B-A4B-NVFP4"),
+    Path("/Users/spotta/Desktop/models/gemma4/Gemma-4-26B-A4B-NVFP4"),
+)
+DEFAULT_REAL_PATH = str(
+    next((path for path in _REAL_PATH_CANDIDATES if path.is_dir()), _REAL_PATH_CANDIDATES[0])
+)
 
 
 def write_safetensors(path: Path, items):

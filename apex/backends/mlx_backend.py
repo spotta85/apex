@@ -46,16 +46,10 @@ class MLXBackend:
         gate = mx.matmul(hidden_state, expert_weights.gate_proj.T)
         up = mx.matmul(hidden_state, expert_weights.up_proj.T)
         # silu via mx.sigmoid (mx.silu / mx.fast.silu aren't in this
-        # MLX version). MLX is lazy — the result here is unevaluated;
-        # combine_outputs forces evaluation cheaply via the addition.
+        # MLX version). MLX is lazy; run_moe_layer combines outputs
+        # without forcing a numpy round trip.
         gate_silu = gate * mx.sigmoid(gate)
         return mx.matmul(gate_silu * up, expert_weights.down_proj.T)
-
-    def combine_outputs(self, outputs):
-        # Uniform average; identical algebra to FakeBackend. mx.array
-        # supports `+` via __radd__ (Python's sum() works starting
-        # from int 0) and `/` with a Python int.
-        return sum(outputs) / len(outputs)
 
     def to_numpy(self, arr):
         # Boundary conversion for callers / tests / numpy routers.

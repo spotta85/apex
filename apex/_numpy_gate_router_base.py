@@ -4,7 +4,7 @@ All three concrete numpy gate routers (`GateRouter`, `SafetensorsGateRouter`,
 `GGUFGateRouter`) share the routing math:
 
     scores = np.asarray(hidden) @ gate
-    return top-k expert IDs as plain Python ints
+    return (top-k expert IDs as plain Python ints, None)
 
 Only the per-layer gate-loading step differs (file path vs safetensors
 get_tensor vs GGUF tensor index). This base lifts the common logic into
@@ -39,7 +39,9 @@ class BaseNumpyGateRouter:
         # reverse for highest-first. Plain Python ints so cache keys /
         # JSON serialization stay clean across the rest of the system.
         expert_ids = scores[0].argsort()[-self.top_k :][::-1]
-        return [int(e) for e in expert_ids]
+        # These score-only routers intentionally do not softmax. None
+        # tells Runtime/run_moe_layer to keep the legacy uniform combine.
+        return [int(e) for e in expert_ids], None
 
     def _load_gate(self, layer_id: int):
         # Subclasses must return the per-layer gate as a numpy array.

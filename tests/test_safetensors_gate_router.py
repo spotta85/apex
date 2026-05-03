@@ -29,10 +29,11 @@ def test_returns_top_k_experts_by_score(tmp_path):
     router = SafetensorsGateRouter(str(path), FakeMoELayout(), top_k=2)
 
     hidden = np.array([[1.0, 0.0, 0.0, 0.0]], dtype="float32")
-    selected = router.route(0, hidden)
+    selected, weights = router.route(0, hidden)
 
     # Highest-scoring two columns: 1 (score 5) then 2 (score 2).
     assert selected == [1, 2]
+    assert weights is None
 
 
 def test_returns_python_ints(tmp_path):
@@ -42,7 +43,8 @@ def test_returns_python_ints(tmp_path):
     router = SafetensorsGateRouter(str(path), FakeMoELayout(), top_k=2)
 
     hidden = np.ones((1, 4), dtype="float32")
-    for expert_id in router.route(0, hidden):
+    selected, _ = router.route(0, hidden)
+    for expert_id in selected:
         assert type(expert_id) is int
 
 
@@ -57,14 +59,14 @@ def test_lazy_loads_and_caches_gate(tmp_path):
     router = SafetensorsGateRouter(str(path), FakeMoELayout(), top_k=1)
 
     hidden = np.array([[1.0]], dtype="float32")
-    first = router.route(0, hidden)
+    first, _ = router.route(0, hidden)
 
     # Overwrite the file so a re-read would prefer the other expert.
     save_file(
         {"layers.0.gate.weight": np.array([[0.0, 1.0]], dtype="float32")},
         str(path),
     )
-    second = router.route(0, hidden)
+    second, _ = router.route(0, hidden)
 
     assert first == second  # cached gate is still the original
 
@@ -77,8 +79,10 @@ def test_different_hidden_chooses_different_experts(tmp_path):
 
     a = np.array([[1, 0, 0, 0]], dtype="float32")
     b = np.array([[0, 0, 1, 0]], dtype="float32")
-    assert router.route(0, a) == [0]
-    assert router.route(0, b) == [2]
+    selected_a, _ = router.route(0, a)
+    selected_b, _ = router.route(0, b)
+    assert selected_a == [0]
+    assert selected_b == [2]
 
 
 def test_missing_gate_raises(tmp_path):

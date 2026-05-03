@@ -10,7 +10,13 @@ from apex.checkpoint_index import read_safetensors_index
 from apex.safetensors_loader import load_tensor
 
 
-DEFAULT_GEMMA_PATH = "/Users/spotta/Desktop/models/Gemma-4-26B-A4B-NVFP4"
+_GEMMA_PATH_CANDIDATES = (
+    Path("/Users/spotta/Desktop/models/Gemma-4-26B-A4B-NVFP4"),
+    Path("/Users/spotta/Desktop/models/gemma4/Gemma-4-26B-A4B-NVFP4"),
+)
+DEFAULT_GEMMA_PATH = str(
+    next((path for path in _GEMMA_PATH_CANDIDATES if path.is_dir()), _GEMMA_PATH_CANDIDATES[0])
+)
 _WEIGHT_MAP_CACHE = {}
 
 

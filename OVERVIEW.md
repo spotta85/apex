@@ -1,11 +1,11 @@
 # APEX — Overview
 
-APEX is a from-scratch Mixture-of-Experts (MoE) inference runtime focused on **bounded-memory expert loading**: the user sets `max_memory_mb` and APEX loads experts on demand, caches them LRU, and evicts when over budget. Built up in tightly-scoped MVP steps; now runs real Gemma 4 NVFP4 weights end-to-end through a single MoE layer.
+APEX is a from-scratch Mixture-of-Experts (MoE) inference runtime focused on **bounded-memory expert loading**: the user sets `max_memory_mb` and APEX loads experts on demand, caches them LRU, and evicts when over budget. Built up in tightly-scoped MVP steps; now the same `Runtime` used by fake demos can drive real Gemma 4 NVFP4 MoE layers.
 
 ## How to test
 
 ```bash
-# Full unit suite (200 tests, ~1s)
+# Full unit suite (220 tests, real-checkpoint tests skip if absent)
 uv run pytest -q
 
 # Seven fake-MoE demos — each exercises a different combination of
@@ -22,6 +22,7 @@ uv run python demo_mlx_backend.py     # MLXBackend (Apple Silicon)
 uv run python scripts/smoke_real_moe_layer.py        # one layer
 uv run python scripts/smoke_real_moe_two_layer.py    # two layers in sequence
 uv run python scripts/demo_real_moe_cache.py         # load-once / reuse-many
+uv run python scripts/demo_real_runtime.py           # real layers through Runtime
 ```
 
 Diagnostic scripts:
@@ -57,8 +58,8 @@ uv run python scripts/validate_layout.py <path> --layout gemma-moe [--check-shap
             │                │
             │                ▼
             │         ┌──────────────┐
-            │         │ Backend.run_ │ ── SwiGLU FFN
-            │         │   expert     │
+            │         │ run_moe_layer│ ── weighted SwiGLU FFN
+            │         │ + Backend    │
             │         └──────────────┘
             │
             ▼
@@ -100,16 +101,17 @@ weighted-combine via apex.moe_layer.run_moe_layer
 
 | File | What it does | Key exports |
 |------|--------------|-------------|
-| `runtime.py` | Per-layer loop: route → ensure_loaded → run_expert → combine | `Runtime` |
+| `runtime.py` | Per-layer loop: route → `run_moe_layer` via `ExpertManager` | `Runtime` |
 | `expert_manager.py` | Cache lookup; on miss → store.load → backend.prepare → cache.put | `ExpertManager.ensure_loaded` |
 | `expert_cache.py` | Thread-safe LRU keyed on (layer, expert), bounded by `max_memory_mb` | `ExpertCache` |
 | `prefetcher.py` | Background thread that warms the cache from predictor hints | `Prefetcher` |
 | `predictor.py` | Markov predictor over `(layer, experts) → next_experts` | `MarkovPredictor` |
 | `router.py` | `FakeRouter` returns hand-coded picks (no math) | `FakeRouter` |
 | `gate_router.py` | Real top-k routing via `hidden @ gate.npy` | `GateRouter` |
+| `real_router.py` | Lazy per-layer router loading from real sharded safetensors | `MultiLayerRealRouter` |
 | `metrics.py` | Counters (cache_hit/miss/eviction, prefetch_hit/miss) | `Metrics` |
 | `trace_recorder.py` | Append-only JSONL transition log for predictor training | `TraceRecorder` |
-| `types.py` | `ExpertWeights(gate_proj, up_proj, down_proj)`, `RouteResult` | dataclasses |
+| `types.py` | `ExpertWeights(gate_proj, up_proj, down_proj)` | dataclass |
 
 ### `apex/` — MoE math (step 9)
 
@@ -133,7 +135,7 @@ weighted-combine via apex.moe_layer.run_moe_layer
 | `safetensors_expert_store.py` | safetensors (single file) | uses `safetensors.numpy` |
 | `gguf_expert_store.py` | GGUF (mmap-backed) | fp32 unquantized only |
 | `quantized_safetensors_store.py` | NVFP4 sharded safetensors | returns `QuantizedTensor` bundles |
-| `safetensors_gate_router.py` / `gguf_gate_router.py` / `mlx_gate_router.py` | Router-weight loaders | Same `route(layer, hidden)` interface |
+| `safetensors_gate_router.py` / `gguf_gate_router.py` / `mlx_gate_router.py` | Router-weight loaders | Return `(ids, None)` for uniform combine |
 
 ### `apex/` — naming + format helpers
 
@@ -160,14 +162,15 @@ weighted-combine via apex.moe_layer.run_moe_layer
 | `smoke_real_moe_layer.py` | End-to-end one MoE layer of real Gemma 4 NVFP4 (step 9) |
 | `demo_real_moe_cache.py` | First-run misses + second-run hits on real Gemma 4 layer 0 (step 10) — ~167x speedup |
 | `smoke_real_moe_two_layer.py` | Drives two real MoE layers in sequence; cache key disambiguates by `(layer, expert)` (step 11) |
+| `demo_real_runtime.py` | Drives real Gemma 4 MoE layers through `Runtime` with cold/warm cache checks (step 12) |
 
 ### `tests/`
 
-31 test modules, 214 tests total. `tests/_world.py` provides `FakeStore` + re-exports the fake-world writers from `apex._fake_weights`. `tests/test_real_moe_cache.py` and `tests/test_real_moe_two_layer.py` each include 1 real-Gemma test that auto-skips unless `REAL_MOE_PATH` (or the default download path) resolves.
+32 test modules, 220 tests total. `tests/_world.py` provides `FakeStore` + re-exports the fake-world writers from `apex._fake_weights`. `tests/test_real_moe_cache.py`, `tests/test_real_moe_two_layer.py`, and `tests/test_runtime_real_integration.py` include real-Gemma tests that auto-skip unless `REAL_MOE_PATH` (or a known local default path) resolves.
 
 ---
 
-## What's done (steps 1–11, all on `main`)
+## What's done (steps 1–12)
 
 1–3. Bounded LRU cache, prefetcher, Markov predictor, metrics.
 4. SwiGLU FFN experts (gate/up/down bundles via `ExpertWeights`).
@@ -178,6 +181,7 @@ weighted-combine via apex.moe_layer.run_moe_layer
 9. `apex/moe_layer.py` (`route` + `run_moe_layer`) + `smoke_real_moe_layer.py` end-to-end on real Gemma 4.
 10. Real MoE cache integration: `DequantizingExpertStore` + `demo_real_moe_cache.py`. First pass: 8 misses + 8 dequants. Second pass: 8 hits, ~167x speedup.
 11. Two-layer real smoke: `smoke_real_moe_two_layer.py`. Cache key disambiguates by `(layer, expert)`; cross-layer cache state survives intact; ~200x cold→warm speedup.
+12. Runtime integration: routers return `(ids, weights)`, `Runtime` calls `run_moe_layer`, accepts `initial_hidden`, and `MultiLayerRealRouter` lets `scripts/demo_real_runtime.py` drive real Gemma MoE layers through the main orchestrator.
 
 ---
 
@@ -185,8 +189,6 @@ weighted-combine via apex.moe_layer.run_moe_layer
 
 ### Near term
 
-- **Plug `apex.moe_layer.run_moe_layer` into `Runtime`** — the runtime today loops `for expert: ensure_loaded; run_expert` with uniform-mean combine. Switching to the real router-weighted combine via `run_moe_layer` removes a layer of duplication and makes the fake demos use the same math the smoke test uses.
-- **Real-checkpoint Runtime mode** — `Runtime` itself doesn't yet know how to drive a real checkpoint; the step 10/11 demos wire `ExpertManager` directly. Adding a `RealRuntime` (or extending `Runtime` to take routers + a list of layer ids) closes that last gap.
 - **MLX path for real weights** — `MLXBackend` already does SwiGLU; needs a `dequantize` step that produces `mx.array` directly to avoid the numpy round-trip.
 - **Predictor + prefetcher for real layers** — step 11 proved 200x speedup once cached; the pre-cache work could happen in the background while attention runs. Wire `Prefetcher` into the demo to overlap layer N+1's expert loads with layer N's compute.
 

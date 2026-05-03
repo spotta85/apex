@@ -1,19 +1,27 @@
-"""Tests for backend.prepare_hidden / combine_outputs / to_numpy.
+"""Tests for backend.prepare_hidden / run_moe_layer combine / to_numpy.
 
-These three methods make the runtime backend-array-type-agnostic. With
-them in place, MLXBackend can keep `hidden` as mx.array across layers
-while FakeBackend keeps it as ndarray, and the runtime doesn't have to
-branch on backend type.
+These boundaries make the runtime backend-array-type-agnostic. MLXBackend
+can keep `hidden` as mx.array across layers while FakeBackend keeps it
+as ndarray, and the runtime doesn't have to branch on backend type.
 """
 
 import numpy as np
 import pytest
 
 from apex.backends.fake_backend import FakeBackend
+from apex.moe_layer import run_moe_layer
 
 mx = pytest.importorskip("mlx.core")
 from apex.backends.mlx_backend import MLXBackend
 from tests._world import write_npy_world
+
+
+class _OutputBackend:
+    def __init__(self, outputs):
+        self.outputs = outputs
+
+    def run_expert(self, _hidden, expert_id):
+        return self.outputs[expert_id]
 
 
 def test_fake_prepare_hidden_is_passthrough():
@@ -31,19 +39,24 @@ def test_mlx_prepare_hidden_returns_mx_array():
     assert isinstance(out, mx.array)
 
 
-def test_fake_combine_outputs_averages_ndarrays():
+def test_run_moe_layer_none_weights_averages_ndarrays():
     backend = FakeBackend()
     a = np.full((1, 4), 2.0, dtype="float32")
     b = np.full((1, 4), 4.0, dtype="float32")
-    avg = backend.combine_outputs([a, b])
+    avg = run_moe_layer(
+        a,
+        [0, 1],
+        None,
+        lambda eid: eid,
+        backend=_OutputBackend([a, b]),
+    )
     np.testing.assert_array_equal(avg, np.full((1, 4), 3.0, dtype="float32"))
 
 
-def test_mlx_combine_outputs_averages_mx_arrays():
-    backend = MLXBackend()
+def test_run_moe_layer_none_weights_averages_mx_arrays():
     a = mx.array(np.full((1, 4), 2.0, dtype="float32"))
     b = mx.array(np.full((1, 4), 4.0, dtype="float32"))
-    avg = backend.combine_outputs([a, b])
+    avg = run_moe_layer(a, [0, 1], None, lambda eid: eid, _OutputBackend([a, b]))
     # Result should still be an mx.array (no implicit numpy conversion).
     assert isinstance(avg, mx.array)
     np.testing.assert_allclose(np.array(avg), np.full((1, 4), 3.0, dtype="float32"))
@@ -103,9 +116,6 @@ def test_runtime_hidden_stays_mx_array_under_mlx(tmp_path):
             seen_expert_types.append(type(expert).__name__)
             seen_projection_types.append(type(expert.gate_proj).__name__)
             return inner.run_expert(hidden, expert)
-
-        def combine_outputs(self, outs):
-            return inner.combine_outputs(outs)
 
         def to_numpy(self, x):
             return inner.to_numpy(x)

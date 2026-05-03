@@ -1,8 +1,8 @@
 """Toy MoE runtime, with optional async prefetch + learned predictor.
 
 Walks through 2 layers, asks the router which experts to use at each
-layer, makes sure each chosen expert is loaded, runs it via the backend,
-and averages the per-expert outputs to form the next hidden state.
+layer, makes sure each chosen expert is loaded, runs the MoE layer via
+the backend, and combines per-expert outputs into the next hidden state.
 
 Optional pluggables:
   - prefetcher: schedules next-layer expert loads in the background
@@ -17,8 +17,8 @@ Optional pluggables:
 Backend-native hidden state (step 2):
   The hidden state is converted to the backend's preferred form once at
   the start (`backend.prepare_hidden`) and stays in that form across
-  layers (`backend.combine_outputs` averages per-layer outputs in
-  place). Only at two boundaries do we cross back to numpy:
+  layers (`apex.moe_layer.run_moe_layer` preserves the backend array
+  type). Only at two boundaries do we cross back to numpy:
     - calling the router (numpy routers want ndarray; MLX router doesn't
       care because it accepts either via internal handling)
     - returning the final hidden from `run()` (callers / tests expect
@@ -28,6 +28,8 @@ Backend-native hidden state (step 2):
 """
 
 import numpy as np
+
+from apex.moe_layer import run_moe_layer
 
 
 class Runtime:
@@ -40,6 +42,7 @@ class Runtime:
         predictor=None,
         trace_recorder=None,
         num_layers: int = 2,
+        initial_hidden=None,
     ):
         # Decides which experts run at each layer (ground truth).
         # Routers must accept (layer_id, hidden_state) — FakeRouter
@@ -48,8 +51,8 @@ class Runtime:
         # Owns the cache + store; gives us loaded expert weights.
         self.expert_manager = expert_manager
         # Compute backend. Provides prepare_hidden / run_expert /
-        # combine_outputs / to_numpy so the runtime stays
-        # array-type-agnostic (numpy vs mx.array).
+        # to_numpy so the runtime stays array-type-agnostic
+        # (numpy vs mx.array).
         self.backend = backend
         # Optional: AsyncPrefetcher for background next-layer loading.
         self.prefetcher = prefetcher
@@ -61,15 +64,19 @@ class Runtime:
         # existing demo unchanged; future real-model layouts can pass
         # whatever the model actually has.
         self.num_layers = num_layers
+        # Optional real-model starting hidden state. None keeps the
+        # fake demos' original (1, 8) all-ones input exactly.
+        self.initial_hidden = initial_hidden
 
     def run(self):
-        # Start with a dummy hidden state (batch=1, hidden=8) and let
-        # the backend transform it into its preferred form. For
-        # FakeBackend this is a no-op; for MLXBackend we now hold an
-        # mx.array that travels through every layer without round trips.
-        hidden = self.backend.prepare_hidden(
-            np.ones((1, 8), dtype="float32")
-        )
+        # Start with either the caller-supplied hidden state or the
+        # original fake-demo default (batch=1, hidden=8). The backend
+        # owns any array-type conversion.
+        if self.initial_hidden is None:
+            initial = np.ones((1, 8), dtype="float32")
+        else:
+            initial = self.initial_hidden
+        hidden = self.backend.prepare_hidden(initial)
 
         for layer_id in range(self.num_layers):
             # If we prefetched experts for this layer at the end of the
@@ -85,30 +92,23 @@ class Runtime:
             # (numpy routers call np.asarray, MLX router wraps with
             # mx.array). So we pass `hidden` directly and let the
             # router decide what to do with it.
-            expert_ids = self.router.route(layer_id, hidden)
+            expert_ids, weights = self.router.route(layer_id, hidden)
             # `router.name` lets demos see which routing path is in
             # use ("numpy" vs "mlx"). All routers declare a name.
             print(f"router backend: {self.router.name}")
             print(f"router selected experts: {list(expert_ids)}")
 
-            # Run each chosen expert and collect its output.
-            outputs = []
-            for expert_id in expert_ids:
-                # ensure_loaded handles cache hit / miss / eviction and
-                # (if backend was supplied) returns a backend-prepared
-                # tensor — for MLXBackend, that's an mx.array.
-                expert = self.expert_manager.ensure_loaded(layer_id, expert_id)
-                # The backend applies the expert's weights to the hidden
-                # state. With MLXBackend this is mx.matmul; both inputs
-                # are already mx.array (hidden from prepare_hidden,
-                # expert from prepare_expert in the manager).
-                out = self.backend.run_expert(hidden, expert)
-                outputs.append(out)
-
-            # Combine the per-expert outputs by simple averaging. The
-            # backend owns the math so mx.array stays mx.array (no
-            # implicit numpy conversion via Python's sum() pitfalls).
-            hidden = self.backend.combine_outputs(outputs)
+            # Keep ExpertManager as the single cache/load path. Routers
+            # that return weights=None get the exact legacy uniform mean
+            # inside run_moe_layer; real routers pass softmax weights.
+            expert_loader = (
+                lambda expert_id, lid=layer_id: self.expert_manager.ensure_loaded(
+                    lid, expert_id
+                )
+            )
+            hidden = run_moe_layer(
+                hidden, expert_ids, weights, expert_loader, self.backend,
+            )
 
             # End-of-layer side work: trace recording + prefetch scheduling.
             # Doing prefetch AFTER current-layer compute (rather than in
@@ -122,7 +122,7 @@ class Runtime:
                 # if the predictor has no opinion. Pass the freshly
                 # computed `hidden` so a gate router scores the same
                 # state the next layer will see.
-                actual_next_experts = self.router.route(next_layer, hidden)
+                actual_next_experts, _ = self.router.route(next_layer, hidden)
 
                 if self.trace_recorder is not None:
                     self.trace_recorder.record(

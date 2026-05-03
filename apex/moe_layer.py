@@ -81,34 +81,40 @@ def run_moe_layer(hidden_state, expert_ids, weights, expert_loader, backend):
     Args:
       hidden_state:   shape (1, hidden_dim) -- batch=1 for now
       expert_ids:     iterable of int, length top_k
-      weights:        iterable of float, length top_k (must sum to ~1
-                      for combination to behave like a "router-weighted
-                      average"; this function does not re-normalize)
+      weights:        iterable of float, length top_k, or None. None
+                      preserves the legacy runtime behavior: uniform
+                      mean across selected experts.
       expert_loader:  callable expert_id -> ExpertWeights bundle ready
                       for backend.run_expert (already dequantized)
       backend:        anything with run_expert(hidden, bundle) -> array
 
     Returns:
       combined output of the same shape as backend.run_expert's return
-      (typically (1, hidden_dim)), summed as
-        sum_i  weight_i * backend.run_expert(hidden, expert_loader(id_i))
+      (typically (1, hidden_dim)). Weighted mode sums as:
+        sum_i weight_i * backend.run_expert(hidden, expert_loader(id_i))
 
-    The accumulator type follows whatever backend.run_expert returns,
-    so this works for both numpy and MLX backends (`float * mx.array`
-    is well-defined; Python's sum() folds left starting from int 0,
-    which mx.array's __radd__ handles).
+    The None/uniform branch uses `sum(outputs) / len(outputs)` exactly
+    like the pre-step-12 Runtime did, keeping fake demos byte-identical.
     """
     expert_ids = list(expert_ids)
-    weights_list = [float(w) for w in weights]
-    if len(expert_ids) != len(weights_list):
-        raise ValueError(
-            f"expert_ids ({len(expert_ids)}) and weights ({len(weights_list)}) "
-            f"must have the same length"
-        )
+    if not expert_ids:
+        raise ValueError("expert_ids must not be empty")
+    if weights is None:
+        weights_list = None
+    else:
+        weights_list = [float(w) for w in weights]
+        if len(expert_ids) != len(weights_list):
+            raise ValueError(
+                f"expert_ids ({len(expert_ids)}) and weights ({len(weights_list)}) "
+                f"must have the same length"
+            )
 
     outputs = []
     for expert_id in expert_ids:
         bundle = expert_loader(expert_id)
         outputs.append(backend.run_expert(hidden_state, bundle))
+
+    if weights_list is None:
+        return sum(outputs) / len(outputs)
 
     return sum(w * out for w, out in zip(weights_list, outputs))

@@ -155,6 +155,21 @@ def test_run_moe_layer_weights_scale_contribution():
     np.testing.assert_allclose(half_each, single, rtol=1e-5)
 
 
+def test_run_moe_layer_none_weights_uses_uniform_mean():
+    hidden = np.ones((1, HIDDEN), dtype="float32")
+    backend = FakeBackend()
+    bundles = {
+        0: make_expert_bundle(fill=0.05),
+        1: make_expert_bundle(fill=0.10),
+    }
+
+    out = run_moe_layer(hidden, [0, 1], None, lambda eid: bundles[eid], backend)
+    expected = (
+        backend.run_expert(hidden, bundles[0]) + backend.run_expert(hidden, bundles[1])
+    ) / 2
+    np.testing.assert_array_equal(out, expected)
+
+
 def test_run_moe_layer_loader_called_per_expert_id():
     # The loader is called exactly once per expert_id, in the order
     # they appear — which is the order route() returned them.

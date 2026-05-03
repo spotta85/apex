@@ -32,7 +32,11 @@ def test_top_k_matches_safetensors_router(tmp_path):
     np_router = SafetensorsGateRouter(str(path), FakeMoELayout(), top_k=2)
     mlx_router = MLXGateRouter(str(path), FakeMoELayout(), top_k=2)
 
-    assert mlx_router.route(0, hidden) == np_router.route(0, hidden)
+    mlx_selected, mlx_weights = mlx_router.route(0, hidden)
+    np_selected, np_weights = np_router.route(0, hidden)
+    assert mlx_selected == np_selected
+    assert mlx_weights is None
+    assert np_weights is None
 
 
 def test_gate_cached_as_mx_array(tmp_path):
@@ -56,7 +60,9 @@ def test_accepts_mx_array_hidden(tmp_path):
 
     router = MLXGateRouter(str(path), FakeMoELayout(), top_k=1)
     hidden_mx = mx.array(np.array([[1, 0, 0, 0]], dtype="float32"))
-    assert router.route(0, hidden_mx) == [0]
+    selected, weights = router.route(0, hidden_mx)
+    assert selected == [0]
+    assert weights is None
 
 
 def test_accepts_ndarray_hidden(tmp_path):
@@ -67,7 +73,9 @@ def test_accepts_ndarray_hidden(tmp_path):
 
     router = MLXGateRouter(str(path), FakeMoELayout(), top_k=1)
     hidden_np = np.array([[0, 0, 1, 0]], dtype="float32")
-    assert router.route(0, hidden_np) == [2]
+    selected, weights = router.route(0, hidden_np)
+    assert selected == [2]
+    assert weights is None
 
 
 def test_returns_python_ints(tmp_path):
@@ -76,7 +84,8 @@ def test_returns_python_ints(tmp_path):
     path = write_gate(tmp_path, gate)
 
     router = MLXGateRouter(str(path), FakeMoELayout(), top_k=2)
-    for expert_id in router.route(0, np.ones((1, 4), dtype="float32")):
+    selected, _ = router.route(0, np.ones((1, 4), dtype="float32"))
+    for expert_id in selected:
         assert type(expert_id) is int
 
 
