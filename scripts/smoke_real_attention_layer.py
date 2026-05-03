@@ -38,12 +38,11 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from apex.attention import single_token_attention
+from apex.checkpoint_loaders import load_attention_weights, read_text_config
 from scripts._real_moe_helpers import (
     add_real_moe_args,
     detect_real_moe_layout,
-    load_attention_weights,
     nvfp4_matmul_warnings,
-    read_text_config,
 )
 
 

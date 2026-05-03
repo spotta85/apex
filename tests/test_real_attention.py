@@ -238,7 +238,7 @@ def test_decode_step_output_changes_when_cache_has_history():
 @skip_if_no_real_checkpoint()
 def test_real_gemma_layer0_single_token_attention_is_finite():
     """End-to-end on real Gemma 4 layer 0: load + dequant + run attention."""
-    from scripts._real_moe_helpers import (
+    from apex.checkpoint_loaders import (
         load_attention_weights,
         read_text_config,
     )
@@ -292,7 +292,7 @@ def test_real_gemma_layer0_single_token_attention_is_finite():
 @skip_if_no_real_checkpoint()
 def test_real_gemma_attention_decode_step_grows_cache_finitely():
     """Three real-Gemma decode steps: cache grows 1→2→3, outputs stay finite."""
-    from scripts._real_moe_helpers import (
+    from apex.checkpoint_loaders import (
         load_attention_weights,
         read_text_config,
     )

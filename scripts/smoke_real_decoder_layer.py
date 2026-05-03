@@ -49,14 +49,16 @@ from apex.expert_manager import ExpertManager
 from apex.metrics import Metrics
 from apex.moe_layer import run_moe_layer
 from apex.real_router import MultiLayerRealRouter
+from apex.checkpoint_loaders import (
+    load_attention_weights,
+    load_layer_norms,
+    read_text_config,
+)
 from scripts._real_moe_helpers import (
     add_real_moe_args,
     detect_real_moe_layout,
-    load_attention_weights,
-    load_layer_norms,
     nvfp4_matmul_warnings,
     quantized_store_for_layout,
-    read_text_config,
 )
 
 

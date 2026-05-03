@@ -192,12 +192,12 @@ def test_real_gemma_layer0_decoder_decode_step_grows_cache():
     from apex.metrics import Metrics
     from apex.moe_layer import run_moe_layer
     from apex.real_router import MultiLayerRealRouter
-    from scripts._real_moe_helpers import (
+    from apex.checkpoint_loaders import (
         load_attention_weights,
         load_layer_norms,
-        quantized_store_for_layout,
         read_text_config,
     )
+    from scripts._real_moe_helpers import quantized_store_for_layout
     from tests._synthetic_nvfp4 import (
         real_checkpoint_path,
         real_layout_and_quant_store,
@@ -269,12 +269,12 @@ def test_real_gemma_layer0_decoder_produces_finite_output():
     from apex.metrics import Metrics
     from apex.moe_layer import run_moe_layer
     from apex.real_router import MultiLayerRealRouter
-    from scripts._real_moe_helpers import (
+    from apex.checkpoint_loaders import (
         load_attention_weights,
         load_layer_norms,
-        quantized_store_for_layout,
         read_text_config,
     )
+    from scripts._real_moe_helpers import quantized_store_for_layout
     from tests._synthetic_nvfp4 import (
         real_checkpoint_path,
         real_layout_and_quant_store,

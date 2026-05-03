@@ -36,14 +36,14 @@ def _silence_matmul_warnings():
 @skip_if_no_real_checkpoint()
 def test_real_gemma_one_token_forward_emits_in_vocab_id():
     """Embed → 1 decoder layer → final_norm → lm_head → argmax."""
-    from scripts._real_moe_helpers import (
+    from apex.checkpoint_loaders import (
         load_attention_weights,
         load_embedding,
         load_final_norm,
         load_layer_norms,
-        quantized_store_for_layout,
         read_text_config,
     )
+    from scripts._real_moe_helpers import quantized_store_for_layout
     from tests._synthetic_nvfp4 import (
         real_checkpoint_path,
         real_layout_and_quant_store,
