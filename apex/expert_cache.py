@@ -33,6 +33,11 @@ class ExpertCache:
         self.max_memory_bytes = max_memory_mb * 1024 * 1024
         # Running total of nbytes across everything in the cache.
         self.current_bytes = 0
+        # High-water mark for current_bytes across the cache's lifetime.
+        # Updated post-eviction in put() so it reflects what the cache
+        # actually held at any moment, not transient mid-insert peaks.
+        # Used by apex.memory + step 14 demos to assert "budget respected".
+        self.peak_bytes = 0
         # OrderedDict gives O(1) insert/lookup and an in-order eviction
         # policy: oldest-touched at the front, newest at the back.
         self.cache = OrderedDict()
@@ -87,6 +92,12 @@ class ExpertCache:
                     print(f"evicting layer {old_key[0]} expert {old_key[1]}")
                 if self.metrics is not None:
                     self.metrics.on_eviction(old_key)
+
+            # Update peak after eviction so it reflects the steady-state
+            # post-insert footprint, not the transient mid-insert peak
+            # the eviction loop just stepped down from.
+            if self.current_bytes > self.peak_bytes:
+                self.peak_bytes = self.current_bytes
 
             # Verbose-only: report post-load memory usage so the user
             # can watch the cache stay near its budget. Metrics still
