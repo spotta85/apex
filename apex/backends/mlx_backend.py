@@ -5,10 +5,10 @@ tensors runs through MLX (`mlx.core`). On Apple Silicon this lets the
 operations use unified memory and optionally the GPU without explicit
 transfer steps.
 
-Step 4 changed `run_expert` from a single matmul to the standard
-SwiGLU FFN, computed via mx.matmul / mx.sigmoid:
+Math is HF SwiGLU (gate/up/down projections stored as
+(out_features, in_features), multiplied against the transpose):
 
-    out = (silu(h @ gate_proj) * (h @ up_proj)) @ down_proj
+    out = (silu(h @ gate_proj.T) * (h @ up_proj.T)) @ down_proj.T
 
 `prepare_expert` converts each of the three projections in the
 ExpertWeights bundle to mx.array exactly once; the cache then holds
@@ -40,16 +40,16 @@ class MLXBackend:
         return mx.array(hidden_state)
 
     def run_expert(self, hidden_state, expert_weights):
-        # SwiGLU FFN: same algebra as FakeBackend, MLX primitives.
-        # Inputs are already mx.array (hidden via prepare_hidden,
-        # bundle via prepare_expert).
-        gate = mx.matmul(hidden_state, expert_weights.gate_proj)
-        up = mx.matmul(hidden_state, expert_weights.up_proj)
+        # HF-oriented SwiGLU FFN — same algebra as FakeBackend, MLX
+        # primitives. Inputs are already mx.array (hidden via
+        # prepare_hidden, bundle via prepare_expert).
+        gate = mx.matmul(hidden_state, expert_weights.gate_proj.T)
+        up = mx.matmul(hidden_state, expert_weights.up_proj.T)
         # silu via mx.sigmoid (mx.silu / mx.fast.silu aren't in this
         # MLX version). MLX is lazy — the result here is unevaluated;
         # combine_outputs forces evaluation cheaply via the addition.
         gate_silu = gate * mx.sigmoid(gate)
-        return mx.matmul(gate_silu * up, expert_weights.down_proj)
+        return mx.matmul(gate_silu * up, expert_weights.down_proj.T)
 
     def combine_outputs(self, outputs):
         # Uniform average; identical algebra to FakeBackend. mx.array

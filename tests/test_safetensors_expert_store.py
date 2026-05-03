@@ -12,17 +12,16 @@ from tests._world import write_safetensors_world
 
 def test_loads_expert_as_bundle(tmp_path):
     # Each expert has three projections; load() should return them
-    # bundled into an ExpertWeights with shapes that match what
-    # SwiGLU FFN expects.
+    # bundled into an ExpertWeights with HF-orientation SwiGLU shapes
+    # (gate/up are (intermediate, hidden); down is reversed).
     path = write_safetensors_world(tmp_path / "x.safetensors")
 
     bundle = SafetensorsExpertStore(str(path), FakeMoELayout()).load(0, 1)
 
     assert isinstance(bundle, ExpertWeights)
-    # SwiGLU shapes: gate / up are (hidden, intermediate), down is (intermediate, hidden).
-    assert bundle.gate_proj.shape == (8, 16)
-    assert bundle.up_proj.shape == (8, 16)
-    assert bundle.down_proj.shape == (16, 8)
+    assert bundle.gate_proj.shape == (16, 8)
+    assert bundle.up_proj.shape == (16, 8)
+    assert bundle.down_proj.shape == (8, 16)
     assert bundle.gate_proj.dtype == np.float32
 
 
@@ -40,15 +39,15 @@ def test_uses_layout_for_tensor_naming(tmp_path):
     path = tmp_path / "x.safetensors"
     save_file(
         {
-            "weird/0/1/g": np.full((8, 16), 9.0, dtype="float32"),
-            "weird/0/1/u": np.full((8, 16), 9.0, dtype="float32"),
-            "weird/0/1/d": np.full((16, 8), 9.0, dtype="float32"),
+            "weird/0/1/g": np.full((16, 8), 9.0, dtype="float32"),
+            "weird/0/1/u": np.full((16, 8), 9.0, dtype="float32"),
+            "weird/0/1/d": np.full((8, 16), 9.0, dtype="float32"),
         },
         str(path),
     )
 
     bundle = SafetensorsExpertStore(str(path), WeirdLayout()).load(0, 1)
-    assert bundle.gate_proj.shape == (8, 16)
+    assert bundle.gate_proj.shape == (16, 8)
 
 
 def test_missing_projection_raises_clear_error(tmp_path):

@@ -24,15 +24,17 @@ from tests._world import (
 )
 
 
-# Identity-projection bundle: gate_proj/up_proj are the (hidden, intermediate)
-# matrix [I | 0], down_proj is the (intermediate, hidden) matrix [I; 0]^T.
-# Used by tests that need a stable "the math actually computed" check
-# without caring about specific numbers.
+# Identity-projection bundle in HF orientation: gate_proj/up_proj are
+# (intermediate, hidden) with the first `hidden` rows = I, down_proj is
+# (hidden, intermediate) with the first `hidden` cols = I. Backends do
+# h @ proj.T, so this projects h to itself in the active hidden dim
+# without caring about specific numbers — useful for "the math
+# actually computed" sanity checks.
 def _identity_bundle(hidden=HIDDEN, intermediate=INTERMEDIATE):
-    gate = np.zeros((hidden, intermediate), dtype="float32")
+    gate = np.zeros((intermediate, hidden), dtype="float32")
     gate[:hidden, :hidden] = np.eye(hidden, dtype="float32")
     up = gate.copy()
-    down = np.zeros((intermediate, hidden), dtype="float32")
+    down = np.zeros((hidden, intermediate), dtype="float32")
     down[:hidden, :hidden] = np.eye(hidden, dtype="float32")
     return ExpertWeights(gate_proj=gate, up_proj=up, down_proj=down)
 
@@ -60,9 +62,10 @@ def test_output_values_close_to_numpy_backend():
     rng = np.random.default_rng(0)
     hidden = rng.standard_normal((1, HIDDEN)).astype("float32")
     bundle = ExpertWeights(
-        gate_proj=rng.standard_normal((HIDDEN, INTERMEDIATE)).astype("float32"),
-        up_proj=rng.standard_normal((HIDDEN, INTERMEDIATE)).astype("float32"),
-        down_proj=rng.standard_normal((INTERMEDIATE, HIDDEN)).astype("float32"),
+        # HF orientation: gate/up are (intermediate, hidden); down is reversed.
+        gate_proj=rng.standard_normal((INTERMEDIATE, HIDDEN)).astype("float32"),
+        up_proj=rng.standard_normal((INTERMEDIATE, HIDDEN)).astype("float32"),
+        down_proj=rng.standard_normal((HIDDEN, INTERMEDIATE)).astype("float32"),
     )
 
     fake = FakeBackend()
