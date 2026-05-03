@@ -1,0 +1,16 @@
+[project]
+name = "apex"
+version = "0.1.0"
+description = "Add your description here"
+requires-python = ">=3.10"
+dependencies = [
+    "gguf>=0.18.0",
+    "mlx>=0.31.2",
+    "numpy>=2.2.6",
+    "safetensors>=0.7.0",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.0.3",
+]
