@@ -120,6 +120,39 @@ def dequantize_bundle(bundle: ExpertWeights) -> ExpertWeights:
     )
 
 
+class DequantizingExpertStore:
+    """Wrap a store-of-quantized-bundles so it returns dequantized bundles.
+
+    Composes with any object exposing ``load(layer_id, expert_id)``:
+
+        base  = QuantizedSafetensorsExpertStore(path, layout)
+        store = DequantizingExpertStore(base)
+        manager = ExpertManager(store, cache, ...)
+
+    The point of this adapter is **where the dequant happens**. Without
+    it, the manager would cache the QuantizedTensor bundle and every
+    cache hit would still pay the ~60 ms NVFP4 decode (gate/up/down).
+    By dequantizing inside ``load``, the cache holds fp32 ndarrays and
+    cache hits skip dequant entirely — which is the whole point of
+    "real MoE cache integration."
+
+    `verbose=True` prints ``dequantized expert <eid>`` after each load so
+    the demo trace can show that dequant is happening on misses (and
+    NOT on hits — the line never fires from the manager's hit path).
+    """
+
+    def __init__(self, base, *, verbose: bool = False):
+        self.base = base
+        self.verbose = verbose
+
+    def load(self, layer_id: int, expert_id: int) -> ExpertWeights:
+        bundle = self.base.load(layer_id, expert_id)
+        out = dequantize_bundle(bundle)
+        if self.verbose:
+            print(f"dequantized expert {expert_id}")
+        return out
+
+
 # --- Raw tensor handling (mostly BF16) -------------------------------------
 
 def _dequantize_raw(t: RawTensor, *, name: str) -> np.ndarray:
