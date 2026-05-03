@@ -9,7 +9,8 @@ import contextlib
 
 import numpy as np
 
-from apex.attention import single_token_attention
+from apex.attention import attention_decode_step, single_token_attention
+from apex.kv_cache import KVCache
 from apex.ops import linear
 from tests._synthetic_nvfp4 import skip_if_no_real_checkpoint
 
@@ -132,6 +133,108 @@ def test_single_token_attention_no_gqa_when_heads_equal_kv_heads():
     assert np.all(np.isfinite(out))
 
 
+# --- attention_decode_step (KV cache + RoPE) ----------------------------
+
+def _decode_kwargs(rng, hidden_dim=64, num_heads=4, num_kv_heads=2, head_dim=16):
+    return dict(
+        q_weight=rng.standard_normal(
+            (num_heads * head_dim, hidden_dim),
+        ).astype(np.float32),
+        k_weight=rng.standard_normal(
+            (num_kv_heads * head_dim, hidden_dim),
+        ).astype(np.float32),
+        v_weight=rng.standard_normal(
+            (num_kv_heads * head_dim, hidden_dim),
+        ).astype(np.float32),
+        o_weight=rng.standard_normal(
+            (hidden_dim, num_heads * head_dim),
+        ).astype(np.float32),
+        num_heads=num_heads,
+        num_kv_heads=num_kv_heads,
+        head_dim=head_dim,
+    )
+
+
+def test_decode_step_first_call_with_empty_cache_matches_single_token_attention():
+    """At cache len 0 (position 0), RoPE is identity ⇒ output equals
+    `single_token_attention` with the same weights."""
+    rng = np.random.default_rng(10)
+    hidden = rng.standard_normal((1, 64)).astype(np.float32)
+    kwargs = _decode_kwargs(rng)
+    cache = KVCache(num_layers=1)
+
+    with _silence_matmul_warnings():
+        decode_out = attention_decode_step(
+            hidden, **kwargs, kv_cache=cache, layer_id=0,
+        )
+        single_out = single_token_attention(hidden, **kwargs)
+
+    np.testing.assert_allclose(decode_out, single_out, rtol=1e-5)
+
+
+def test_decode_step_grows_kv_cache_by_one_per_call():
+    """Each call appends exactly one new (k, v) row to the cache."""
+    rng = np.random.default_rng(11)
+    kwargs = _decode_kwargs(rng)
+    cache = KVCache(num_layers=1)
+
+    with _silence_matmul_warnings():
+        for step in range(5):
+            hidden = rng.standard_normal((1, 64)).astype(np.float32)
+            attention_decode_step(
+                hidden, **kwargs, kv_cache=cache, layer_id=0,
+            )
+            assert cache.length(0) == step + 1
+
+
+def test_decode_step_isolates_per_layer_kv_state():
+    """Decoding through layer 0 must not pollute layer 1's cache."""
+    rng = np.random.default_rng(12)
+    kwargs = _decode_kwargs(rng)
+    cache = KVCache(num_layers=2)
+
+    with _silence_matmul_warnings():
+        attention_decode_step(
+            rng.standard_normal((1, 64)).astype(np.float32),
+            **kwargs, kv_cache=cache, layer_id=0,
+        )
+
+    assert cache.length(0) == 1
+    assert cache.length(1) == 0
+
+
+def test_decode_step_output_changes_when_cache_has_history():
+    """Same input vector at position 5 differs from same input at position 0.
+
+    Position 0 ⇒ RoPE identity + cache holds only the new k/v.
+    Position 5 ⇒ RoPE rotates q/k + softmax mixes 6 cached values.
+    Outputs must differ — otherwise the cache is being ignored.
+    """
+    rng = np.random.default_rng(13)
+    kwargs = _decode_kwargs(rng)
+
+    fresh = KVCache(num_layers=1)
+    primed = KVCache(num_layers=1)
+
+    hidden = rng.standard_normal((1, 64)).astype(np.float32)
+    with _silence_matmul_warnings():
+        # Prime the second cache with 5 unrelated tokens so the next
+        # decode step sees position 5 + a populated history.
+        for _ in range(5):
+            attention_decode_step(
+                rng.standard_normal((1, 64)).astype(np.float32),
+                **kwargs, kv_cache=primed, layer_id=0,
+            )
+        out_at_zero = attention_decode_step(
+            hidden, **kwargs, kv_cache=fresh, layer_id=0,
+        )
+        out_at_five = attention_decode_step(
+            hidden, **kwargs, kv_cache=primed, layer_id=0,
+        )
+
+    assert not np.allclose(out_at_zero, out_at_five)
+
+
 @skip_if_no_real_checkpoint()
 def test_real_gemma_layer0_single_token_attention_is_finite():
     """End-to-end on real Gemma 4 layer 0: load + dequant + run attention."""
@@ -183,4 +286,56 @@ def test_real_gemma_layer0_single_token_attention_is_finite():
     assert weights["o_weight"].shape == (
         text_cfg["hidden_size"],
         text_cfg["num_attention_heads"] * text_cfg["head_dim"],
+    )
+
+
+@skip_if_no_real_checkpoint()
+def test_real_gemma_attention_decode_step_grows_cache_finitely():
+    """Three real-Gemma decode steps: cache grows 1→2→3, outputs stay finite."""
+    from scripts._real_moe_helpers import (
+        load_attention_weights,
+        read_text_config,
+    )
+    from tests._synthetic_nvfp4 import (
+        real_checkpoint_path,
+        real_layout_and_quant_store,
+    )
+
+    path = real_checkpoint_path()
+    layout, _ = real_layout_and_quant_store(path)
+    text_cfg = read_text_config(path)
+    weights = load_attention_weights(path, layout, layer_id=0)
+
+    cache = KVCache(num_layers=1)
+    rng = np.random.default_rng(0)
+    kwargs = dict(
+        q_weight=weights["q_weight"], k_weight=weights["k_weight"],
+        v_weight=weights["v_weight"], o_weight=weights["o_weight"],
+        num_heads=text_cfg["num_attention_heads"],
+        num_kv_heads=text_cfg["num_key_value_heads"],
+        head_dim=text_cfg["head_dim"],
+        q_norm_weight=weights["q_norm"], k_norm_weight=weights["k_norm"],
+        rms_eps=text_cfg["rms_norm_eps"],
+        rope_theta=10000.0,            # sliding_attention default
+    )
+
+    for step in range(3):
+        hidden = rng.standard_normal(
+            (1, text_cfg["hidden_size"]),
+        ).astype(np.float32)
+        with _silence_matmul_warnings():
+            out = attention_decode_step(
+                hidden, **kwargs, kv_cache=cache, layer_id=0,
+            )
+        assert out.shape == (1, text_cfg["hidden_size"])
+        assert np.all(np.isfinite(out))
+        assert cache.length(0) == step + 1
+
+    # Cached key shape: (batch=1, num_kv_heads=8, seq=3, head_dim=256).
+    keys, _ = cache.get(0)
+    assert keys.shape == (
+        1,
+        text_cfg["num_key_value_heads"],
+        3,
+        text_cfg["head_dim"],
     )
