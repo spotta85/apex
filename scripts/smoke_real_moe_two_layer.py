@@ -114,10 +114,12 @@ def main():
           f"{metrics.cache_hits} hits, {metrics.evictions} evictions")
 
     # --- 5. Second pass: same hidden ⇒ same routing decisions per layer
-    # ⇒ every expert is a cache hit.
+    # ⇒ every expert is a cache hit. Per-layer selections are the same
+    # by construction (same hidden, same router, no cache state changes
+    # routing) so we discard them here.
     print("\n=== second pass (warm cache) ===")
     metrics_before = (metrics.cache_misses, metrics.cache_hits)
-    selections_per_layer_2, out_second = _two_layer_pass(
+    _, out_second = _two_layer_pass(
         hidden_initial, args.layers, routers, manager, backend, args.top_k,
     )
 

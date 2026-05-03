@@ -272,7 +272,7 @@ def _dequantize_nvfp4_u32(t: QuantizedTensor, *, name: str) -> np.ndarray:
             message="NVFP4_U32 dequant expects at least 1-D packed data",
         )
 
-    nibbles = _unpack_u32_nibbles(packed)
+    nibbles = _unpack_u32_lanes(packed, lane_bits=4)
     fp4_values = NVFP4_LOOKUP[nibbles]
 
     block_scales_u8 = np.asarray(t.weight_scale, dtype=np.uint8)
@@ -308,7 +308,7 @@ def _dequantize_affine_uint8_u32(t: QuantizedTensor, *, name: str) -> np.ndarray
         )
 
     packed = np.asarray(t.data, dtype=np.uint32)
-    q = _unpack_u32_bytes(packed).astype(np.float32)
+    q = _unpack_u32_lanes(packed, lane_bits=8).astype(np.float32)
     scales = np.asarray(t.weight_scale, dtype=np.float32)
     biases = np.asarray(t.weight_scale_2, dtype=np.float32)
     if scales.shape != biases.shape:
@@ -334,19 +334,19 @@ def _dequantize_affine_uint8_u32(t: QuantizedTensor, *, name: str) -> np.ndarray
     )
 
 
-def _unpack_u32_nibbles(packed: np.ndarray) -> np.ndarray:
-    """Unpack little-endian uint32 words into eight low-to-high nibbles."""
-    out = np.empty(packed.shape[:-1] + (packed.shape[-1] * 8,), dtype=np.uint8)
-    for i in range(8):
-        out[..., i::8] = ((packed >> (4 * i)) & 0x0F).astype(np.uint8)
-    return out
+def _unpack_u32_lanes(packed: np.ndarray, *, lane_bits: int) -> np.ndarray:
+    """Unpack little-endian uint32 words into 32/lane_bits lanes per word.
 
-
-def _unpack_u32_bytes(packed: np.ndarray) -> np.ndarray:
-    """Unpack little-endian uint32 words into four low-to-high bytes."""
-    out = np.empty(packed.shape[:-1] + (packed.shape[-1] * 4,), dtype=np.uint8)
-    for i in range(4):
-        out[..., i::4] = ((packed >> (8 * i)) & 0xFF).astype(np.uint8)
+    Lane 0 is bits [0, lane_bits); lane 1 is [lane_bits, 2*lane_bits);
+    etc. Lanes are placed at strided positions along the last axis so
+    `out[..., i]` corresponds to the i-th lane in word `i // lanes`,
+    matching the on-disk MLX/HF packing order.
+    """
+    lanes = 32 // lane_bits
+    mask = (1 << lane_bits) - 1
+    out = np.empty(packed.shape[:-1] + (packed.shape[-1] * lanes,), dtype=np.uint8)
+    for i in range(lanes):
+        out[..., i::lanes] = ((packed >> (lane_bits * i)) & mask).astype(np.uint8)
     return out
 
 
