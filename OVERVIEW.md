@@ -18,8 +18,10 @@ uv run python demo_gguf.py            # GGUFExpertStore + gate router
 uv run python demo_mmap_store.py      # MMapExpertStore (np.memmap)
 uv run python demo_mlx_backend.py     # MLXBackend (Apple Silicon)
 
-# Real-checkpoint smoke test — needs ~17 GB Gemma 4 NVFP4 download
-uv run python scripts/smoke_real_moe_layer.py
+# Real-checkpoint smoke tests — need ~17 GB Gemma 4 NVFP4 download
+uv run python scripts/smoke_real_moe_layer.py        # one layer
+uv run python scripts/smoke_real_moe_two_layer.py    # two layers in sequence
+uv run python scripts/demo_real_moe_cache.py         # load-once / reuse-many
 ```
 
 Diagnostic scripts:
@@ -143,7 +145,7 @@ weighted-combine via apex.moe_layer.run_moe_layer
 | `gguf_tensor_index.py` | Lightweight wrapper around `gguf.GGUFReader` with shape-corrected metadata |
 | `tensor_types.py` | `RawTensor`, `QuantizedTensor` dataclasses (sidecars for dequant) |
 | `tensor_utils.py` | `tensor_nbytes(x)` — single source of truth for cache budget accounting |
-| `dequant.py` | `dequantize(t)` + `dequantize_bundle(b)` — NVFP4 (E2M1 lookup + F8_E4M3 block scale + F32 scalar), BF16 |
+| `dequant.py` | `dequantize(t)` + `dequantize_bundle(b)` — NVFP4 (E2M1 lookup + F8_E4M3 block scale + F32 scalar), BF16. Also `DequantizingExpertStore(base)` — wraps any quantized store so the cache holds fp32 bundles |
 | `_fake_weights.py` | `write_npy_world` / `write_safetensors_world` / `write_gguf_world` + `make_expert_bundle` + size constants |
 | `_numpy_gate_router_base.py` | `BaseNumpyGateRouter` — shared top-k math for the three numpy routers |
 | `demo_modes.py` | `RuntimeBundle` dataclass + factory funcs that wire up each demo |
@@ -155,15 +157,17 @@ weighted-combine via apex.moe_layer.run_moe_layer
 | `make_fake_moe_weights.py` / `make_fake_safetensors_moe.py` / `make_fake_gguf_moe.py` | Generate fake-MoE checkpoints + record traces for demos |
 | `inspect_weight_names.py` | Print every tensor name in any supported checkpoint |
 | `validate_layout.py` | Assert a layout's strings exist in a checkpoint; `--check-shapes` adds SwiGLU consistency |
-| `smoke_real_moe_layer.py` | End-to-end one MoE layer of real Gemma 4 NVFP4 |
+| `smoke_real_moe_layer.py` | End-to-end one MoE layer of real Gemma 4 NVFP4 (step 9) |
+| `demo_real_moe_cache.py` | First-run misses + second-run hits on real Gemma 4 layer 0 (step 10) — ~167x speedup |
+| `smoke_real_moe_two_layer.py` | Drives two real MoE layers in sequence; cache key disambiguates by `(layer, expert)` (step 11) |
 
 ### `tests/`
 
-29 test modules, 200 tests total. `tests/_world.py` provides `FakeStore` + re-exports the fake-world writers from `apex._fake_weights`.
+31 test modules, 214 tests total. `tests/_world.py` provides `FakeStore` + re-exports the fake-world writers from `apex._fake_weights`. `tests/test_real_moe_cache.py` and `tests/test_real_moe_two_layer.py` each include 1 real-Gemma test that auto-skips unless `REAL_MOE_PATH` (or the default download path) resolves.
 
 ---
 
-## What's done (steps 1–9, all on `main`)
+## What's done (steps 1–11, all on `main`)
 
 1–3. Bounded LRU cache, prefetcher, Markov predictor, metrics.
 4. SwiGLU FFN experts (gate/up/down bundles via `ExpertWeights`).
@@ -172,6 +176,8 @@ weighted-combine via apex.moe_layer.run_moe_layer
 7. NVFP4 dequant + `RawTensor` / `QuantizedTensor` + `safetensors_loader` with BF16/F8 support; real Gemma expert load + dequant + forward.
 8. HF (PyTorch) weight orientation throughout — backends compute `h @ proj.T`; no per-load transposes.
 9. `apex/moe_layer.py` (`route` + `run_moe_layer`) + `smoke_real_moe_layer.py` end-to-end on real Gemma 4.
+10. Real MoE cache integration: `DequantizingExpertStore` + `demo_real_moe_cache.py`. First pass: 8 misses + 8 dequants. Second pass: 8 hits, ~167x speedup.
+11. Two-layer real smoke: `smoke_real_moe_two_layer.py`. Cache key disambiguates by `(layer, expert)`; cross-layer cache state survives intact; ~200x cold→warm speedup.
 
 ---
 
@@ -180,9 +186,9 @@ weighted-combine via apex.moe_layer.run_moe_layer
 ### Near term
 
 - **Plug `apex.moe_layer.run_moe_layer` into `Runtime`** — the runtime today loops `for expert: ensure_loaded; run_expert` with uniform-mean combine. Switching to the real router-weighted combine via `run_moe_layer` removes a layer of duplication and makes the fake demos use the same math the smoke test uses.
-- **Real-checkpoint runtime mode** — wire `QuantizedSafetensorsExpertStore` + `dequantize_bundle` through `ExpertManager` so the standard runtime can drive a real Gemma layer (today only the smoke script does).
-- **Cache the dequantized bundle, not the quantized one** — currently the cache holds whatever `store.load` returned (`QuantizedTensor`s for NVFP4). Backend prepare path should dequant before `cache.put` so cache hits skip the ~60ms NVFP4 decode. Needs `tensor_nbytes` updated to count fp32 bytes.
+- **Real-checkpoint Runtime mode** — `Runtime` itself doesn't yet know how to drive a real checkpoint; the step 10/11 demos wire `ExpertManager` directly. Adding a `RealRuntime` (or extending `Runtime` to take routers + a list of layer ids) closes that last gap.
 - **MLX path for real weights** — `MLXBackend` already does SwiGLU; needs a `dequantize` step that produces `mx.array` directly to avoid the numpy round-trip.
+- **Predictor + prefetcher for real layers** — step 11 proved 200x speedup once cached; the pre-cache work could happen in the background while attention runs. Wire `Prefetcher` into the demo to overlap layer N+1's expert loads with layer N's compute.
 
 ### Medium term
 
