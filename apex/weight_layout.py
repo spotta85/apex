@@ -36,6 +36,8 @@ GemmaHFMoELayout):
   - attn_k_norm(layer_id)         -> str
   - input_layernorm(layer_id)     -> str
   - post_attention_layernorm(layer_id) -> str
+  - pre_feedforward_layernorm(layer_id)  -> str
+  - post_feedforward_layernorm(layer_id) -> str
   - embedding_tensors()           -> {"weight": str, "scales"?: str}
   - final_norm()                  -> str
   - lm_head_tensors()             -> dict | None  (None ⇒ tied to embeddings)
@@ -141,6 +143,12 @@ class FakeMoELayout(_MoELayoutBase):
 
     def post_attention_layernorm(self, layer_id: int) -> str:
         return f"layers.{layer_id}.post_attention_layernorm.weight"
+
+    def pre_feedforward_layernorm(self, layer_id: int) -> str:
+        return f"layers.{layer_id}.pre_feedforward_layernorm.weight"
+
+    def post_feedforward_layernorm(self, layer_id: int) -> str:
+        return f"layers.{layer_id}.post_feedforward_layernorm.weight"
 
     def embedding_tensors(self) -> dict:
         return {"weight": "embed_tokens.weight"}
@@ -291,6 +299,12 @@ class GemmaMoELayout(_MoELayoutBase):
     def post_attention_layernorm(self, layer_id: int) -> str:
         return f"model.language_model.layers.{layer_id}.post_attention_layernorm.weight"
 
+    def pre_feedforward_layernorm(self, layer_id: int) -> str:
+        return f"model.language_model.layers.{layer_id}.pre_feedforward_layernorm.weight"
+
+    def post_feedforward_layernorm(self, layer_id: int) -> str:
+        return f"model.language_model.layers.{layer_id}.post_feedforward_layernorm.weight"
+
     def embedding_tensors(self) -> dict:
         prefix = "model.language_model.embed_tokens"
         return {"weight": f"{prefix}.weight", "scales": f"{prefix}.weight_scale"}
@@ -373,6 +387,17 @@ class GemmaHFMoELayout(_MoELayoutBase):
 
     def post_attention_layernorm(self, layer_id: int) -> str:
         return f"language_model.model.layers.{layer_id}.post_attention_layernorm.weight"
+
+    def pre_feedforward_layernorm(self, layer_id: int) -> str:
+        # Note: Gemma 4 layers also carry `pre_feedforward_layernorm_2`
+        # and `post_feedforward_layernorm_{1,2}` variants — one set per
+        # parallel feedforward path (dense MLP + routed MoE). The base
+        # names below are what the simple pre-norm + MoE smoke uses;
+        # supporting the full multi-path layer is a 16D+ concern.
+        return f"language_model.model.layers.{layer_id}.pre_feedforward_layernorm.weight"
+
+    def post_feedforward_layernorm(self, layer_id: int) -> str:
+        return f"language_model.model.layers.{layer_id}.post_feedforward_layernorm.weight"
 
     def embedding_tensors(self) -> dict:
         prefix = "language_model.model.embed_tokens"

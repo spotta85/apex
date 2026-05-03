@@ -70,6 +70,29 @@ def read_text_config(path) -> dict:
     return text
 
 
+def load_layer_norms(path, layout, layer_id: int) -> dict:
+    """Load layer L's four BF16 norm weights as fp32 ndarrays.
+
+    Returns {input, post_attn, pre_ffn, post_ffn}. Skips Gemma 4's
+    `_1` / `_2` variants (those belong to parallel feedforward paths
+    we don't drive yet — dense MLP alongside the routed MoE).
+    """
+    from apex.safetensors_loader import load_tensor
+
+    path = Path(path)
+    weight_map = read_safetensors_index(path)
+
+    def _load(name: str):
+        return load_tensor(path / weight_map[name], name)
+
+    return {
+        "input": _load(layout.input_layernorm(layer_id)),
+        "post_attn": _load(layout.post_attention_layernorm(layer_id)),
+        "pre_ffn": _load(layout.pre_feedforward_layernorm(layer_id)),
+        "post_ffn": _load(layout.post_feedforward_layernorm(layer_id)),
+    }
+
+
 def load_attention_weights(path, layout, layer_id: int) -> dict:
     """Load + dequantize layer `layer_id`'s q/k/v/o + q_norm/k_norm.
 

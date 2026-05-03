@@ -248,6 +248,14 @@ def test_gemma_hf_layernorm_formats():
         layout.post_attention_layernorm(29)
         == "language_model.model.layers.29.post_attention_layernorm.weight"
     )
+    assert (
+        layout.pre_feedforward_layernorm(0)
+        == "language_model.model.layers.0.pre_feedforward_layernorm.weight"
+    )
+    assert (
+        layout.post_feedforward_layernorm(11)
+        == "language_model.model.layers.11.post_feedforward_layernorm.weight"
+    )
 
 
 def test_gemma_hf_embedding_and_final_norm():
@@ -299,6 +307,14 @@ def test_fake_layout_norms_and_embeddings():
     assert (
         layout.post_attention_layernorm(0)
         == "layers.0.post_attention_layernorm.weight"
+    )
+    assert (
+        layout.pre_feedforward_layernorm(0)
+        == "layers.0.pre_feedforward_layernorm.weight"
+    )
+    assert (
+        layout.post_feedforward_layernorm(2)
+        == "layers.2.post_feedforward_layernorm.weight"
     )
     assert layout.attn_q_norm(0) == "layers.0.attn.q_norm.weight"
     assert layout.attn_k_norm(0) == "layers.0.attn.k_norm.weight"

@@ -124,6 +124,8 @@ def _check_non_moe(layout, names_set: set, last_layer: int) -> bool:
         "attn_k_norm",
         "input_layernorm",
         "post_attention_layernorm",
+        "pre_feedforward_layernorm",
+        "post_feedforward_layernorm",
     )
 
     # Probe layer 0 only. Gemma 4 has heterogeneous attention across
