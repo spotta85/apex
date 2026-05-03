@@ -1,11 +1,12 @@
 # APEX — Overview
 
-APEX is a from-scratch Mixture-of-Experts (MoE) inference runtime focused on **bounded-memory expert loading**: the user sets `max_memory_mb` and APEX loads experts on demand, caches them LRU, and evicts when over budget. Built up in tightly-scoped MVP steps; now the same `Runtime` used by fake demos can drive real Gemma 4 NVFP4 MoE layers.
+APEX is a from-scratch Mixture-of-Experts (MoE) inference runtime focused on **bounded-memory expert loading**: the user sets `max_memory_mb` and APEX loads experts on demand, caches them LRU, and evicts when over budget. Built up in tightly-scoped MVP steps; now the same `Runtime` used by fake demos can drive real Gemma 4 NVFP4 MoE layers, and step 16 begins building the surrounding model (attention, norms, embeddings) on top of the proven MoE block.
 
 ## How to test
 
 ```bash
-# Full unit suite (234 tests, real-checkpoint tests skip if absent)
+# Full unit suite (263 always-on tests; +5 real-Gemma tests run when
+# REAL_MOE_PATH points at a checkpoint)
 uv run pytest -q
 
 # Seven fake-MoE demos — each exercises a different combination of
@@ -25,14 +26,15 @@ uv run python scripts/demo_real_moe_cache.py         # load-once / reuse-many
 uv run python scripts/demo_real_runtime.py           # real layers through Runtime
 uv run python scripts/demo_real_memory_budget.py     # tight budget + LRU eviction
 uv run python scripts/demo_real_prefetch.py          # AsyncPrefetcher on real layers
+uv run python scripts/smoke_real_attention_layer.py  # single-token attention on layer 0 (step 16C)
 ```
 
 Diagnostic scripts:
 
 ```bash
 uv run python scripts/inspect_weight_names.py <path>          # list tensor names
-uv run python scripts/validate_layout.py <path> --layout gemma-moe [--check-shapes]
-uv run python scripts/validate_layout.py <path> --layout gemma-hf-moe [--check-shapes]
+uv run python scripts/validate_layout.py <path> --layout gemma-moe [--check-shapes] [--check-non-moe]
+uv run python scripts/validate_layout.py <path> --layout gemma-hf-moe [--check-shapes] [--check-non-moe]
 ```
 
 ---
@@ -123,6 +125,13 @@ weighted-combine via apex.moe_layer.run_moe_layer
 |------|--------------|-------------|
 | `moe_layer.py` | `route()` (top-k softmax) + `run_moe_layer()` (per-expert SwiGLU + weighted combine) | `route`, `run_moe_layer` |
 
+### `apex/` — non-MoE building blocks (step 16)
+
+| File | What it does | Key exports |
+|------|--------------|-------------|
+| `ops.py` | Tiny NumPy primitives: `rms_norm` (with Gemma `+1` convention), `linear` (HF orientation), `softmax` (numerically stable) | `rms_norm`, `linear`, `softmax` |
+| `attention.py` | `single_token_attention` — q/k/v/o + scaled-dot-product + GQA repeat + optional q/k norm. No KV cache, no RoPE (16D concern) | `single_token_attention` |
+
 ### `apex/backends/` — compute
 
 | File | What it does | Notes |
@@ -146,7 +155,7 @@ weighted-combine via apex.moe_layer.run_moe_layer
 
 | File | What it does |
 |------|--------------|
-| `weight_layout.py` | `FakeMoELayout`, `MixtralLayout`, `QwenMoELayout`, `GemmaMoELayout`, `GemmaHFMoELayout` + `get_layout(name)` registry |
+| `weight_layout.py` | `FakeMoELayout`, `MixtralLayout`, `QwenMoELayout`, `GemmaMoELayout`, `GemmaHFMoELayout` + `get_layout(name)` registry. Gemma layouts also expose optional non-MoE methods for attention / norms / embeddings / lm_head (step 16A) |
 | `checkpoint_index.py` | Metadata-only queries: `list_tensor_names`, `get_tensor_shape`, `read_safetensors_index` (handles single file / sharded dir / gguf) |
 | `safetensors_loader.py` | `load_tensor(path, name)` — manual header parsing so BF16 / F8 work without torch |
 | `gguf_tensor_index.py` | Lightweight wrapper around `gguf.GGUFReader` with shape-corrected metadata |
@@ -163,21 +172,22 @@ weighted-combine via apex.moe_layer.run_moe_layer
 |--------|---------|
 | `make_fake_moe_weights.py` / `make_fake_safetensors_moe.py` / `make_fake_gguf_moe.py` | Generate fake-MoE checkpoints + record traces for demos |
 | `inspect_weight_names.py` | Print every tensor name in any supported checkpoint |
-| `validate_layout.py` | Assert a layout's strings exist in a checkpoint; `--check-shapes` adds SwiGLU consistency |
+| `validate_layout.py` | Assert a layout's strings exist in a checkpoint; `--check-shapes` adds SwiGLU consistency; `--check-non-moe` probes optional attention / norm / embedding / lm_head names at layer 0 |
 | `smoke_real_moe_layer.py` | End-to-end one MoE layer of real Gemma 4 NVFP4 (step 9) |
 | `demo_real_moe_cache.py` | First-run misses + second-run hits on real Gemma 4 layer 0 (step 10) — ~167x speedup |
 | `smoke_real_moe_two_layer.py` | Drives two real MoE layers in sequence; cache key disambiguates by `(layer, expert)` (step 11) |
 | `demo_real_runtime.py` | Drives real Gemma 4 MoE layers through `Runtime` with cold/warm cache checks (step 12) |
 | `demo_real_memory_budget.py` | Drives real Gemma under a small `--max-memory-mb`; LRU eviction enforces the budget; final `MemoryReport` reports peak vs budget (step 14) |
 | `demo_real_prefetch.py` | Drives real Gemma 2 layers through `Runtime` with `AsyncPrefetcher`; layer 1 served from prefetched cache; reports `prefetch_hit_rate` (step 15) |
+| `smoke_real_attention_layer.py` | Loads + dequants real Gemma 4 layer 0 q/k/v/o + q_norm/k_norm; runs single-token attention through `apex.attention.single_token_attention`; asserts (1, 2816) finite output (step 16C) |
 
 ### `tests/`
 
-36 test modules, 234 tests total. `tests/_world.py` provides `FakeStore` + re-exports the fake-world writers from `apex._fake_weights`. `tests/test_real_moe_cache.py`, `tests/test_real_moe_two_layer.py`, and `tests/test_runtime_real_integration.py` include real-Gemma tests that auto-skip unless `REAL_MOE_PATH` (or a known local default path) resolves.
+38 test modules, 263 always-on tests + 5 real-Gemma skipif tests. `tests/_world.py` provides `FakeStore` + re-exports the fake-world writers from `apex._fake_weights`. `tests/test_real_moe_cache.py`, `tests/test_real_moe_two_layer.py`, `tests/test_runtime_real_integration.py`, `tests/test_real_memory_budget.py`, `tests/test_real_prefetch.py`, and `tests/test_real_attention.py` include real-Gemma tests that auto-skip unless `REAL_MOE_PATH` (or a known local default path) resolves.
 
 ---
 
-## What's done (steps 1–15)
+## What's done (steps 1–16C)
 
 1–3. Bounded LRU cache, prefetcher, Markov predictor, metrics.
 4. SwiGLU FFN experts (gate/up/down bundles via `ExpertWeights`).
@@ -192,6 +202,9 @@ weighted-combine via apex.moe_layer.run_moe_layer
 13. Lowercase HF/MLX Gemma checkpoint support: `GemmaHFMoELayout`, stacked expert slicing via `GemmaHFQuantizedExpertStore`, U32-packed expert/router dequantization, layout auto-detection in `demo_real_runtime.py`, and real Runtime validation against the local `gemma-4-26b-a4b-it-nvfp4` checkpoint.
 14. Real memory-budget enforcement: `ExpertCache.peak_bytes` high-water tracking + `apex/memory.py` (`MemoryReport`, `snapshot`) joining cache/budget/peak with hits/misses/evictions and a `budget_respected` predicate. `demo_real_memory_budget.py` drives real Gemma under a 256 MB budget, forcing LRU eviction (peak 249.6 MB, 5 evictions, finite output, budget respected).
 15. Real prefetch on real Runtime: `demo_real_prefetch.py` wires `AsyncPrefetcher` into the production stack — layer 0 cold-misses 8 experts, the worker thread loads layer 1's 8 experts in the background while we wait at `wait_for_layer(1)`, and layer 1 hits the cache on every lookup (prefetch hit rate 100% in the deterministic case, 0% when a misaligned predictor schedules wrong experts).
+16A. Layout extension for non-MoE tensors: `WeightLayout` exposes optional `attn_{q,k,v,o}_proj_tensors`, `attn_{q,k}_norm`, `input_layernorm`, `post_attention_layernorm`, `embedding_tensors`, `final_norm`, `lm_head_tensors` (`None` for tied embeddings). All names verified against real `gemma-4-26b-a4b-it-nvfp4` via `validate_layout.py --check-non-moe`.
+16B. Tiny ops module: `apex/ops.py` provides `rms_norm` (with Gemma `+1` convention), `linear` (HF orientation), `softmax` (max-subtract stabilized). 12 unit tests pin behavior so 16C/D/E can compose them without surprises.
+16C. Single-token attention smoke: `apex/attention.py:single_token_attention` runs q/k/v/o + scaled-dot-product + GQA repeat + optional q_norm/k_norm. `scripts/smoke_real_attention_layer.py` loads + dequants real Gemma layer 0's NVFP4_U32 attention weights and emits a finite (1, 2816) output. No KV cache, no RoPE — those land in 16D.
 
 ---
 
@@ -199,7 +212,9 @@ weighted-combine via apex.moe_layer.run_moe_layer
 
 ### Near term
 
-- **MLX path for real weights** — `MLXBackend` already does SwiGLU; needs a `dequantize` step that produces `mx.array` directly to avoid the numpy round-trip.
+- **Step 16D — full decoder layer wrap** — compose `single_token_attention` with `input_layernorm` + residual + `post_attention_layernorm` + the existing MoE Runtime path + residual. Adds RoPE (real, not the position-0 identity), KV cache, and handling of Gemma 4's full_attention layers (5/11/17/23/29 tie K=V; head_dim=512 instead of 256).
+- **Step 16E — one-token generation** — embedding lookup → N decoder layers → `final_norm` → tied lm_head (embed_tokens.T) → `final_logit_softcapping=30.0` → argmax/sample → tokenizer decode.
+- **MLX path for real weights** — `MLXBackend` already does SwiGLU; needs a `dequantize` step that produces `mx.array` directly to avoid the numpy round-trip. Same applies to the new `apex/ops.py` and `apex/attention.py` (NumPy-only today).
 - **Trained predictor on real-Gemma traces** — step 15 proved the prefetch path works on real layers; an actual trained `MarkovPredictor` (instead of the router-peek fallback) would let prefetch overlap with attention/norm in a real model loop. Needs trace data we don't have yet.
 
 ### Medium term

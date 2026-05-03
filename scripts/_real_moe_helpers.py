@@ -2,6 +2,7 @@
 
 import argparse
 import contextlib
+import json
 from pathlib import Path
 
 import numpy as np
@@ -50,6 +51,63 @@ def detect_real_moe_layout(path):
         if layout.gate_weight(0) in weight_map:
             return name, layout
     raise SystemExit(f"could not detect a supported Gemma MoE layout for {path}")
+
+
+def read_text_config(path) -> dict:
+    """Return the `text_config` dict from a Gemma 4 checkpoint's config.json.
+
+    Gemma 4 is multimodal (Gemma4ForConditionalGeneration), so the
+    language-model hyperparams (num_attention_heads, head_dim,
+    rms_norm_eps, etc.) are nested under `text_config` rather than
+    sitting at the top level. Pull them out once here so callers
+    don't repeat the parse.
+    """
+    with open(Path(path) / "config.json") as f:
+        cfg = json.load(f)
+    text = cfg.get("text_config")
+    if text is None:
+        raise ValueError(f"{path}/config.json has no text_config field")
+    return text
+
+
+def load_attention_weights(path, layout, layer_id: int) -> dict:
+    """Load + dequantize layer `layer_id`'s q/k/v/o + q_norm/k_norm.
+
+    Returns a dict with keys {q_weight, k_weight, v_weight, o_weight,
+    q_norm, k_norm}. Each *_weight is fp32 from NVFP4_U32 dequant
+    (mlx-community lowercase Gemma layout); each *_norm is fp32 from
+    BF16. Mirrors `apex.real_router.MultiLayerRealRouter._load_router_weight`
+    (the same `QuantizedTensor` + `dequantize` pattern, just over four
+    projections instead of one).
+    """
+    from apex.dequant import dequantize
+    from apex.safetensors_loader import load_tensor
+    from apex.tensor_types import QuantizedTensor
+
+    path = Path(path)
+    weight_map = read_safetensors_index(path)
+
+    def _load(name: str):
+        return load_tensor(path / weight_map[name], name)
+
+    def _load_proj(names: dict):
+        data = _load(names["weight"])
+        tensor = QuantizedTensor(
+            data=data,
+            dtype="NVFP4_U32",
+            shape=tuple(data.shape),
+            weight_scale=_load(names["scales"]),
+        )
+        return dequantize(tensor, name=names["weight"])
+
+    return {
+        "q_weight": _load_proj(layout.attn_q_proj_tensors(layer_id)),
+        "k_weight": _load_proj(layout.attn_k_proj_tensors(layer_id)),
+        "v_weight": _load_proj(layout.attn_v_proj_tensors(layer_id)),
+        "o_weight": _load_proj(layout.attn_o_proj_tensors(layer_id)),
+        "q_norm": _load(layout.attn_q_norm(layer_id)),
+        "k_norm": _load(layout.attn_k_norm(layer_id)),
+    }
 
 
 def quantized_store_for_layout(path, layout):
