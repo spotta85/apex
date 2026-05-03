@@ -70,6 +70,50 @@ def read_text_config(path) -> dict:
     return text
 
 
+def load_embedding(path, layout):
+    """Load + dequantize the token embedding table to fp32.
+
+    Returns (vocab_size, hidden_size). On Gemma 4 26B-A4B-IT NVFP4
+    the embedding is NVFP4_U32-packed (262144 × 352 packed cols + a
+    U8 scales sidecar); the dequantized fp32 table is ~3 GB. Caller
+    holds it for both the input-token row lookup and the tied lm_head
+    matmul.
+    """
+    from apex.dequant import dequantize
+    from apex.safetensors_loader import load_tensor
+    from apex.tensor_types import QuantizedTensor
+
+    path = Path(path)
+    weight_map = read_safetensors_index(path)
+    names = layout.embedding_tensors()
+    data = load_tensor(path / weight_map[names["weight"]], names["weight"])
+
+    if "scales" in names:
+        scales = load_tensor(
+            path / weight_map[names["scales"]], names["scales"],
+        )
+        tensor = QuantizedTensor(
+            data=data,
+            dtype="NVFP4_U32",
+            shape=tuple(data.shape),
+            weight_scale=scales,
+        )
+        return dequantize(tensor, name=names["weight"])
+    # Fallback for layouts that store fp32 / BF16 embeddings (e.g. the
+    # FakeMoELayout's synthetic checkpoint, if it ever grows one).
+    return np.asarray(data, dtype=np.float32)
+
+
+def load_final_norm(path, layout):
+    """Load the model-final RMSNorm weight (BF16 → fp32) by layout name."""
+    from apex.safetensors_loader import load_tensor
+
+    path = Path(path)
+    weight_map = read_safetensors_index(path)
+    name = layout.final_norm()
+    return load_tensor(path / weight_map[name], name)
+
+
 def load_layer_norms(path, layout, layer_id: int) -> dict:
     """Load layer L's four BF16 norm weights as fp32 ndarrays.
 

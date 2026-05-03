@@ -5,7 +5,7 @@ APEX is a from-scratch Mixture-of-Experts (MoE) inference runtime focused on **b
 ## How to test
 
 ```bash
-# Full unit suite (263 always-on tests; +5 real-Gemma tests run when
+# Full unit suite (273 always-on tests; +7 real-Gemma tests run when
 # REAL_MOE_PATH points at a checkpoint)
 uv run pytest -q
 
@@ -27,6 +27,8 @@ uv run python scripts/demo_real_runtime.py           # real layers through Runti
 uv run python scripts/demo_real_memory_budget.py     # tight budget + LRU eviction
 uv run python scripts/demo_real_prefetch.py          # AsyncPrefetcher on real layers
 uv run python scripts/smoke_real_attention_layer.py  # single-token attention on layer 0 (step 16C)
+uv run python scripts/smoke_real_decoder_layer.py    # full decoder layer (norms+attn+MoE) (step 16D)
+uv run python scripts/demo_one_token_generate.py     # embed → decoder → lm_head → argmax (step 16E)
 ```
 
 Diagnostic scripts:
@@ -130,7 +132,9 @@ weighted-combine via apex.moe_layer.run_moe_layer
 | File | What it does | Key exports |
 |------|--------------|-------------|
 | `ops.py` | Tiny NumPy primitives: `rms_norm` (with Gemma `+1` convention), `linear` (HF orientation), `softmax` (numerically stable) | `rms_norm`, `linear`, `softmax` |
-| `attention.py` | `single_token_attention` — q/k/v/o + scaled-dot-product + GQA repeat + optional q/k norm. No KV cache, no RoPE (16D concern) | `single_token_attention` |
+| `attention.py` | `single_token_attention` — q/k/v/o + scaled-dot-product + GQA repeat + optional q/k norm. No KV cache, no RoPE (multi-token concern) | `single_token_attention` |
+| `decoder.py` | `single_token_decoder_layer` — sandwich-norm composition: input_norm → attn → post_attn_norm → +residual → pre_ffn_norm → moe_call → post_ffn_norm → +residual | `single_token_decoder_layer` |
+| `generation.py` | One-token generation primitives: `embed_token` (row lookup), `final_logits` (tied lm_head + softcap), `sample_argmax` (greedy) | `embed_token`, `final_logits`, `sample_argmax` |
 
 ### `apex/backends/` — compute
 
@@ -180,14 +184,16 @@ weighted-combine via apex.moe_layer.run_moe_layer
 | `demo_real_memory_budget.py` | Drives real Gemma under a small `--max-memory-mb`; LRU eviction enforces the budget; final `MemoryReport` reports peak vs budget (step 14) |
 | `demo_real_prefetch.py` | Drives real Gemma 2 layers through `Runtime` with `AsyncPrefetcher`; layer 1 served from prefetched cache; reports `prefetch_hit_rate` (step 15) |
 | `smoke_real_attention_layer.py` | Loads + dequants real Gemma 4 layer 0 q/k/v/o + q_norm/k_norm; runs single-token attention through `apex.attention.single_token_attention`; asserts (1, 2816) finite output (step 16C) |
+| `smoke_real_decoder_layer.py` | Drives layer 0 through `apex.decoder.single_token_decoder_layer`: norms + attention + routed MoE + residuals; asserts finite (1, 2816) output (step 16D) |
+| `demo_one_token_generate.py` | End-to-end one-token generation on real Gemma: embedding lookup → N decoder layers → final RMSNorm → tied lm_head + final_logit_softcapping → argmax (step 16E) |
 
 ### `tests/`
 
-38 test modules, 263 always-on tests + 5 real-Gemma skipif tests. `tests/_world.py` provides `FakeStore` + re-exports the fake-world writers from `apex._fake_weights`. `tests/test_real_moe_cache.py`, `tests/test_real_moe_two_layer.py`, `tests/test_runtime_real_integration.py`, `tests/test_real_memory_budget.py`, `tests/test_real_prefetch.py`, and `tests/test_real_attention.py` include real-Gemma tests that auto-skip unless `REAL_MOE_PATH` (or a known local default path) resolves.
+41 test modules, 273 always-on tests + 7 real-Gemma skipif tests (280 with `REAL_MOE_PATH` set). `tests/_world.py` provides `FakeStore` + re-exports the fake-world writers from `apex._fake_weights`. Real-Gemma tests live in `tests/test_real_moe_cache.py`, `tests/test_real_moe_two_layer.py`, `tests/test_runtime_real_integration.py`, `tests/test_real_memory_budget.py`, `tests/test_real_prefetch.py`, `tests/test_real_attention.py`, `tests/test_real_decoder.py`, and `tests/test_real_generation.py` — all auto-skip unless `REAL_MOE_PATH` (or a known local default path) resolves.
 
 ---
 
-## What's done (steps 1–16C)
+## What's done (steps 1–16E)
 
 1–3. Bounded LRU cache, prefetcher, Markov predictor, metrics.
 4. SwiGLU FFN experts (gate/up/down bundles via `ExpertWeights`).
@@ -204,7 +210,9 @@ weighted-combine via apex.moe_layer.run_moe_layer
 15. Real prefetch on real Runtime: `demo_real_prefetch.py` wires `AsyncPrefetcher` into the production stack — layer 0 cold-misses 8 experts, the worker thread loads layer 1's 8 experts in the background while we wait at `wait_for_layer(1)`, and layer 1 hits the cache on every lookup (prefetch hit rate 100% in the deterministic case, 0% when a misaligned predictor schedules wrong experts).
 16A. Layout extension for non-MoE tensors: `WeightLayout` exposes optional `attn_{q,k,v,o}_proj_tensors`, `attn_{q,k}_norm`, `input_layernorm`, `post_attention_layernorm`, `embedding_tensors`, `final_norm`, `lm_head_tensors` (`None` for tied embeddings). All names verified against real `gemma-4-26b-a4b-it-nvfp4` via `validate_layout.py --check-non-moe`.
 16B. Tiny ops module: `apex/ops.py` provides `rms_norm` (with Gemma `+1` convention), `linear` (HF orientation), `softmax` (max-subtract stabilized). 12 unit tests pin behavior so 16C/D/E can compose them without surprises.
-16C. Single-token attention smoke: `apex/attention.py:single_token_attention` runs q/k/v/o + scaled-dot-product + GQA repeat + optional q_norm/k_norm. `scripts/smoke_real_attention_layer.py` loads + dequants real Gemma layer 0's NVFP4_U32 attention weights and emits a finite (1, 2816) output. No KV cache, no RoPE — those land in 16D.
+16C. Single-token attention smoke: `apex/attention.py:single_token_attention` runs q/k/v/o + scaled-dot-product + GQA repeat + optional q_norm/k_norm. `scripts/smoke_real_attention_layer.py` loads + dequants real Gemma layer 0's NVFP4_U32 attention weights and emits a finite (1, 2816) output. No KV cache, no RoPE — those land in step 17.
+16D. Full decoder layer: `apex/decoder.py:single_token_decoder_layer` composes the sandwich-norm Gemma block — input_norm → attn → post_attn_norm → +residual → pre_ffn_norm → moe_call → post_ffn_norm → +residual. Layout adds `pre_feedforward_layernorm` and `post_feedforward_layernorm` methods. `scripts/smoke_real_decoder_layer.py` drives layer 0 end-to-end and emits a finite (1, 2816) output (~±100 magnitude). Dense-MLP shared expert + `_1`/`_2` parallel-norm variants intentionally not yet wired.
+16E. One-token generation: `apex/generation.py` (`embed_token`, `final_logits` with Gemma's `final_logit_softcapping=30.0`, `sample_argmax`) plus `load_embedding` / `load_final_norm` helpers. `scripts/demo_one_token_generate.py` runs end-to-end on real Gemma 4 — embedding (NVFP4_U32 dequant of the full ~3 GB table) → decoder layer 0 → final RMSNorm → tied lm_head + softcap → argmax. With token id 2 (BOS), produces `next token id: 477` and finite logits.
 
 ---
 
@@ -212,9 +220,11 @@ weighted-combine via apex.moe_layer.run_moe_layer
 
 ### Near term
 
-- **Step 16D — full decoder layer wrap** — compose `single_token_attention` with `input_layernorm` + residual + `post_attention_layernorm` + the existing MoE Runtime path + residual. Adds RoPE (real, not the position-0 identity), KV cache, and handling of Gemma 4's full_attention layers (5/11/17/23/29 tie K=V; head_dim=512 instead of 256).
-- **Step 16E — one-token generation** — embedding lookup → N decoder layers → `final_norm` → tied lm_head (embed_tokens.T) → `final_logit_softcapping=30.0` → argmax/sample → tokenizer decode.
-- **MLX path for real weights** — `MLXBackend` already does SwiGLU; needs a `dequantize` step that produces `mx.array` directly to avoid the numpy round-trip. Same applies to the new `apex/ops.py` and `apex/attention.py` (NumPy-only today).
+- **Step 17 — multi-token generation with KV cache** — adds `apex/kv_cache.py:KVCache`, threads RoPE + cached K/V through attention, exposes prefill (process prompt) vs decode (one token at a time) phases. KV cache memory is non-evictable during generation; track separately from the LRU expert cache budget.
+- **Tokenizer integration** — `demo_one_token_generate.py` currently prints token ids only. Adding `tokenizers` (small Rust dep, no torch) lets the demo accept a string prompt and decode the predicted id.
+- **Layer heterogeneity for full-attention layers** — Gemma 4 layers 5/11/17/23/29 use full_attention with K=V tied (no v_proj on disk) and head_dim=512. Needed for any decoder pass that goes past 5 layers.
+- **Dense-MLP shared expert** — Gemma 4 carries both routed MoE and a dense MLP per layer (with the `_1`/`_2` parallel norm variants); driving both would change residual sums.
+- **MLX path for real weights** — `MLXBackend` already does SwiGLU; needs a `dequantize` step that produces `mx.array` directly to avoid the numpy round-trip. Same applies to `apex/ops.py`, `apex/attention.py`, `apex/decoder.py`, `apex/generation.py` (NumPy-only today).
 - **Trained predictor on real-Gemma traces** — step 15 proved the prefetch path works on real layers; an actual trained `MarkovPredictor` (instead of the router-peek fallback) would let prefetch overlap with attention/norm in a real model loop. Needs trace data we don't have yet.
 
 ### Medium term
