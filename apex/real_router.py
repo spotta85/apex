@@ -109,7 +109,7 @@ class MultiLayerRealRouter:
             or self._per_expert_scales.get(layer_id) is not None
         )
 
-    def route(self, layer_id: int, hidden_state):
+    def route(self, layer_id: int, hidden_state, *, rms_eps: float = 1e-6):
         router_weight = self._load_for_layer(layer_id)
         # Real checkpoint matmuls can produce transient floating-point
         # warnings while still yielding finite logits and outputs; the
@@ -120,8 +120,10 @@ class MultiLayerRealRouter:
                 router_weight,
                 top_k=self.top_k,
                 # Both default to None when the layer / layout doesn't
-                # carry the stabilizer; route() then skips the multiply.
+                # carry the stabilizer; route() then skips the RMS-norm
+                # / per-expert-scale post-softmax (step 26D).
                 hidden_scale=self._hidden_scales.get(layer_id),
                 per_expert_scale=self._per_expert_scales.get(layer_id),
+                rms_eps=rms_eps,
             )
         return expert_ids[0].tolist(), weights[0].tolist()

@@ -5,8 +5,9 @@ without a real checkpoint and reused by both the fake-MoE pipeline
 and the real-checkpoint smoke test:
 
   - `route(hidden, router_weight, top_k, *, hidden_scale=None,
-           per_expert_scale=None)`                  returns (top_k_expert_ids,
-                                                    softmax-of-top-k weights)
+           per_expert_scale=None, rms_eps=1e-6)`     returns (top_k_expert_ids,
+                                                    softmax-and-scaled
+                                                    top-k weights)
   - `run_moe_layer(hidden, expert_ids, weights,
                    expert_loader, backend)`         returns combined output
 
@@ -17,14 +18,27 @@ typical loader is
 
     lambda eid: dequantize_bundle(store.load(layer_id, eid))
 
-Step 24A added `hidden_scale` (per-feature scale on hidden, matches
-Gemma 4's `router.scale` shape (hidden_size,)) and `per_expert_scale`
-(per-expert scale on logits, matches Gemma 4's `router.per_expert_scale`
-shape (num_experts,)) — both optional, both multiplicative, both default
-to None for back-compat with Mixtral / Qwen / synthetic routers.
+Step 26D rewrote `route()`'s formula to match the Gemma 4 reference
+(`mlx_lm.models.gemma4_text:Router.__call__`):
+
+  - `hidden_scale` is no longer a multiplicative pre-scale. It is now
+    the LEARNED WEIGHT of an internal RMSNorm (no `+1` Gemma-unit
+    offset, weight pre-multiplied by `1/sqrt(hidden_size)`). The
+    pre-step-26D semantics were a guess that produced visibly peaky
+    distributions but wrong-architecture logits.
+  - `per_expert_scale` is no longer applied to all 128 logits before
+    top-k. It is applied to the SELECTED top-k softmax weights as a
+    multiplicative scale at the gathered indices. Top-k selection
+    runs on the raw post-projection logits; per-expert-scale only
+    reweights the chosen winners.
+
+Both still default to None for synthetic / Mixtral / Qwen routers
+(byte-identical to pre-step-24A behavior in those layouts).
 """
 
 import numpy as np
+
+from apex.ops import rms_norm
 
 
 def route(
@@ -34,6 +48,7 @@ def route(
     *,
     hidden_scale: np.ndarray | None = None,
     per_expert_scale: np.ndarray | None = None,
+    rms_eps: float = 1e-6,
 ):
     """Compute top-k expert IDs and their softmax routing weights.
 
@@ -41,31 +56,37 @@ def route(
       hidden_state:    shape (batch, hidden_dim)
       router_weight:   shape (num_experts, hidden_dim)  -- HF orientation
       top_k:           number of experts to keep per token
-      hidden_scale:    optional shape (hidden_dim,). Multiplied
-                       element-wise into hidden_state BEFORE the
-                       projection. Gemma 4 stores this as
-                       `router.scale` and the runtime loads it as fp32.
-      per_expert_scale: optional shape (num_experts,). Multiplied
-                       element-wise into the projected logits BEFORE
-                       top-k selection (so it can flip which experts
-                       win). Gemma 4 stores this as
+      hidden_scale:    optional shape (hidden_dim,). When provided,
+                       `hidden_state` is RMS-normalized along the last
+                       axis with the effective weight
+                       `hidden_scale * (1/sqrt(hidden_dim))` (no +1
+                       Gemma offset; matches the reference's
+                       `mx.fast.rms_norm(x, scale * root_size, eps)`).
+                       Gemma 4 stores this as `router.scale`.
+      per_expert_scale: optional shape (num_experts,). When provided,
+                       the top-k softmax weights are multiplied by
+                       `per_expert_scale[expert_ids]` element-wise
+                       AFTER softmax. Gemma 4 stores this as
                        `router.per_expert_scale`.
+      rms_eps:         epsilon for the internal RMSNorm. Defaults to
+                       1e-6 (Gemma default); should track the model's
+                       `rms_norm_eps`.
 
     Returns:
       expert_ids:    int array, shape (batch, top_k), per-token IDs
                      ordered from highest to lowest logit
-      weights:       float32 array, shape (batch, top_k), softmax
-                     normalized over the top_k logits (sum to 1
-                     along the last axis)
-
-    Note: scaling is applied BEFORE top-k and softmax, so a
-    per-expert scale of 0 fully suppresses an expert and a large
-    positive scale boosts its selection probability. This matches
-    the standard Gemma3-style router stabilizer pattern.
+      weights:       float32 array, shape (batch, top_k). Softmax
+                     normalized over the top_k logits, then optionally
+                     multiplied by per_expert_scale at the selected
+                     ids. Note: when per_expert_scale is non-uniform,
+                     the weights NO LONGER sum to 1 along the last
+                     axis — that's the reference's intentional
+                     behavior (per-expert scale acts as a learned
+                     output gain).
 
     Synthetic routers (Mixtral / Qwen / fake) leave both scale
-    arguments as None; the multiplications are skipped so behavior
-    stays byte-identical to the pre-step-24 path.
+    arguments as None; the RMSNorm and per-expert reweight are
+    skipped, behavior stays byte-identical to the pre-step-24 path.
     """
     if hidden_state.ndim != 2:
         raise ValueError(
@@ -83,11 +104,18 @@ def route(
                 f"hidden_scale shape {hidden_scale.shape} does not match "
                 f"hidden_dim ({hidden_dim},)"
             )
-        # Broadcast (batch, hidden) * (hidden,) ⇒ (batch, hidden).
-        # Cast to fp32 for the multiplication; safetensors_loader already
-        # returns fp32 for bf16, but a defensive cast keeps synthetic
-        # callers (which may pass float64) on the canonical fp32 path.
-        hidden_state = hidden_state * hidden_scale.astype(np.float32)
+        # Step 26D: router applies its own RMSNorm on hidden BEFORE
+        # projection. Effective scale weight is `hidden_scale *
+        # (1/sqrt(hidden_dim))` per the reference; no +1 Gemma offset
+        # (the router's RMSNorm uses a plain scale, not the unit-offset
+        # convention the rest of the model uses on its norms).
+        effective_weight = hidden_scale.astype(np.float32) * (
+            np.float32(hidden_dim) ** -0.5
+        )
+        hidden_state = rms_norm(
+            hidden_state, effective_weight, eps=rms_eps,
+            gemma_unit_offset=False,
+        )
     if per_expert_scale is not None:
         if per_expert_scale.shape != (num_experts,):
             raise ValueError(
@@ -98,12 +126,10 @@ def route(
     # Project hidden to per-expert logits. router_weight is HF-oriented
     # ((num_experts, hidden_dim)) so we multiply against its transpose.
     logits = hidden_state @ router_weight.T  # (batch, num_experts)
-    if per_expert_scale is not None:
-        # Broadcast (batch, num_experts) * (num_experts,) — element-wise
-        # per-expert weighting before top-k. Applied here (not after
-        # softmax) so an expert with a near-zero scale can fall out of
-        # the top-k entirely, which is the whole point of the parameter.
-        logits = logits * per_expert_scale.astype(np.float32)
+    # Top-k selection runs on the RAW post-projection logits — no
+    # per-expert-scale tweak before top-k anymore (that was the
+    # pre-step-26D formula; reference applies per_expert_scale to the
+    # softmax weights at the SELECTED ids, not to all 128 logits).
 
     # Top-k along the experts axis, sorted descending by logit.
     # argpartition is faster than full argsort for k << num_experts;
@@ -118,6 +144,15 @@ def route(
     shifted = top_k_logits - top_k_logits.max(axis=-1, keepdims=True)
     exps = np.exp(shifted)
     weights = (exps / exps.sum(axis=-1, keepdims=True)).astype(np.float32)
+
+    if per_expert_scale is not None:
+        # Step 26D: gather scales at selected expert ids and multiply
+        # element-wise into the softmax weights. This is the reference
+        # behavior — per-expert-scale is a per-expert output gain, not
+        # a top-k selection bias.
+        per_expert_f32 = per_expert_scale.astype(np.float32)
+        weights = weights * per_expert_f32[expert_ids]
+
     return expert_ids, weights
 
 

@@ -42,25 +42,31 @@ def test_route_with_no_scales_matches_pre_step24_behavior():
     np.testing.assert_array_equal(w_baseline, w_explicit_none)
 
 
-def test_route_per_expert_scale_zero_suppresses_expert():
-    """An expert with scale 0 must never appear in top-k.
+def test_route_per_expert_scale_zeros_weight_at_selected_expert():
+    """An expert with scale 0 still appears in top-k but its weight is 0.
 
-    This is the strongest contract: if `per_expert_scale[e] == 0` the
-    expert's logit becomes 0 and (for any positive other logit) it
-    falls out of top-k entirely. Confirms the multiply happens BEFORE
-    selection, not just before the softmax.
+    Step 26D corrected the semantics: `per_expert_scale` is a per-
+    expert OUTPUT GAIN applied to the softmax weights at the selected
+    top-k indices (matching `mlx_lm.models.gemma4_text:Router`). Top-k
+    selection runs on the raw post-projection logits — the scale
+    doesn't bias selection.
     """
-    # Hidden such that the raw logits are all positive — without
-    # scaling, every expert would tie or be in contention.
     hidden = np.ones((1, 4), dtype=np.float32)
-    router_w = np.eye(4, 4, dtype=np.float32)  # logits = hidden = [1,1,1,1]
+    router_w = np.eye(4, 4, dtype=np.float32)  # logits = [1,1,1,1]
     per_expert_scale = np.array([1.0, 0.0, 1.0, 1.0], dtype=np.float32)
-    ids, _ = route(
+    ids, weights = route(
         hidden, router_w, top_k=3,
         per_expert_scale=per_expert_scale,
     )
-    # Expert 1 was zeroed out; top-3 must be {0, 2, 3} in some order.
-    assert 1 not in set(ids[0].tolist())
+    ids_list = ids[0].tolist()
+    weights_list = weights[0].tolist()
+    if 1 in ids_list:
+        # Expert 1 made it into top-k; its post-softmax weight must be 0.
+        idx = ids_list.index(1)
+        assert weights_list[idx] == 0.0, (
+            "per_expert_scale[1]=0 must zero the softmax weight at "
+            f"the selected position; got {weights_list[idx]}"
+        )
 
 
 def test_route_hidden_scale_changes_logits():
@@ -101,21 +107,37 @@ def test_route_per_expert_scale_wrong_shape_raises():
         route(hidden, router_w, top_k=2, per_expert_scale=bad)
 
 
-def test_route_per_expert_scale_negative_can_demote_expert():
-    """A negative scale flips the sign of a logit — expert can leave top-k."""
+def test_route_per_expert_scale_negative_flips_weight_sign():
+    """A negative `per_expert_scale[e]` produces a negative softmax weight.
+
+    Step 26D: `per_expert_scale` is no longer a top-k bias; it's a
+    post-softmax multiplier at the selected indices. So a negative
+    scale produces a NEGATIVE final weight at that expert (acting as
+    a destructive contribution to the combined output), and a large
+    positive scale amplifies the contribution. Top-k selection itself
+    is unchanged from the no-scale case.
+    """
     hidden = np.ones((1, 4), dtype=np.float32)
-    # Plain projection: each expert's raw logit = 1.0.
     router_w = np.eye(4, 4, dtype=np.float32)
-    # Boost expert 0, neutral on 1/2, strong negative on 3.
     per_expert_scale = np.array([2.0, 1.0, 1.0, -5.0], dtype=np.float32)
-    ids, _ = route(
-        hidden, router_w, top_k=2,
+    ids, weights = route(
+        hidden, router_w, top_k=4,
         per_expert_scale=per_expert_scale,
     )
-    # Expert 3 with logit -5 must not be in top-2.
-    assert 3 not in set(ids[0].tolist())
-    # Expert 0 with logit 2 must be in top-2.
-    assert 0 in set(ids[0].tolist())
+    ids_list = ids[0].tolist()
+    weights_list = weights[0].tolist()
+    # Whichever position holds expert 3 must be negative (scale -5).
+    if 3 in ids_list:
+        idx = ids_list.index(3)
+        assert weights_list[idx] < 0.0
+    # Whichever position holds expert 0 must be the largest (scale 2).
+    if 0 in ids_list:
+        idx0 = ids_list.index(0)
+        # All other selected weights at neutral / negative ⇒ this is
+        # the largest absolute-value contribution.
+        assert weights_list[idx0] >= max(
+            (w for w in weights_list if w >= 0.0), default=0.0
+        )
 
 
 # --- Real-Gemma router tests ------------------------------------------------
