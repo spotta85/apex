@@ -104,11 +104,15 @@ def test_real_generate_returns_string(real_model):
 
 @skip_if_no_real_checkpoint()
 def test_real_generate_respects_max_tokens(real_model):
-    """At most `max_tokens` token ids are appended (may be fewer if EOS hit)."""
-    # Use the underlying tokenizer to count ids in the returned text.
-    text = real_model.generate("Hello", max_tokens=3, verbose=False)
-    ids = real_model.tokenizer.encode(text, add_special_tokens=False)
-    assert len(ids) <= 3
+    """At most `max_tokens` token ids are appended (may be fewer if EOS hit).
+
+    Counts via `_last_generated_ids` directly — re-encoding the decoded
+    text via the tokenizer doesn't round-trip when the model (running
+    only one layer) emits non-printable byte sequences that BPE
+    re-segments into more tokens than were originally generated.
+    """
+    real_model.generate("Hello", max_tokens=3, verbose=False)
+    assert len(real_model._last_generated_ids) <= 3
 
 
 @skip_if_no_real_checkpoint()

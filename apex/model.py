@@ -117,6 +117,11 @@ class MoEModel:
         # `memory_report` so callers can see KV usage. None until first
         # `generate` call.
         self._last_kv: KVCache | None = None
+        # Most-recent generated token id list (in order). Useful for
+        # tests that need an authoritative count rather than re-encoding
+        # the decoded text (BPE doesn't round-trip cleanly when the
+        # model emits unusual byte sequences — e.g. one-layer output).
+        self._last_generated_ids: list[int] | None = None
 
     @classmethod
     def from_pretrained(
@@ -283,6 +288,7 @@ class MoEModel:
 
         first_id = prefill(prompt_ids, step_fn=step_fn)
         generated = [first_id]
+        self._last_generated_ids = generated
 
         if verbose:
             print(f"  → token 1: id {first_id} "

@@ -116,7 +116,16 @@ def attention_decode_step(
 
     # Scaled dot product. q: (1, H, 1, D); k_all.T: (1, H, D, S).
     # scores: (1, H, 1, S). softmax over the S axis.
-    scores = (q @ k_all.transpose(0, 1, 3, 2)) / np.sqrt(head_dim)
+    # `np.sqrt(int)` returns numpy.float64; dividing an fp32 score
+    # array by an fp64 scalar promotes the result to fp64 — and that
+    # promotion then propagates through softmax, the v matmul, and
+    # the o_weight projection, so the *layer's output* becomes fp64.
+    # Layer L+1's hidden then carries fp64 into its KV cache, which
+    # silently doubles the per-layer KV bytes (visible in
+    # `kv_snapshot.per_layer_bytes`). Cast the divisor to fp32 to
+    # keep the whole attention path in single precision.
+    scale = np.float32(head_dim) ** -0.5
+    scores = (q @ k_all.transpose(0, 1, 3, 2)) * scale
     weights = softmax(scores, axis=-1)
     attn = weights @ v_all                          # (1, H, 1, D)
     attn = attn.transpose(0, 2, 1, 3).reshape(1, num_heads * head_dim)
