@@ -27,6 +27,11 @@ What's NOT here:
   - Per-layer router loading (apex.real_router.MultiLayerRealRouter)
   - CLI argparse boilerplate (scripts/_real_moe_helpers.add_real_moe_args)
   - Layout auto-detection (scripts/_real_moe_helpers.detect_real_moe_layout)
+
+Step 24B added `load_dense_mlp_weights` for Gemma 4's per-layer dense
+MLP (the parallel branch alongside the routed MoE). Same NVFP4_U32
+dequant pipeline as `load_attention_weights`, just over three
+projections with bf16 scales + biases.
 """
 
 import json
@@ -159,4 +164,63 @@ def load_attention_weights(path, layout, layer_id: int, *, k_eq_v: bool = False)
         "o_weight": _load_proj(layout.attn_o_proj_tensors(layer_id)),
         "q_norm": _load(layout.attn_q_norm(layer_id)),
         "k_norm": _load(layout.attn_k_norm(layer_id)),
+    }
+
+
+def load_dense_mlp_weights(path, layout, layer_id: int) -> dict | None:
+    """Load + dequantize layer `layer_id`'s dense MLP gate/up/down projections.
+
+    Returns `{gate_weight, up_weight, down_weight}` (each fp32, dequantized
+    from AFFINE_UINT8_U32 with bf16 scales + biases) when the layout
+    exposes a dense MLP, or `None` when it doesn't (e.g. synthetic /
+    Mixtral / Qwen layouts that only have routed experts).
+
+    On Gemma 4 the dense MLP runs PARALLEL to the routed MoE inside a
+    single decoder layer — both consume the same `pre_ffn_norm(hidden)`
+    and their outputs are summed before `post_ffn_norm + residual`. Loading
+    the dense MLP closes a real capacity gap that step 23 left open.
+
+    Memory note: per layer this is ~71 MB at hidden=2816 / intermediate=2112
+    (3 fp32 matrices). Across 30 layers that's ~2.1 GB of NON-EVICTABLE
+    weights — operators running deep models need to budget for this on
+    top of the LRU expert cache budget.
+    """
+    gate_names = layout.dense_mlp_gate_proj(layer_id)
+    if gate_names is None:
+        return None
+    up_names = layout.dense_mlp_up_proj(layer_id)
+    down_names = layout.dense_mlp_down_proj(layer_id)
+    if up_names is None or down_names is None:
+        # Defensive: if the layout exposes one of the three but not the
+        # others, refuse rather than silently running with partial weights.
+        raise ValueError(
+            f"layout exposes some but not all dense MLP projections for "
+            f"layer {layer_id}; expected gate + up + down or none"
+        )
+
+    path = Path(path)
+    weight_map = read_safetensors_index(path)
+
+    def _load(name: str):
+        return load_tensor(path / weight_map[name], name)
+
+    def _load_affine(names: dict):
+        # Dense MLP weights ship as AFFINE_UINT8_U32 (uint32 packed
+        # weight + bf16 scales + bf16 biases) — same encoding as the
+        # router projection, distinct from the NVFP4_U32 attention
+        # weights (which have only scales, no biases).
+        data = _load(names["weight"])
+        tensor = QuantizedTensor(
+            data=data,
+            dtype="AFFINE_UINT8_U32",
+            shape=tuple(data.shape),
+            weight_scale=_load(names["scales"]),
+            weight_scale_2=_load(names["biases"]),
+        )
+        return dequantize(tensor, name=names["weight"])
+
+    return {
+        "gate_weight": _load_affine(gate_names),
+        "up_weight": _load_affine(up_names),
+        "down_weight": _load_affine(down_names),
     }

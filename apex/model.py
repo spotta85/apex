@@ -47,6 +47,7 @@ if str(_REPO_ROOT) not in sys.path:
 from apex.backends.fake_backend import FakeBackend
 from apex.checkpoint_loaders import (
     load_attention_weights,
+    load_dense_mlp_weights,
     load_embedding,
     load_final_norm,
     load_layer_norms,
@@ -66,6 +67,7 @@ from apex.prefill import prefill
 from apex.real_router import MultiLayerRealRouter
 from apex.sampling import sample
 from apex.tokenizer import Tokenizer
+from apex.types import ExpertWeights
 
 from scripts._real_moe_helpers import (
     nvfp4_matmul_warnings,
@@ -99,6 +101,7 @@ class MoEModel:
         backend,
         metrics: Metrics,
         num_layers: int,
+        per_layer_dense_mlp=None,
         verbose: bool = False,
     ):
         self.config = config
@@ -107,6 +110,15 @@ class MoEModel:
         self.final_norm_w = final_norm_w
         self.per_layer_attn = per_layer_attn
         self.per_layer_norms = per_layer_norms
+        # Step 24B: per-layer dense MLP weights when the layout exposes
+        # them (Gemma 4 yes, Mixtral / Qwen / synthetic no). Each entry
+        # is `{gate_weight, up_weight, down_weight}` (fp32) or None.
+        # Lives outside the LRU expert cache — these are non-evictable.
+        self.per_layer_dense_mlp = (
+            per_layer_dense_mlp
+            if per_layer_dense_mlp is not None
+            else [None] * num_layers
+        )
         self.cache = cache
         self.manager = manager
         self.router = router
@@ -210,6 +222,7 @@ class MoEModel:
 
         per_layer_attn = []
         per_layer_norms = []
+        per_layer_dense_mlp = []
         for layer_id in range(num_layers):
             kind = "full" if config.is_full_attention(layer_id) else "sliding"
             if verbose:
@@ -226,6 +239,19 @@ class MoEModel:
             per_layer_norms.append(
                 load_layer_norms(config.path, config.layout, layer_id)
             )
+            # Step 24B: load the parallel dense MLP if the layout
+            # exposes one. None for layouts without (e.g. Mixtral),
+            # which leaves `decoder_decode_step` in routed-only mode.
+            dense = load_dense_mlp_weights(
+                config.path, config.layout, layer_id,
+            )
+            per_layer_dense_mlp.append(dense)
+            if verbose and dense is not None:
+                # Heads up that this is non-evictable RAM — operators
+                # need to budget for it on top of the LRU expert cache.
+                bytes_dense = sum(w.nbytes for w in dense.values())
+                print(f"    dense MLP loaded: "
+                      f"{bytes_dense / (1024 * 1024):.1f} MB")
 
         metrics = Metrics()
         max_memory_mb = max_memory_gb * 1024.0
@@ -251,6 +277,7 @@ class MoEModel:
             final_norm_w=final_norm_w,
             per_layer_attn=per_layer_attn,
             per_layer_norms=per_layer_norms,
+            per_layer_dense_mlp=per_layer_dense_mlp,
             cache=cache,
             manager=manager,
             router=router,
@@ -455,12 +482,30 @@ class MoEModel:
                         self.backend,
                     )
 
+            # Step 24B: parallel dense MLP. ExpertWeights bundle is the
+            # natural container — same shape contract as one routed
+            # expert, just with a wider intermediate dim. Reusing
+            # `backend.run_expert` keeps the SwiGLU math in one place
+            # so a future MLX port lights up the dense path for free.
+            dense_weights = self.per_layer_dense_mlp[layer_id]
+            dense_mlp_call = None
+            if dense_weights is not None:
+                bundle = ExpertWeights(
+                    gate_proj=dense_weights["gate_weight"],
+                    up_proj=dense_weights["up_weight"],
+                    down_proj=dense_weights["down_weight"],
+                )
+                def dense_mlp_call(h, b=bundle):
+                    with nvfp4_matmul_warnings():
+                        return self.backend.run_expert(h, b)
+
             with nvfp4_matmul_warnings():
                 hidden = decoder_decode_step(
                     hidden,
                     norms=norms,
                     attn_kwargs=attn_kwargs,
                     moe_call=moe_call,
+                    dense_mlp_call=dense_mlp_call,
                     kv_cache=kv,
                     layer_id=layer_id,
                     rms_eps=config.rms_norm_eps,

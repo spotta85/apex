@@ -105,6 +105,21 @@ class _MoELayoutBase:
         """Tensor name for `router.per_expert_scale` (shape (num_experts,))."""
         return None
 
+    # --- Optional step-24B dense MLP (parallel to routed experts) -------
+    # Returns a `{weight, scales, biases}` dict per projection — same
+    # shape contract as `router_tensors` so the loader can reuse the
+    # existing AFFINE_UINT8_U32 dequant pipeline. Default None for
+    # layouts that don't carry a dense MLP branch.
+
+    def dense_mlp_gate_proj(self, layer_id: int) -> dict | None:
+        return None
+
+    def dense_mlp_up_proj(self, layer_id: int) -> dict | None:
+        return None
+
+    def dense_mlp_down_proj(self, layer_id: int) -> dict | None:
+        return None
+
 
 class FakeMoELayout(_MoELayoutBase):
     """Layout used by APEX's scripts/make_fake_*_moe.py setup scripts.
@@ -367,6 +382,30 @@ class GemmaHFMoELayout(_MoELayoutBase):
         # bf16 vector of shape (num_experts,). Multiplied element-wise
         # into projected logits BEFORE top-k (step 24A).
         return f"language_model.model.layers.{layer_id}.router.per_expert_scale"
+
+    def dense_mlp_gate_proj(self, layer_id: int) -> dict:
+        prefix = f"language_model.model.layers.{layer_id}.mlp.gate_proj"
+        return {
+            "weight": f"{prefix}.weight",
+            "scales": f"{prefix}.scales",
+            "biases": f"{prefix}.biases",
+        }
+
+    def dense_mlp_up_proj(self, layer_id: int) -> dict:
+        prefix = f"language_model.model.layers.{layer_id}.mlp.up_proj"
+        return {
+            "weight": f"{prefix}.weight",
+            "scales": f"{prefix}.scales",
+            "biases": f"{prefix}.biases",
+        }
+
+    def dense_mlp_down_proj(self, layer_id: int) -> dict:
+        prefix = f"language_model.model.layers.{layer_id}.mlp.down_proj"
+        return {
+            "weight": f"{prefix}.weight",
+            "scales": f"{prefix}.scales",
+            "biases": f"{prefix}.biases",
+        }
 
     def expert_gate_proj(self, layer_id: int, expert_id: int) -> str:
         return f"language_model.model.layers.{layer_id}.experts.switch_glu.gate_proj.weight"
