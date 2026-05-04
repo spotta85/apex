@@ -5,7 +5,7 @@ APEX is a from-scratch Mixture-of-Experts (MoE) inference runtime focused on **b
 ## How to test
 
 ```bash
-# Full unit suite (303 always-on tests; +10 real-Gemma tests run when
+# Full unit suite (304 always-on tests; +17 real-Gemma tests run when
 # REAL_MOE_PATH points at a checkpoint)
 uv run pytest -q
 
@@ -31,6 +31,7 @@ uv run python scripts/smoke_real_decoder_layer.py    # full decoder layer (norms
 uv run python scripts/demo_one_token_generate.py     # embed → decoder → lm_head → argmax (step 16E)
 uv run python scripts/demo_generate_with_kv.py       # multi-token gen with KV cache (step 17D)
 uv run python scripts/demo_prefill.py                # prompt prefill + decode tail (step 18)
+uv run python scripts/demo_tokenizer_generate.py     # text in / text out generation (step 19)
 ```
 
 Diagnostic scripts:
@@ -139,6 +140,7 @@ weighted-combine via apex.moe_layer.run_moe_layer
 | `decoder.py` | `decoder_decode_step` (canonical, sandwich-norm + KV cache) and `single_token_decoder_layer` (thin wrapper) | `decoder_decode_step`, `single_token_decoder_layer` |
 | `generation.py` | `embed_token` (row lookup), `final_logits` (tied lm_head + softcap), `sample_argmax` (greedy) | `embed_token`, `final_logits`, `sample_argmax` |
 | `prefill.py` | `prefill(prompt_ids, *, step_fn)` — loop step_fn over prompt tokens, return last prediction (= first generated). Stateless; KV cache lives in step_fn's closure | `prefill` |
+| `tokenizer.py` | Thin wrapper over HF `tokenizers` lib. `Tokenizer.from_pretrained(path)` loads `tokenizer.json` + reads BOS id from `config.json`. `encode` prepends BOS by default; `decode` skips special tokens by default | `Tokenizer` |
 | `checkpoint_loaders.py` | High-level component loaders: `read_text_config`, `load_embedding`, `load_final_norm`, `load_layer_norms`, `load_attention_weights`. Built on `safetensors_loader` + `dequant` | five loader functions |
 
 ### `apex/backends/` — compute
@@ -193,14 +195,15 @@ weighted-combine via apex.moe_layer.run_moe_layer
 | `demo_one_token_generate.py` | End-to-end one-token generation on real Gemma: embedding lookup → N decoder layers → final RMSNorm → tied lm_head + final_logit_softcapping → argmax (step 16E) |
 | `demo_generate_with_kv.py` | Multi-token generation: prefill prompt token-by-token through `decoder_decode_step` (KVCache grows monotonically), then decode N more tokens (step 17D) |
 | `demo_prefill.py` | Real prompt prefill via `apex.prefill.prefill`: 5-token prompt + 3-token decode tail; per-step KV cache length printout matches the step 18 spec format (step 18) |
+| `demo_tokenizer_generate.py` | Text-in / text-out generation: `Tokenizer.encode("Hello world")` → BOS + token ids → prefill + decode loop → `Tokenizer.decode` back to text (step 19) |
 
 ### `tests/`
 
-43 test modules, 303 always-on tests + 10 real-Gemma skipif tests (313 with `REAL_MOE_PATH` set). `tests/_world.py` provides `FakeStore` + re-exports the fake-world writers from `apex._fake_weights`. Real-Gemma tests live in `tests/test_real_moe_cache.py`, `tests/test_real_moe_two_layer.py`, `tests/test_runtime_real_integration.py`, `tests/test_real_memory_budget.py`, `tests/test_real_prefetch.py`, `tests/test_real_attention.py`, `tests/test_real_decoder.py`, and `tests/test_real_generation.py` — all auto-skip unless `REAL_MOE_PATH` (or a known local default path) resolves.
+44 test modules, 304 always-on tests + 17 real-Gemma skipif tests (321 with `REAL_MOE_PATH` set). `tests/_world.py` provides `FakeStore` + re-exports the fake-world writers from `apex._fake_weights`. Real-Gemma tests live in `tests/test_real_moe_cache.py`, `tests/test_real_moe_two_layer.py`, `tests/test_runtime_real_integration.py`, `tests/test_real_memory_budget.py`, `tests/test_real_prefetch.py`, `tests/test_real_attention.py`, `tests/test_real_decoder.py`, and `tests/test_real_generation.py` — all auto-skip unless `REAL_MOE_PATH` (or a known local default path) resolves.
 
 ---
 
-## What's done (steps 1–18)
+## What's done (steps 1–19)
 
 1–3. Bounded LRU cache, prefetcher, Markov predictor, metrics.
 4. SwiGLU FFN experts (gate/up/down bundles via `ExpertWeights`).
@@ -226,6 +229,7 @@ weighted-combine via apex.moe_layer.run_moe_layer
 17D. Multi-token generation: `apex/decoder.py:decoder_decode_step` (canonical sandwich-norm decoder threading KVCache through to attention) + `scripts/demo_generate_with_kv.py` running real Gemma 4 layer 0 with prefill + decode loops. KV cache grows monotonically (5 tokens × 1 layer × 8 KV heads × 256 head_dim × 4 bytes × 2 = 81920 bytes).
 17E. Separate memory budgets: `apex/memory.py:KVMemoryReport` (per-layer KV bytes) + `RuntimeMemoryReport` (joined view with `expert_cache_bytes`, `kv_cache_bytes`, `total_runtime_bytes`). `demo_generate_with_kv.py` now prints a joined `=== memory ===` block at the end of generation: e.g. `expert cache: 385.7 MB (peak 385.7 MB / budget 512.0 MB), kv cache: 0.1 MB, total: 385.8 MB`. KV is non-evictable during generation; the joined report surfaces it next to the LRU expert budget so operators can size both deliberately.
 18. Real prompt prefill: `apex/prefill.py:prefill(prompt_ids, *, step_fn)` extracts the prefill loop into a reusable + testable primitive. KV cache lives in `step_fn`'s closure so prefill itself stays stateless. `scripts/demo_prefill.py` drives a 5-token prompt then 3-token decode tail, printing `kv cache length: N` per step. `scripts/demo_generate_with_kv.py` refactored to use the same `prefill` function — single source of truth.
+19. Tokenizer integration: `apex/tokenizer.py:Tokenizer` wraps the pure-Rust `tokenizers` library (`Tokenizer.from_file` on `<path>/tokenizer.json`) and reads `bos_token_id` from `<path>/config.json` to replicate `transformers.GemmaTokenizer.add_bos_token=True` behavior. `scripts/demo_tokenizer_generate.py` accepts `--prompt "Hello world"`, encodes to `[2, 9259, 1902]` (BOS + 2 tokens), runs prefill + decode, and decodes generated ids back to text — completing the text-in / text-out path.
 
 ---
 
@@ -233,8 +237,7 @@ weighted-combine via apex.moe_layer.run_moe_layer
 
 ### Near term
 
-- **Step 19 — tokenizer integration** — accept string prompts in the demos and decode predicted ids. Adds `tokenizers` (small Rust dep, no torch) so we can stop hardcoding token ids.
-- **Step 20 — user-facing `MoEModel.generate()`** — wraps embedding + decoder layers + final norm + lm_head behind one class with `model.generate(prompt, n_tokens) → str` so callers don't have to wire the whole stack themselves.
+- **Step 20 — user-facing `MoEModel.generate()`** — wraps embedding + decoder layers + final norm + lm_head + KVCache + tokenizer behind one class with `model.generate(prompt, max_tokens) → str`. Callers stop having to assemble the per-layer attn / norms / moe-call closure themselves. The 19 demo's `_decode` closure is the seed for the class's `step` method.
 - **Batched-prompt prefill (multi-token attention with causal mask)** — current `prefill` calls `step_fn` once per prompt token (O(prompt_len) sequential). A real batched prefill would process the whole prompt in a single multi-token attention call, cutting wall time for long prompts.
 - **Layer heterogeneity for full-attention layers** — Gemma 4 layers 5/11/17/23/29 use full_attention with K=V tied (no v_proj on disk), head_dim=512, and partial RoPE (rotary_factor=0.25, theta=1e6). Needed for any decoder pass that goes past 5 layers.
 - **Dense-MLP shared expert** — Gemma 4 carries both routed MoE and a dense MLP per layer (with the `_1`/`_2` parallel norm variants); driving both would change residual sums.
