@@ -85,3 +85,22 @@ def test_out_of_range_layer_treated_as_sliding():
     cfg = ModelConfig.from_path(real_checkpoint_path())
     assert not cfg.is_full_attention(9999)
     assert cfg.head_dim_for_layer(9999) == cfg.head_dim
+
+
+# --- Step 24C: sliding-window scope -----------------------------------------
+
+@skip_if_no_real_checkpoint()
+def test_sliding_window_parsed_from_text_config():
+    """Gemma 4 sets `sliding_window=1024`; ModelConfig must surface it."""
+    cfg = ModelConfig.from_path(real_checkpoint_path())
+    assert cfg.sliding_window == 1024
+
+
+@skip_if_no_real_checkpoint()
+def test_sliding_window_for_layer_distinguishes_sliding_vs_full():
+    """Sliding layers cap at the configured window; full layers attend globally."""
+    cfg = ModelConfig.from_path(real_checkpoint_path())
+    # Layer 0 is sliding → window cap.
+    assert cfg.sliding_window_for_layer(0) == 1024
+    # Layer 5 is full_attention → no cap (None ⇒ attend globally).
+    assert cfg.sliding_window_for_layer(5) is None

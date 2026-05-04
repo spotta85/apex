@@ -82,6 +82,12 @@ class ModelConfig:
     # frequency wavelengths = better long-range positional sensitivity.
     rope_theta_full: float
 
+    # --- Step 24C: sliding-window attention scope -----------------------
+    # `sliding_window`: max attention scope (in tokens) for sliding
+    # layers. Gemma 4 = 1024. Full_attention layers ignore this. None
+    # for models that don't differentiate (every layer attends globally).
+    sliding_window: int | None
+
     @classmethod
     def from_path(cls, path, *, layout_name=None) -> "ModelConfig":
         """Detect layout, read text_config, return a fully-populated ModelConfig.
@@ -153,6 +159,11 @@ class ModelConfig:
         )
         attention_k_eq_v = bool(text_cfg.get("attention_k_eq_v", False))
 
+        # Sliding-window scope for sliding_attention layers (step 24C).
+        # Cast to int when present; missing → None ⇒ no window enforced.
+        sliding_window = text_cfg.get("sliding_window")
+        sliding_window = int(sliding_window) if sliding_window is not None else None
+
         return cls(
             path=path,
             layout_name=resolved_layout_name,
@@ -184,6 +195,7 @@ class ModelConfig:
             attention_k_eq_v=attention_k_eq_v,
             partial_rotary_factor_full=partial_factor_full,
             rope_theta_full=rope_theta_full,
+            sliding_window=sliding_window,
         )
 
     @property
@@ -256,3 +268,19 @@ class ModelConfig:
     def attention_k_eq_v_for_layer(self, layer_id: int) -> bool:
         """Whether `layer_id` ties V to K (no v_proj on disk)."""
         return self.attention_k_eq_v and self.is_full_attention(layer_id)
+
+    def sliding_window_for_layer(self, layer_id: int) -> int | None:
+        """Attention scope for `layer_id`, or None for no limit.
+
+        Sliding-attention layers cap attention to `sliding_window`
+        tokens (1024 on Gemma 4); full_attention layers attend
+        globally and return None. None is also returned for any
+        layer when `sliding_window` is missing from text_config —
+        layouts without the field get the pre-step-24C "attend to
+        the whole cache" behavior.
+        """
+        if self.sliding_window is None:
+            return None
+        if self.is_full_attention(layer_id):
+            return None
+        return self.sliding_window

@@ -23,9 +23,6 @@ What is intentionally NOT here:
     "simple loop first, optimize prefill later" stance from the
     step 17 spec. The decode function can drive a prefill loop
     one token at a time at O(prompt_len * total_seq) cost.
-  - Sliding-window attention scope limit (Gemma 4 sliding layers
-    cap attention to the last 1024 tokens). For decode demos with
-    seq < 1024 this is moot.
 
 Step 23 added support for Gemma 4 full_attention layers via three
 keyword args without forking the function:
@@ -34,6 +31,12 @@ keyword args without forking the function:
   - `rotary_dim` plumbs through to `apply_rope` for partial RoPE
     (full layers rotate only `head_dim * partial_rotary_factor` dims).
   - `head_dim`/`num_kv_heads`/`rope_theta` are already per-call.
+
+Step 24C added `window_size` for sliding-window attention scope:
+when set, the read of K/V from the cache trims to the last
+`window_size` entries before the dot product. The cache itself is
+not modified (eviction inside KVCache is out of scope). For prompt
+lengths ≤ window_size this is a no-op.
 """
 
 import numpy as np
@@ -59,6 +62,7 @@ def attention_decode_step(
     rms_eps: float = 1e-6,
     rope_theta: float = 10000.0,
     rotary_dim: int | None = None,
+    window_size: int | None = None,
 ):
     """One decode step of self-attention with a KVCache.
 
@@ -143,6 +147,15 @@ def attention_decode_step(
     kv_cache.append(layer_id, k, v)
     k_all, v_all = kv_cache.get(layer_id)
     # k_all / v_all: (1, num_kv_heads, seq_total, head_dim).
+
+    # Step 24C: sliding-window scope. When set, attend to only the last
+    # `window_size` cached tokens (the cache itself isn't trimmed —
+    # this is purely an attention-scope slice). Mathematically a no-op
+    # for cached lengths ≤ window_size, so short prompts are unaffected.
+    # Full_attention layers pass window_size=None and attend globally.
+    if window_size is not None and k_all.shape[-2] > window_size:
+        k_all = k_all[..., -window_size:, :]
+        v_all = v_all[..., -window_size:, :]
 
     # GQA: replicate each KV head q_per_kv times so the per-head
     # einsum lines up with q. q_per_kv == 1 ⇒ no-op.
