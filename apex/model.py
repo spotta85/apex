@@ -338,6 +338,11 @@ class MoEModel:
         Gemma 4's `enable_thinking=True`). Returns the decoded model
         reply (no prompt prefix).
 
+        Step 24D: also stops on the chat end-of-turn token (Gemma 4's
+        `<turn|>` = id 106), not just `<eos>`. Without this the model
+        happily generates into the next user turn until `max_tokens`
+        runs out — useless for chat UX.
+
         Raises ValueError if the checkpoint has no chat template.
         """
         prompt_ids = self.tokenizer.encode_chat(
@@ -347,12 +352,21 @@ class MoEModel:
         )
         if not prompt_ids:
             raise ValueError("rendered chat encoded to zero tokens")
+        # Build the chat-mode stop set: EOS plus EOT (when the
+        # tokenizer carries one). Plain `generate` keeps the smaller
+        # EOS-only set so non-chat callers don't get surprised by
+        # premature stops on a token that has a different meaning
+        # in their context.
+        stop_ids = set(self.config.eos_token_ids)
+        if self.tokenizer.eot_token_id is not None:
+            stop_ids.add(self.tokenizer.eot_token_id)
         return self._generate_from_ids(
             prompt_ids,
             max_tokens=max_tokens,
             temperature=temperature,
             verbose=verbose,
             prompt_label=f"<chat with {len(messages)} message(s)>",
+            stop_ids=stop_ids,
         )
 
     def _generate_from_ids(
@@ -363,12 +377,18 @@ class MoEModel:
         temperature: float,
         verbose: bool,
         prompt_label: str,
+        stop_ids: set | None = None,
     ) -> str:
         """Shared prefill + decode-loop body for `generate` / `generate_chat`.
 
         `prompt_label` is just for the verbose trace — both entry
         points hand it a human-readable rendering so the trace is
         legible without the caller having to peek at the ids.
+
+        `stop_ids` is the set of token ids that terminate the decode
+        loop early. Defaults to `self.config.eos_token_ids` so plain
+        `generate` keeps the pre-step-24D behavior; `generate_chat`
+        adds the EOT id on top.
         """
         if max_tokens <= 0:
             raise ValueError(f"max_tokens must be positive, got {max_tokens}")
@@ -389,9 +409,10 @@ class MoEModel:
             print(f"  → token 1: id {first_id} "
                   f"= {self.tokenizer.decode([first_id])!r}")
 
-        eos = set(self.config.eos_token_ids)
+        if stop_ids is None:
+            stop_ids = set(self.config.eos_token_ids)
 
-        if first_id in eos:
+        if first_id in stop_ids:
             return self.tokenizer.decode(generated)
 
         last_id = first_id
@@ -401,7 +422,7 @@ class MoEModel:
             if verbose:
                 print(f"  → token {step + 2}: id {last_id} "
                       f"= {self.tokenizer.decode([last_id])!r}")
-            if last_id in eos:
+            if last_id in stop_ids:
                 break
 
         return self.tokenizer.decode(generated)

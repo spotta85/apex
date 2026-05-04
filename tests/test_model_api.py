@@ -150,6 +150,62 @@ def test_real_generate_chat_returns_string(real_model):
 
 
 @skip_if_no_real_checkpoint()
+def test_generate_chat_stops_on_eot_token(real_model, monkeypatch):
+    """When the model predicts `<turn|>` (id 106), generate_chat must stop.
+
+    Patch `_make_step_fn` to return a step that always emits id 106
+    (the Gemma 4 EOT). With max_tokens=8, the generated list should
+    have length 1 (just the EOT) — proving the chat-mode stop set
+    includes EOT and triggers the early break.
+    """
+    # Sanity: the real tokenizer carries the EOT id we expect.
+    assert real_model.tokenizer.eot_token_id == 106
+
+    eot_id = real_model.tokenizer.eot_token_id
+
+    def fake_step_fn(self, kv, *, temperature):
+        # Returns a step closure that always predicts EOT, ignoring input.
+        def step(_token_id, _eot=eot_id):
+            return _eot
+        return step
+
+    monkeypatch.setattr(
+        type(real_model), "_make_step_fn", fake_step_fn, raising=True,
+    )
+    real_model.generate_chat(
+        [{"role": "user", "content": "Hello"}],
+        max_tokens=8, verbose=False,
+    )
+    # Just the first EOT — the loop must NOT keep generating.
+    assert real_model._last_generated_ids == [eot_id]
+
+
+@skip_if_no_real_checkpoint()
+def test_generate_does_not_stop_on_eot_token(real_model, monkeypatch):
+    """Plain `generate` must NOT treat EOT as a stop token.
+
+    Confirms the chat stop-set is `generate_chat`-only — `generate`
+    keeps stopping just on EOS, since EOT has no special meaning
+    outside chat mode.
+    """
+    eot_id = real_model.tokenizer.eot_token_id
+
+    def fake_step_fn(self, kv, *, temperature):
+        def step(_token_id, _eot=eot_id):
+            return _eot
+        return step
+
+    monkeypatch.setattr(
+        type(real_model), "_make_step_fn", fake_step_fn, raising=True,
+    )
+    real_model.generate("Hello", max_tokens=4, verbose=False)
+    # Plain generate should run for the full max_tokens — every step
+    # returns EOT but EOT isn't in the (EOS-only) stop set.
+    assert len(real_model._last_generated_ids) == 4
+    assert all(i == eot_id for i in real_model._last_generated_ids)
+
+
+@skip_if_no_real_checkpoint()
 def test_real_generate_chat_uses_more_prompt_tokens_than_plain(real_model):
     """Templated render expands the prompt — KV must reflect more tokens.
 

@@ -42,9 +42,23 @@ class Tokenizer:
     models like Gemma 4) and is `None` when no config is present.
     """
 
-    def __init__(self, tokenizer, *, bos_token_id=None, chat_template=None):
+    def __init__(
+        self,
+        tokenizer,
+        *,
+        bos_token_id=None,
+        eot_token_id=None,
+        chat_template=None,
+    ):
         self.tokenizer = tokenizer
         self.bos_token_id = bos_token_id
+        # Step 24D: end-of-turn id for chat-style models. Gemma 4 uses
+        # `<turn|>` (id 106) to mark the end of a model turn — distinct
+        # from `<eos>` (id 1). `MoEModel.generate_chat` stops on either
+        # so it doesn't keep generating into the next user turn. None
+        # for non-chat tokenizers; consumers that don't care about chat
+        # mode ignore it.
+        self.eot_token_id = eot_token_id
         # Raw Jinja2 source for the chat template, or None if the
         # checkpoint didn't ship one. Compiled lazily on first use
         # of `apply_chat_template` so the dep is paid only when
@@ -96,17 +110,40 @@ class Tokenizer:
         # Standalone file wins when both exist (it's the canonical
         # source for newer multimodal templates).
         chat_template = None
+        eot_token_str = None
+        tok_cfg_path = path / "tokenizer_config.json"
+        if tok_cfg_path.is_file():
+            with open(tok_cfg_path) as f:
+                tok_cfg = json.load(f)
+            # Read both regardless — the chat_template might come from
+            # the standalone .jinja file but eot_token only ever lives
+            # in tokenizer_config.json.
+            chat_template = tok_cfg.get("chat_template")
+            eot_token_str = tok_cfg.get("eot_token")
         standalone = path / "chat_template.jinja"
         if standalone.is_file():
+            # Standalone wins for the chat_template specifically.
             chat_template = standalone.read_text()
-        else:
-            tok_cfg_path = path / "tokenizer_config.json"
-            if tok_cfg_path.is_file():
-                with open(tok_cfg_path) as f:
-                    tok_cfg = json.load(f)
-                chat_template = tok_cfg.get("chat_template")
 
-        return cls(underlying, bos_token_id=bos_id, chat_template=chat_template)
+        # Step 24D: encode `<turn|>` (or whatever the model calls its
+        # end-of-turn marker) to its single-token id. `add_special_tokens=False`
+        # prevents the underlying tokenizer from prepending BOS.
+        eot_id = None
+        if eot_token_str is not None:
+            ids = underlying.encode(eot_token_str, add_special_tokens=False).ids
+            # Defensive: the eot string should tokenize to exactly one
+            # special-token id. If the tokenizer doesn't recognize it
+            # as a single token (unlikely for any sane chat model),
+            # leave eot_id as None rather than guessing.
+            if len(ids) == 1:
+                eot_id = int(ids[0])
+
+        return cls(
+            underlying,
+            bos_token_id=bos_id,
+            eot_token_id=eot_id,
+            chat_template=chat_template,
+        )
 
     def encode(self, text: str, *, add_special_tokens: bool = True) -> list:
         """Encode `text` to a list of token ids.

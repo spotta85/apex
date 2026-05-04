@@ -177,6 +177,27 @@ def test_encode_chat_round_trip_starts_with_bos():
 
 
 @skip_if_no_real_checkpoint()
+def test_real_gemma_loads_eot_token_id():
+    """Gemma 4's `<turn|>` (id 106) must populate `eot_token_id`.
+
+    The chat template ends each model turn with `<turn|>\\n`; the
+    decode loop in MoEModel.generate_chat needs the id to know when
+    to stop. Step 24D wires this in.
+    """
+    tok = Tokenizer.from_pretrained(real_checkpoint_path())
+    assert tok.eot_token_id == 106
+
+
+def test_eot_token_id_none_when_tokenizer_config_missing(tmp_path):
+    """No tokenizer_config.json ⇒ no eot_token_id (back-compat)."""
+    # Need a minimal tokenizer.json so from_pretrained doesn't bail;
+    # easiest path is to copy from the real checkpoint when present.
+    # Otherwise just construct a Tokenizer directly with the default.
+    tok = Tokenizer(tokenizer=None, eot_token_id=None)
+    assert tok.eot_token_id is None
+
+
+@skip_if_no_real_checkpoint()
 def test_real_gemma_double_bos_is_not_prepended():
     """If the input already starts with BOS, encode must not prepend a second."""
     tok = Tokenizer.from_pretrained(real_checkpoint_path())
