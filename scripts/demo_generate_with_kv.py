@@ -51,6 +51,7 @@ from apex.memory import runtime_snapshot
 from apex.metrics import Metrics
 from apex.moe_layer import run_moe_layer
 from apex.ops import rms_norm
+from apex.prefill import prefill
 from apex.real_router import MultiLayerRealRouter
 from apex.checkpoint_loaders import (
     load_attention_weights,
@@ -212,17 +213,16 @@ def main():
         assert np.all(np.isfinite(logits)), "logits must be finite"
         return sample_argmax(logits)
 
-    # Prefill. The argmax of the LAST prompt token is the first
-    # generated token — same convention HF generation loops use.
+    # Prefill. apex.prefill.prefill() loops _decode over prompt
+    # tokens and returns the last prediction — which is conventionally
+    # the first generated token (matches HF generation).
     print("=== prefill ===")
-    last_pred = None
-    for prompt_token in prompt_ids:
-        last_pred = _decode(prompt_token)
-        print(
-            f"  token {prompt_token} → next-id {last_pred}  "
-            f"kv_cache length: {kv.length(0)}  "
-            f"kv_cache bytes: {kv.total_bytes}"
-        )
+    print(f"  prompt: {prompt_ids}")
+    last_pred = prefill(prompt_ids, step_fn=_decode)
+    print(
+        f"  prefill complete: kv_cache length={kv.length(0)}, "
+        f"first generated id={last_pred}"
+    )
 
     # Decode loop. Feed the previous prediction; argmax becomes the
     # next prediction; repeat.
