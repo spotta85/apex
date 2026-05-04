@@ -463,7 +463,75 @@ class MoEModel:
             logits = self._compute_logits(token_id, kv)
         return logits
 
-    def _compute_logits(self, token_id: int, kv: KVCache):
+    def forward_with_trace(self, prompt: str, *, top_k_logits: int = 10):
+        """Run prefill on `prompt` and return (logits, trace).
+
+        Step 25A parity harness — same forward path as `forward()` but
+        captures per-layer intermediates for the LAST prompt token (the
+        position the model would sample from). Earlier prompt tokens
+        are processed normally; tracing only the last token keeps the
+        cost a constant overhead instead of O(prompt_len) trace
+        entries.
+
+        Returns `(logits, trace)`:
+          - `logits`: (1, vocab_size) — same array `forward()` would
+            return.
+          - `trace`: a JSON-serialisable dict with shape
+            ```
+            {
+              "prompt": str,
+              "input_ids": list[int],
+              "num_layers": int,
+              "layers": [
+                {"layer_id": int,
+                 "router": {"expert_ids": [...], "weights": [...]},
+                 "attn_out_norm": float,
+                 "moe_out_norm": float,
+                 "dense_out_norm": float | None,
+                 "post_layer_hidden_norm": float},
+                ...
+              ],
+              "top_k_logits": [(token_id, logit), ...],
+            }
+            ```
+
+        Useful for:
+          - Diffing APEX's per-layer state across two configs (e.g.
+            with/without dense MLP) to localise what changed.
+          - Future reference-parity comparison (load HF / mlx-lm,
+            run the same prompt through the same instrumentation, diff
+            by layer to find the operator where math drifts).
+        """
+        prompt_ids = self.tokenizer.encode(prompt)
+        if not prompt_ids:
+            raise ValueError("prompt encoded to zero tokens")
+        kv = KVCache(num_layers=self.num_layers)
+        self._last_kv = kv
+        # Run all prompt tokens UP TO the last one through the standard
+        # untraced path — we only need intermediates at the final
+        # decision point.
+        for token_id in prompt_ids[:-1]:
+            self._compute_logits(token_id, kv)
+        layer_traces: list = []
+        logits = self._compute_logits(
+            prompt_ids[-1], kv, trace_layers=layer_traces,
+        )
+        # Top-K logits for compact comparison signature. argpartition
+        # is O(vocab) instead of O(vocab log vocab) for full sort.
+        flat = logits[0]
+        top_idx = np.argpartition(-flat, top_k_logits - 1)[:top_k_logits]
+        top_idx = top_idx[np.argsort(-flat[top_idx])]
+        top_pairs = [(int(i), float(flat[i])) for i in top_idx]
+        trace = {
+            "prompt": prompt,
+            "input_ids": list(prompt_ids),
+            "num_layers": self.num_layers,
+            "layers": layer_traces,
+            "top_k_logits": top_pairs,
+        }
+        return logits, trace
+
+    def _compute_logits(self, token_id: int, kv: KVCache, *, trace_layers=None):
         """Per-token forward through embed → N layers → final norm → lm_head.
 
         Returns `(1, vocab_size)` logits with softcap applied. Internal
@@ -473,6 +541,12 @@ class MoEModel:
         rope_theta, rotary_dim, K=V-tied) is per-layer, picked via
         `config.*_for_layer(L)` so sliding and full layers can be
         intermixed without a separate code path.
+
+        Step 25A: optional `trace_layers` is a list that, when provided,
+        is appended to with one dict per layer carrying the router's
+        top-k decision and the post-attn-norm / MoE / dense intermediate
+        tensors (raw, for the caller to extract norms or top-k from).
+        Default None ⇒ zero overhead, byte-identical pre-step-25 path.
         """
         config = self.config
         hidden = embed_token(self.embedding, token_id)
@@ -498,9 +572,29 @@ class MoEModel:
                 window_size=config.sliding_window_for_layer(layer_id),
             )
 
-            def moe_call(h, lid=layer_id):
+            # Per-layer router capture buffer. The closure below writes
+            # the router's top-k decision into this dict as a side
+            # effect; we read it back after `decoder_decode_step` to
+            # build the trace entry. None when tracing is off so the
+            # closure stays a single-statement body.
+            router_capture = {} if trace_layers is not None else None
+
+            def moe_call(h, lid=layer_id, cap=router_capture):
                 with nvfp4_matmul_warnings():
                     ids, weights = self.router.route(lid, h)
+                    if cap is not None:
+                        # Coerce to plain lists for JSON-friendly
+                        # downstream serialization. The router returns
+                        # either python lists or numpy arrays depending
+                        # on the layout; normalize here.
+                        cap["expert_ids"] = (
+                            list(ids) if not hasattr(ids, "tolist")
+                            else ids.tolist()
+                        )
+                        cap["weights"] = (
+                            list(weights) if not hasattr(weights, "tolist")
+                            else weights.tolist()
+                        )
                     return run_moe_layer(
                         h, ids, weights,
                         lambda eid: self.manager.ensure_loaded(lid, eid),
@@ -524,6 +618,7 @@ class MoEModel:
                     with nvfp4_matmul_warnings():
                         return self.backend.run_expert(h, b)
 
+            decoder_trace = {} if trace_layers is not None else None
             with nvfp4_matmul_warnings():
                 hidden = decoder_decode_step(
                     hidden,
@@ -534,7 +629,29 @@ class MoEModel:
                     kv_cache=kv,
                     layer_id=layer_id,
                     rms_eps=config.rms_norm_eps,
+                    trace=decoder_trace,
                 )
+
+            if trace_layers is not None:
+                # Reduce the raw tensors to scalar signatures here so
+                # callers don't have to carry ~10 MB of intermediates
+                # around per forward pass. Norm is the cheapest
+                # comparison signal and survives JSON serialization.
+                trace_layers.append({
+                    "layer_id": layer_id,
+                    "router": router_capture,
+                    "attn_out_norm": float(
+                        np.linalg.norm(decoder_trace["attn_out"])
+                    ),
+                    "moe_out_norm": float(
+                        np.linalg.norm(decoder_trace["moe_out"])
+                    ),
+                    "dense_out_norm": (
+                        float(np.linalg.norm(decoder_trace["dense_out"]))
+                        if "dense_out" in decoder_trace else None
+                    ),
+                    "post_layer_hidden_norm": float(np.linalg.norm(hidden)),
+                })
         hidden = rms_norm(
             hidden, self.final_norm_w,
             eps=config.rms_norm_eps, gemma_unit_offset=True,

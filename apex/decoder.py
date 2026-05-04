@@ -22,6 +22,13 @@ provided, both the routed MoE and the dense MLP consume the same
 shared `post_ffn_norm + residual`. Default `None` reproduces the
 pre-step-24 routed-only behavior byte-for-byte.
 
+Step 25A added an optional `trace` dict: when provided, gets
+populated with raw intermediate tensors (post-attn-norm output, MoE
+output, dense MLP output) so a caller — typically
+`MoEModel.forward_with_trace` — can compute norms / top-k signatures
+externally for parity comparison. None ⇒ zero overhead, byte-
+identical to the pre-step-25 path.
+
 What is intentionally NOT here:
   - The `_1` / `_2` parallel-path norm variants the real model
     carries (one set per parallel feedforward path). Routed and
@@ -47,6 +54,7 @@ def decoder_decode_step(
     layer_id: int,
     rms_eps: float = 1e-6,
     dense_mlp_call=None,
+    trace: dict | None = None,
 ):
     """Run one decode step of the sandwich-norm decoder block.
 
@@ -69,6 +77,14 @@ def decoder_decode_step(
     `pre_ffn_norm(hidden)` and their outputs are summed before the
     shared `post_ffn_norm + residual`. None reproduces the pre-step-24
     routed-only behavior.
+
+    `trace`: optional dict that, when provided, gets populated in place
+    with the raw intermediate tensors useful for parity / debugging:
+    `attn_out` (post-attn-norm), `moe_out` (raw routed MoE output),
+    `dense_out` (raw dense MLP output, only when `dense_mlp_call` is
+    set). None ⇒ no allocation, no work, identical bytes to the pre-
+    step-25 path. The dict is mutated rather than returned so the
+    caller can pass a fresh dict per layer.
     """
     residual = hidden
     h = rms_norm(hidden, norms["input"], eps=rms_eps, gemma_unit_offset=True)
@@ -76,16 +92,23 @@ def decoder_decode_step(
         h, **attn_kwargs, kv_cache=kv_cache, layer_id=layer_id,
     )
     h = rms_norm(h, norms["post_attn"], eps=rms_eps, gemma_unit_offset=True)
+    if trace is not None:
+        trace["attn_out"] = h
     hidden = residual + h
 
     residual = hidden
     h = rms_norm(hidden, norms["pre_ffn"], eps=rms_eps, gemma_unit_offset=True)
     moe_out = moe_call(h)
+    if trace is not None:
+        trace["moe_out"] = moe_out
     if dense_mlp_call is not None:
         # Parallel branches share `pre_ffn` input AND `post_ffn` output;
         # summing before the post-norm matches the standard interpretation
         # of Gemma 4's parallel feedforward block.
-        moe_out = moe_out + dense_mlp_call(h)
+        dense_out = dense_mlp_call(h)
+        if trace is not None:
+            trace["dense_out"] = dense_out
+        moe_out = moe_out + dense_out
     h = rms_norm(moe_out, norms["post_ffn"], eps=rms_eps, gemma_unit_offset=True)
     return residual + h
 

@@ -15,6 +15,7 @@ traces/runtime_mlx_traces.jsonl
 traces/gate_traces.jsonl
 traces/safetensors_traces.jsonl
 traces/gguf_traces.jsonl
+traces/parity_*.json
 experts/
 weights/
 
