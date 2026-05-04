@@ -103,11 +103,20 @@ def load_final_norm(path, layout):
 
 
 def load_layer_norms(path, layout, layer_id: int) -> dict:
-    """Load layer L's four BF16 norm weights as fp32 ndarrays.
+    """Load layer L's BF16 norm weights as fp32 ndarrays.
 
-    Returns {input, post_attn, pre_ffn, post_ffn}. Skips Gemma 4's
-    `_1` / `_2` variants (those belong to parallel feedforward paths
-    we don't drive yet — dense MLP alongside the routed MoE).
+    Always returns {input, post_attn, pre_ffn, post_ffn}. When the
+    layout exposes Gemma 4's parallel-branch variants (step 26B), the
+    dict additionally carries:
+
+      - `pre_ffn_2`   — pre-norm for the dense MLP branch
+      - `post_ffn_1`  — post-norm for the routed MoE branch
+      - `post_ffn_2`  — post-norm for the dense MLP branch
+
+    Layouts without the variants (Mixtral, Qwen, synthetic) return
+    None from the optional accessors; the keys are simply absent
+    from the returned dict, so `decoder_decode_step` falls back to
+    the pre-step-26B routed-only norm structure.
     """
     path = Path(path)
     weight_map = read_safetensors_index(path)
@@ -115,12 +124,35 @@ def load_layer_norms(path, layout, layer_id: int) -> dict:
     def _load(name: str):
         return load_tensor(path / weight_map[name], name)
 
-    return {
+    norms = {
         "input": _load(layout.input_layernorm(layer_id)),
         "post_attn": _load(layout.post_attention_layernorm(layer_id)),
         "pre_ffn": _load(layout.pre_feedforward_layernorm(layer_id)),
         "post_ffn": _load(layout.post_feedforward_layernorm(layer_id)),
     }
+
+    # Step 26B parallel-branch variants. Each accessor returns None
+    # for layouts that don't ship the tensor; in that case we omit
+    # the key rather than carrying a None through (the decoder uses
+    # `if k in norms` to decide which architecture to run).
+    pre_2_name = layout.pre_feedforward_layernorm_2(layer_id)
+    if pre_2_name is not None:
+        norms["pre_ffn_2"] = _load(pre_2_name)
+    post_1_name = layout.post_feedforward_layernorm_1(layer_id)
+    if post_1_name is not None:
+        norms["post_ffn_1"] = _load(post_1_name)
+    post_2_name = layout.post_feedforward_layernorm_2(layer_id)
+    if post_2_name is not None:
+        norms["post_ffn_2"] = _load(post_2_name)
+
+    # Step 26B: per-layer scalar (Gemma 4 ships shape-(1,) bf16 per
+    # layer; reference applies it as a multiplier on the layer's
+    # final output). Stored on the same dict for plumbing convenience.
+    scalar_name = layout.layer_scalar(layer_id)
+    if scalar_name is not None:
+        norms["layer_scalar"] = _load(scalar_name)
+
+    return norms
 
 
 def load_attention_weights(path, layout, layer_id: int, *, k_eq_v: bool = False) -> dict:

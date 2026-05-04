@@ -585,13 +585,12 @@ class MoEModel:
             router_capture = {} if trace_layers is not None else None
 
             def moe_call(h, lid=layer_id, cap=router_capture):
+                # Pre-step-26B combined route+experts closure; kept for
+                # the back-compat fallback path in `decoder_decode_step`
+                # and for layouts that don't trigger the parallel arch.
                 with nvfp4_matmul_warnings():
                     ids, weights = self.router.route(lid, h)
                     if cap is not None:
-                        # Coerce to plain lists for JSON-friendly
-                        # downstream serialization. The router returns
-                        # either python lists or numpy arrays depending
-                        # on the layout; normalize here.
                         cap["expert_ids"] = (
                             list(ids) if not hasattr(ids, "tolist")
                             else ids.tolist()
@@ -600,6 +599,33 @@ class MoEModel:
                             list(weights) if not hasattr(weights, "tolist")
                             else weights.tolist()
                         )
+                    return run_moe_layer(
+                        h, ids, weights,
+                        lambda eid: self.manager.ensure_loaded(lid, eid),
+                        self.backend,
+                    )
+
+            # Step 26B: split route + experts so the decoder can route
+            # on the RAW post-attn hidden (matches Gemma 4 reference)
+            # while running experts on `pre_ffn_2(hidden)`. The single-
+            # arg moe_call above couldn't express that asymmetry — its
+            # caller handed it the same `h` for both operations.
+            def route_call(h, lid=layer_id, cap=router_capture):
+                with nvfp4_matmul_warnings():
+                    ids, weights = self.router.route(lid, h)
+                    if cap is not None:
+                        cap["expert_ids"] = (
+                            list(ids) if not hasattr(ids, "tolist")
+                            else ids.tolist()
+                        )
+                        cap["weights"] = (
+                            list(weights) if not hasattr(weights, "tolist")
+                            else weights.tolist()
+                        )
+                    return ids, weights
+
+            def experts_call(h, ids, weights, lid=layer_id):
+                with nvfp4_matmul_warnings():
                     return run_moe_layer(
                         h, ids, weights,
                         lambda eid: self.manager.ensure_loaded(lid, eid),
@@ -624,17 +650,25 @@ class MoEModel:
                         return self.backend.run_expert(h, b)
 
             decoder_trace = {} if trace_layers is not None else None
+            # Step 26B: pull the optional `layer_scalar` out of the
+            # norms dict if the layout exposes one (Gemma 4 does;
+            # synthetic / Mixtral / Qwen don't). The decoder applies
+            # it as a multiplier on the layer's final output.
+            layer_scalar = norms.get("layer_scalar")
             with nvfp4_matmul_warnings():
                 hidden = decoder_decode_step(
                     hidden,
                     norms=norms,
                     attn_kwargs=attn_kwargs,
                     moe_call=moe_call,
+                    route_call=route_call,
+                    experts_call=experts_call,
                     dense_mlp_call=dense_mlp_call,
                     kv_cache=kv,
                     layer_id=layer_id,
                     rms_eps=config.rms_norm_eps,
                     trace=decoder_trace,
+                    layer_scalar=layer_scalar,
                 )
 
             if trace_layers is not None:

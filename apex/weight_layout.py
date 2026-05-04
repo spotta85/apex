@@ -120,6 +120,38 @@ class _MoELayoutBase:
     def dense_mlp_down_proj(self, layer_id: int) -> dict | None:
         return None
 
+    # --- Optional step-26B parallel-branch norm variants ---------------
+    # Real Gemma 4 ships TWO pre-feedforward norms and THREE post-
+    # feedforward norms per layer. Mapping (per `mlx_lm.models.gemma4_text`
+    # `DecoderLayer.__call__`, lines 353-369):
+    #   - `pre_feedforward_layernorm`     → DENSE-branch input norm
+    #   - `pre_feedforward_layernorm_2`   → ROUTED-branch input norm
+    #   - `post_feedforward_layernorm_1`  → DENSE-branch output norm
+    #   - `post_feedforward_layernorm_2`  → ROUTED-branch output norm
+    #   - `post_feedforward_layernorm`    → output norm on the summed
+    #                                       branches (before residual)
+    # Default None so synthetic / Mixtral / Qwen layouts (no parallel
+    # branches) skip them and keep the pre-step-26B routed-only
+    # decoder behavior. Real Gemma layouts override.
+
+    def pre_feedforward_layernorm_2(self, layer_id: int) -> str | None:
+        return None
+
+    def post_feedforward_layernorm_1(self, layer_id: int) -> str | None:
+        return None
+
+    def post_feedforward_layernorm_2(self, layer_id: int) -> str | None:
+        return None
+
+    # --- Optional step-26B per-layer scalar -----------------------------
+    # Gemma 4 ships a shape-(1,) bf16 `layer_scalar` per decoder layer.
+    # The reference (`mlx_lm.models.gemma4_text:DecoderLayer.__call__`
+    # lines 386-387) multiplies the layer's final output by this scalar
+    # AFTER the FFN-block residual add. Default None for layouts that
+    # don't carry it.
+    def layer_scalar(self, layer_id: int) -> str | None:
+        return None
+
 
 class FakeMoELayout(_MoELayoutBase):
     """Layout used by APEX's scripts/make_fake_*_moe.py setup scripts.
@@ -333,6 +365,20 @@ class GemmaMoELayout(_MoELayoutBase):
     def post_feedforward_layernorm(self, layer_id: int) -> str:
         return f"model.language_model.layers.{layer_id}.post_feedforward_layernorm.weight"
 
+    # Step 26B: parallel-branch norm variants. Same Gemma 4 weights
+    # as GemmaHFMoELayout, just under a different name prefix.
+    def pre_feedforward_layernorm_2(self, layer_id: int) -> str:
+        return f"model.language_model.layers.{layer_id}.pre_feedforward_layernorm_2.weight"
+
+    def post_feedforward_layernorm_1(self, layer_id: int) -> str:
+        return f"model.language_model.layers.{layer_id}.post_feedforward_layernorm_1.weight"
+
+    def post_feedforward_layernorm_2(self, layer_id: int) -> str:
+        return f"model.language_model.layers.{layer_id}.post_feedforward_layernorm_2.weight"
+
+    def layer_scalar(self, layer_id: int) -> str:
+        return f"model.language_model.layers.{layer_id}.layer_scalar"
+
     def embedding_tensors(self) -> dict:
         prefix = "model.language_model.embed_tokens"
         return {"weight": f"{prefix}.weight", "scales": f"{prefix}.weight_scale"}
@@ -451,15 +497,27 @@ class GemmaHFMoELayout(_MoELayoutBase):
         return f"language_model.model.layers.{layer_id}.post_attention_layernorm.weight"
 
     def pre_feedforward_layernorm(self, layer_id: int) -> str:
-        # Note: Gemma 4 layers also carry `pre_feedforward_layernorm_2`
-        # and `post_feedforward_layernorm_{1,2}` variants — one set per
-        # parallel feedforward path (dense MLP + routed MoE). The base
-        # names below are what the simple pre-norm + MoE smoke uses;
-        # supporting the full multi-path layer is a 16D+ concern.
         return f"language_model.model.layers.{layer_id}.pre_feedforward_layernorm.weight"
 
     def post_feedforward_layernorm(self, layer_id: int) -> str:
         return f"language_model.model.layers.{layer_id}.post_feedforward_layernorm.weight"
+
+    # Step 26B: parallel-branch norm variants. Mapping per the
+    # `mlx_lm/models/gemma4_text.py:DecoderLayer.__call__` reference.
+    # Dense branch uses the unsuffixed pre + `_1` post; routed
+    # branch uses `_2` for both; the unsuffixed post is the combined
+    # output norm.
+    def pre_feedforward_layernorm_2(self, layer_id: int) -> str:
+        return f"language_model.model.layers.{layer_id}.pre_feedforward_layernorm_2.weight"
+
+    def post_feedforward_layernorm_1(self, layer_id: int) -> str:
+        return f"language_model.model.layers.{layer_id}.post_feedforward_layernorm_1.weight"
+
+    def post_feedforward_layernorm_2(self, layer_id: int) -> str:
+        return f"language_model.model.layers.{layer_id}.post_feedforward_layernorm_2.weight"
+
+    def layer_scalar(self, layer_id: int) -> str:
+        return f"language_model.model.layers.{layer_id}.layer_scalar"
 
     def embedding_tensors(self) -> dict:
         prefix = "language_model.model.embed_tokens"

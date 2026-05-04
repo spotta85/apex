@@ -8,38 +8,63 @@
   "prompts": {
     "The capital of France is": {
       "token_ids": [
-        16,
-        1
+        1707,
+        4861,
+        1707,
+        13385,
+        13385,
+        6114,
+        6114,
+        6114
       ],
-      "text": "<unused10>",
-      "hit_eos": true,
-      "longest_run": 1
+      "text": " fact ways fact\u305f\u3081\u305f\u3081 eyes eyes eyes",
+      "hit_eos": false,
+      "longest_run": 3
     },
     "2 + 2 =": {
       "token_ids": [
-        25,
-        1
+        239428,
+        13385,
+        13385,
+        13385,
+        106905,
+        106905,
+        4861,
+        13385
       ],
-      "text": "<unused19>",
-      "hit_eos": true,
-      "longest_run": 1
+      "text": "\ub8cc\u305f\u3081\u305f\u3081\u305f\u3081\uc11c\ub294\uc11c\ub294 ways\u305f\u3081",
+      "hit_eos": false,
+      "longest_run": 3
     },
     "Once upon a time": {
       "token_ids": [
-        1
+        4861,
+        4861,
+        4861,
+        4861,
+        4861,
+        6114,
+        4861,
+        4861
       ],
-      "text": "",
-      "hit_eos": true,
-      "longest_run": 1
+      "text": " ways ways ways ways ways eyes ways ways",
+      "hit_eos": false,
+      "longest_run": 5
     },
     "def fibonacci(n):": {
       "token_ids": [
-        12,
-        1
+        4861,
+        4861,
+        4861,
+        6114,
+        4861,
+        6114,
+        6114,
+        6114
       ],
-      "text": "<unused6>",
-      "hit_eos": true,
-      "longest_run": 1
+      "text": " ways ways ways eyes ways eyes eyes eyes",
+      "hit_eos": false,
+      "longest_run": 3
     }
   }
 }

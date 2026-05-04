@@ -29,12 +29,26 @@ output, dense MLP output) so a caller — typically
 externally for parity comparison. None ⇒ zero overhead, byte-
 identical to the pre-step-25 path.
 
+Step 26B activated the per-branch norm variants. When `norms` carries
+the optional `pre_ffn_2` / `post_ffn_1` / `post_ffn_2` keys (Gemma 4
+ships them on disk and the loader surfaces them automatically), the
+feedforward block runs as a true parallel architecture:
+
+    h_routed = post_ffn_1(moe(pre_ffn(hidden)))
+    h_dense  = post_ffn_2(mlp(pre_ffn_2(hidden)))
+    h        = post_ffn(h_routed + h_dense)
+    return residual + h
+
+Each branch gets its own input + output norm; `post_ffn` (no suffix)
+acts as the combined output norm on the sum before the residual.
+Layouts without the variants (Mixtral, Qwen, synthetic) take the
+pre-26B fallback path — both branches share `pre_ffn` and the
+unsuffixed `post_ffn` only — bytewise identical to step 24B output.
+
 What is intentionally NOT here:
-  - The `_1` / `_2` parallel-path norm variants the real model
-    carries (one set per parallel feedforward path). Routed and
-    dense paths share `pre_ffn` / `post_ffn` in the standard
-    interpretation; if quality stays bad after 24B, those variants
-    are the next thing to investigate.
+  - `layer_scalar` (one bf16 scalar per layer in the Gemma 4
+    checkpoint, currently unused). Suspected residual scale factor;
+    plumbing it is its own commit.
   - Sliding vs full attention switching is owned by
     `attention_decode_step` (step 23 wired the per-layer kwargs).
 """
@@ -49,34 +63,49 @@ def decoder_decode_step(
     *,
     norms: dict,
     attn_kwargs: dict,
-    moe_call,
+    moe_call=None,
     kv_cache,
     layer_id: int,
     rms_eps: float = 1e-6,
     dense_mlp_call=None,
     trace: dict | None = None,
+    route_call=None,
+    experts_call=None,
+    layer_scalar=None,
 ):
     """Run one decode step of the sandwich-norm decoder block.
 
     `norms`: dict with keys {input, post_attn, pre_ffn, post_ffn},
     each a 1-D ndarray of shape (hidden_dim,) — the four BF16 norm
-    weights for this layer.
+    weights for this layer. Step 26B added optional `pre_ffn_2`,
+    `post_ffn_1`, `post_ffn_2` for the Gemma 4 parallel-branch path.
 
     `attn_kwargs`: keyword arguments to `attention_decode_step`
     *except* `kv_cache` and `layer_id`, which are threaded through
     here so callers can't accidentally pass two layer ids that
     disagree.
 
-    `moe_call`: callable `hidden -> hidden` running this layer's MoE
-    forward. Closure over the layer id, router, expert manager, and
-    backend.
+    Two FFN-block call surfaces, picked by which kwargs are provided:
+
+      - **`moe_call(h) -> hidden`**: combined route + experts in one
+        callable. Used by every pre-step-26B caller (synthetic tests,
+        Mixtral / Qwen demos, the smoke scripts). With this surface
+        the decoder routes on the post-pre-ffn-norm hidden.
+      - **`route_call(h) -> (ids, weights)` + `experts_call(h, ids,
+        weights) -> tensor`**: split surface needed by Gemma 4's
+        actual architecture. The router consumes the RAW post-attn
+        hidden (NOT the pre-ffn-norm version), while experts consume
+        the pre_ffn_2-normalized hidden. Step 26B added this surface
+        because the previous moe_call shape couldn't express the
+        different inputs the two operations want.
 
     `dense_mlp_call`: optional callable `hidden -> hidden` running this
     layer's parallel dense FFN (Gemma 4 ships one alongside the routed
-    MoE). When provided, both branches consume the same
-    `pre_ffn_norm(hidden)` and their outputs are summed before the
-    shared `post_ffn_norm + residual`. None reproduces the pre-step-24
-    routed-only behavior.
+    MoE). Required when running the parallel-arch path.
+
+    `layer_scalar`: optional shape-(1,) bf16/fp32 multiplier applied
+    to the layer's final output (post-residual-add). Gemma 4 layers
+    ship one of these per layer. None ⇒ no multiplier (back-compat).
 
     `trace`: optional dict that, when provided, gets populated in place
     with the raw intermediate tensors useful for parity / debugging:
@@ -86,6 +115,7 @@ def decoder_decode_step(
     step-25 path. The dict is mutated rather than returned so the
     caller can pass a fresh dict per layer.
     """
+    # --- Attention sub-block (unchanged across all paths) ----------
     residual = hidden
     h = rms_norm(hidden, norms["input"], eps=rms_eps, gemma_unit_offset=True)
     h = attention_decode_step(
@@ -97,20 +127,107 @@ def decoder_decode_step(
     hidden = residual + h
 
     residual = hidden
-    h = rms_norm(hidden, norms["pre_ffn"], eps=rms_eps, gemma_unit_offset=True)
-    moe_out = moe_call(h)
-    if trace is not None:
-        trace["moe_out"] = moe_out
-    if dense_mlp_call is not None:
-        # Parallel branches share `pre_ffn` input AND `post_ffn` output;
-        # summing before the post-norm matches the standard interpretation
-        # of Gemma 4's parallel feedforward block.
-        dense_out = dense_mlp_call(h)
+
+    # Step 26B: parallel-branch architecture (matches mlx-lm /
+    # transformers Gemma 4 reference). Activated only when the layout
+    # provides the `_1` / `_2` norm variants AND the caller supplies
+    # the split route_call + experts_call (so the router can consume
+    # the raw post-attn hidden while experts consume the pre_ffn_2
+    # normalized version — the previous combined moe_call couldn't
+    # express that).
+    use_parallel_arch = (
+        dense_mlp_call is not None
+        and route_call is not None
+        and experts_call is not None
+        and "pre_ffn_2" in norms
+        and "post_ffn_1" in norms
+        and "post_ffn_2" in norms
+    )
+
+    if use_parallel_arch:
+        # Dense branch: uses the UNSUFFIXED pre_ffn + post_ffn_1.
+        # (Reference: mlx_lm/models/gemma4_text.py lines 354-356,
+        # `h1 = self.mlp(self.pre_feedforward_layernorm(h))` then
+        # `h1 = self.post_feedforward_layernorm_1(h1)`.)
+        h_dense_in = rms_norm(
+            hidden, norms["pre_ffn"],
+            eps=rms_eps, gemma_unit_offset=True,
+        )
+        dense_out = dense_mlp_call(h_dense_in)
         if trace is not None:
             trace["dense_out"] = dense_out
-        moe_out = moe_out + dense_out
-    h = rms_norm(moe_out, norms["post_ffn"], eps=rms_eps, gemma_unit_offset=True)
-    return residual + h
+        h_dense = rms_norm(
+            dense_out, norms["post_ffn_1"],
+            eps=rms_eps, gemma_unit_offset=True,
+        )
+
+        # Routed branch: uses the `_2` variants. Critical detail —
+        # router runs on RAW `hidden` (the post-attn residual stream),
+        # NOT on the pre_ffn_2-normalized version. This is the bug
+        # the pre-step-26B code path silently had: `moe_call(h_norm)`
+        # forced both router and experts to consume the same
+        # normalized input, but the reference routes on the unnormalized
+        # residual stream.
+        ids, weights = route_call(hidden)
+        if trace is not None:
+            trace["route_ids"] = ids
+            trace["route_weights"] = weights
+        h_routed_in = rms_norm(
+            hidden, norms["pre_ffn_2"],
+            eps=rms_eps, gemma_unit_offset=True,
+        )
+        routed_out = experts_call(h_routed_in, ids, weights)
+        if trace is not None:
+            trace["moe_out"] = routed_out
+        h_routed = rms_norm(
+            routed_out, norms["post_ffn_2"],
+            eps=rms_eps, gemma_unit_offset=True,
+        )
+
+        # Combined output norm on the sum, then residual add.
+        h = rms_norm(
+            h_dense + h_routed, norms["post_ffn"],
+            eps=rms_eps, gemma_unit_offset=True,
+        )
+        result = residual + h
+
+    else:
+        # Pre-step-26B fallback path: synthetic / Mixtral / Qwen / any
+        # caller still passing only `moe_call`. Both branches share
+        # the unsuffixed pre / post norms; routing is done by moe_call
+        # on the pre-ffn-normalized hidden (the inherited behavior
+        # from steps 17D + 24B). Kept byte-identical so non-Gemma 4
+        # tests stay green.
+        if moe_call is None:
+            raise ValueError(
+                "decoder_decode_step requires either moe_call (back-compat) "
+                "or route_call + experts_call + dense_mlp_call + "
+                "_1/_2 norms (parallel-arch path)"
+            )
+        h = rms_norm(
+            hidden, norms["pre_ffn"], eps=rms_eps, gemma_unit_offset=True,
+        )
+        moe_out = moe_call(h)
+        if trace is not None:
+            trace["moe_out"] = moe_out
+        if dense_mlp_call is not None:
+            dense_out = dense_mlp_call(h)
+            if trace is not None:
+                trace["dense_out"] = dense_out
+            moe_out = moe_out + dense_out
+        h = rms_norm(
+            moe_out, norms["post_ffn"], eps=rms_eps, gemma_unit_offset=True,
+        )
+        result = residual + h
+
+    # Step 26B: per-layer scalar multiplier (Gemma 4 ships
+    # `layer_scalar` of shape (1,) per layer; reference applies it
+    # to the final layer output AFTER the FFN-block residual add).
+    # Layouts without the tensor pass None ⇒ no-op.
+    if layer_scalar is not None:
+        result = result * layer_scalar
+
+    return result
 
 
 def single_token_decoder_layer(
