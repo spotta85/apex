@@ -8,63 +8,63 @@
   "prompts": {
     "The capital of France is": {
       "token_ids": [
-        1707,
-        4861,
-        1707,
-        13385,
-        13385,
-        6114,
-        6114,
-        6114
+        3666,
+        862,
+        862,
+        1902,
+        1902,
+        3666,
+        862,
+        862
       ],
-      "text": " fact ways fact\u305f\u3081\u305f\u3081 eyes eyes eyes",
+      "text": " mind el el world world mind el el",
       "hit_eos": false,
-      "longest_run": 3
+      "longest_run": 2
     },
     "2 + 2 =": {
       "token_ids": [
-        239428,
-        13385,
-        13385,
-        13385,
-        106905,
-        106905,
-        4861,
-        13385
+        251,
+        3666,
+        862,
+        4880,
+        3519,
+        4880,
+        3147,
+        3147
       ],
-      "text": "\ub8cc\u305f\u3081\u305f\u3081\u305f\u3081\uc11c\ub294\uc11c\ub294 ways\u305f\u3081",
+      "text": "\r mind el\u064a\u0647\u0441\u044c\u064a\u0647boardboard",
       "hit_eos": false,
-      "longest_run": 3
+      "longest_run": 2
     },
     "Once upon a time": {
       "token_ids": [
-        4861,
-        4861,
-        4861,
-        4861,
-        4861,
-        6114,
-        4861,
-        4861
+        1010,
+        251,
+        251,
+        251,
+        251,
+        3666,
+        251,
+        862
       ],
-      "text": " ways ways ways ways ways eyes ways ways",
+      "text": " been\r\r\r\r mind\r el",
       "hit_eos": false,
-      "longest_run": 5
+      "longest_run": 4
     },
     "def fibonacci(n):": {
       "token_ids": [
-        4861,
-        4861,
-        4861,
-        6114,
-        4861,
-        6114,
-        6114,
-        6114
+        927,
+        927,
+        927,
+        927,
+        927,
+        927,
+        927,
+        927
       ],
-      "text": " ways ways ways eyes ways eyes eyes eyes",
+      "text": " \u0906 \u0906 \u0906 \u0906 \u0906 \u0906 \u0906 \u0906",
       "hit_eos": false,
-      "longest_run": 3
+      "longest_run": 8
     }
   }
 }

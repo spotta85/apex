@@ -99,6 +99,19 @@ class ModelConfig:
     # compounds quickly across 30 decoder layers.
     hidden_activation: str
 
+    # --- Step 26C: model_type + embedding scale -------------------------
+    # `model_type` from text_config (e.g. "gemma4_text", "mixtral",
+    # "qwen2_moe"). Used to pick architecture-specific behaviors that
+    # aren't on a single config flag.
+    model_type: str
+    # `embed_scale`: multiplier applied to the embedding output at
+    # model entry. Gemma family multiplies by `sqrt(hidden_size)` (a
+    # large factor — ~53 on Gemma 4 26B). Mixtral / Qwen don't, so
+    # default 1.0 for non-Gemma layouts. Without this scale the
+    # residual stream enters the first decoder layer at ~1/53 of the
+    # magnitude the model expects.
+    embed_scale: float
+
     @classmethod
     def from_path(cls, path, *, layout_name=None) -> "ModelConfig":
         """Detect layout, read text_config, return a fully-populated ModelConfig.
@@ -184,6 +197,18 @@ class ModelConfig:
             "hidden_activation", text_cfg.get("hidden_act", "silu"),
         )
 
+        # Step 26C: model type drives architecture-specific behaviors
+        # not captured by a single flag. `gemma` family scales
+        # embeddings by sqrt(hidden_size) at model entry; others
+        # don't. Default to "" so synthetic / Mixtral configs that
+        # omit the field stay scale-1.0.
+        model_type = str(text_cfg.get("model_type", ""))
+        embed_scale = (
+            float(text_cfg["hidden_size"]) ** 0.5
+            if model_type.startswith("gemma")
+            else 1.0
+        )
+
         return cls(
             path=path,
             layout_name=resolved_layout_name,
@@ -217,6 +242,8 @@ class ModelConfig:
             rope_theta_full=rope_theta_full,
             sliding_window=sliding_window,
             hidden_activation=str(hidden_activation),
+            model_type=model_type,
+            embed_scale=embed_scale,
         )
 
     @property

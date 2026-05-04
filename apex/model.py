@@ -555,6 +555,14 @@ class MoEModel:
         """
         config = self.config
         hidden = embed_token(self.embedding, token_id)
+        # Step 26C: Gemma family scales embeddings by sqrt(hidden_size)
+        # at model entry (mlx_lm/models/gemma4_text.py:528, `h * embed_scale`
+        # where embed_scale = config.hidden_size ** 0.5). Without this
+        # the first layer's input_layernorm sees magnitudes ~53x smaller
+        # than the model expects, which then compounds at every layer.
+        # Non-Gemma layouts get embed_scale=1.0 (no-op).
+        if config.embed_scale != 1.0:
+            hidden = hidden * config.embed_scale
         for layer_id in range(self.num_layers):
             attn_weights = self.per_layer_attn[layer_id]
             norms = self.per_layer_norms[layer_id]
