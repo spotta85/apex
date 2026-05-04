@@ -17,13 +17,15 @@ sampling: `softcap * tanh(logits / softcap)`. Gemma 4 uses
 post-softcap logits stay bounded in (-softcap, softcap), which
 prevents the soft-max from collapsing onto a few peaky values.
 
-`sample_argmax` is the deterministic baseline; future variants
-(temperature, top-k/top-p) compose naturally on top of `final_logits`.
+`sample_argmax` is re-exported from `apex.sampling` so existing
+demo imports keep working; new code that needs temperature should
+import `apex.sampling.sample` directly.
 """
 
 import numpy as np
 
 from apex.ops import linear
+from apex.sampling import sample_argmax  # noqa: F401  (re-export)
 
 
 def embed_token(embedding, token_id: int):
@@ -52,8 +54,3 @@ def final_logits(hidden, embedding, *, softcap=None):
     if softcap is not None:
         logits = softcap * np.tanh(logits / softcap)
     return logits
-
-
-def sample_argmax(logits) -> int:
-    """Greedy next-token id: argmax along the last axis, batch=1."""
-    return int(np.argmax(logits, axis=-1).item())
