@@ -92,6 +92,19 @@ class _MoELayoutBase:
             "down_proj": self.expert_down_proj(layer_id, expert_id),
         }
 
+    # --- Optional step-24 router stabilizers ---------------------------
+    # Default to None so layouts that don't carry these tensors (every
+    # synthetic / Mixtral / Qwen layout) keep working untouched. Real
+    # Gemma 4 overrides both in GemmaHFMoELayout.
+
+    def router_scale(self, layer_id: int) -> str | None:
+        """Tensor name for `router.scale` (per-feature, shape (hidden,))."""
+        return None
+
+    def router_per_expert_scale(self, layer_id: int) -> str | None:
+        """Tensor name for `router.per_expert_scale` (shape (num_experts,))."""
+        return None
+
 
 class FakeMoELayout(_MoELayoutBase):
     """Layout used by APEX's scripts/make_fake_*_moe.py setup scripts.
@@ -344,6 +357,16 @@ class GemmaHFMoELayout(_MoELayoutBase):
             "scales": f"{prefix}.scales",
             "biases": f"{prefix}.biases",
         }
+
+    def router_scale(self, layer_id: int) -> str:
+        # bf16 vector of shape (hidden_size,). Multiplied element-wise
+        # into hidden BEFORE the router projection (step 24A).
+        return f"language_model.model.layers.{layer_id}.router.scale"
+
+    def router_per_expert_scale(self, layer_id: int) -> str:
+        # bf16 vector of shape (num_experts,). Multiplied element-wise
+        # into projected logits BEFORE top-k (step 24A).
+        return f"language_model.model.layers.{layer_id}.router.per_expert_scale"
 
     def expert_gate_proj(self, layer_id: int, expert_id: int) -> str:
         return f"language_model.model.layers.{layer_id}.experts.switch_glu.gate_proj.weight"
