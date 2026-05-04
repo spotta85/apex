@@ -26,8 +26,14 @@ What is intentionally NOT here:
   - Sliding-window attention scope limit (Gemma 4 sliding layers
     cap attention to the last 1024 tokens). For decode demos with
     seq < 1024 this is moot.
-  - Full-attention layers (Gemma 4 layers 5/11/17/23/29 tie K=V,
-    head_dim=512, partial_rotary_factor=0.25, theta=1e6).
+
+Step 23 added support for Gemma 4 full_attention layers via three
+keyword args without forking the function:
+  - `v_weight=None` ⇒ K/V tied (full layers don't ship a v_proj on
+    disk; we project once via k_weight and use it for both).
+  - `rotary_dim` plumbs through to `apply_rope` for partial RoPE
+    (full layers rotate only `head_dim * partial_rotary_factor` dims).
+  - `head_dim`/`num_kv_heads`/`rope_theta` are already per-call.
 """
 
 import numpy as np
@@ -52,6 +58,7 @@ def attention_decode_step(
     k_norm_weight=None,
     rms_eps: float = 1e-6,
     rope_theta: float = 10000.0,
+    rotary_dim: int | None = None,
 ):
     """One decode step of self-attention with a KVCache.
 
@@ -66,21 +73,31 @@ def attention_decode_step(
     with explicit masking — not implemented yet.
 
     `rope_theta` defaults to 10000.0 to match Gemma 4 sliding-attention
-    layers. Full-attention layers use a different theta + partial
-    rotation; passing `theta` here is the surface for that path even
-    though the full layer kind isn't yet supported end-to-end.
+    layers. Full-attention layers pass 1e6 with `rotary_dim < head_dim`
+    (partial RoPE). Both options thread cleanly through `apply_rope`.
+
+    `v_weight=None` enables the K=V-tied path used by Gemma 4
+    full_attention layers (which don't ship a v_proj). When None,
+    `k_weight` is used for both K and V — one matmul instead of two,
+    consistent with how the model was trained.
+
+    `rotary_dim=None` rotates the full head_dim (sliding behavior).
+    Pass an integer < head_dim for partial RoPE (full layers).
     """
-    # Project — each result is (1, num_heads_x * head_dim).
+    # Project Q always; project K once. V either gets its own
+    # projection or is aliased to K below (after k_norm, before RoPE)
+    # for the `attention_k_eq_v` path.
     q = linear(hidden, q_weight)
     k = linear(hidden, k_weight)
-    v = linear(hidden, v_weight)
+    v = None if v_weight is None else linear(hidden, v_weight)
 
     # Reshape to (1, num_heads_x, 1, head_dim). The seq=1 axis is
     # explicit so RoPE can broadcast over it and KVCache.append can
     # concatenate along it on subsequent decode steps.
     q = q.reshape(1, num_heads, 1, head_dim)
     k = k.reshape(1, num_kv_heads, 1, head_dim)
-    v = v.reshape(1, num_kv_heads, 1, head_dim)
+    if v is not None:
+        v = v.reshape(1, num_kv_heads, 1, head_dim)
 
     # Per-head Q/K RMSNorm along the head_dim axis. Gemma 4 stores
     # these and they control attention-score magnitude — without them
@@ -92,13 +109,33 @@ def attention_decode_step(
     if k_norm_weight is not None:
         k = rms_norm(k, k_norm_weight, eps=rms_eps, gemma_unit_offset=True)
 
+    # K=V-tied path: V picks up the post-norm K but NOT RoPE. Alias
+    # before the RoPE rebind below so V keeps the un-rotated values.
+    if v is None:
+        v = k
+
     # RoPE at this token's position in the sequence — the cache's
     # current length IS the next position (0-indexed). At position 0
     # RoPE is identity, which keeps step 16's smoke math correct
     # when wired through this code path with an empty cache.
+    # `rotary_dim` is None for sliding (full rotation) or
+    # `head_dim * partial_rotary_factor` for full (partial rotation).
+    #
+    # Q and K both get RoPE so the q·k dot product carries positional
+    # information. V deliberately does NOT — that's the standard
+    # transformer convention. In the K=V-tied path, `v` was aliased
+    # before this block to the un-rotated projection, so the rebind
+    # below leaves V with its pre-RoPE values (correct semantic;
+    # only K rotates).
     position_offset = kv_cache.length(layer_id)
-    q = apply_rope(q, position_offset=position_offset, theta=rope_theta)
-    k = apply_rope(k, position_offset=position_offset, theta=rope_theta)
+    q = apply_rope(
+        q, position_offset=position_offset,
+        theta=rope_theta, rotary_dim=rotary_dim,
+    )
+    k = apply_rope(
+        k, position_offset=position_offset,
+        theta=rope_theta, rotary_dim=rotary_dim,
+    )
 
     # Commit this step's k/v to the cache before reading; the new
     # token attends to itself too (the canonical "attend to all

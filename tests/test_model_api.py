@@ -84,13 +84,18 @@ def test_real_from_pretrained_loads_config(real_model):
 
 
 @skip_if_no_real_checkpoint()
-def test_real_from_pretrained_caps_num_layers_at_sliding(real_model):
-    """num_layers > sliding cap is rejected with a clear message."""
-    with pytest.raises(ValueError, match="exceeds the .* sliding-attention"):
+def test_real_from_pretrained_caps_num_layers_at_total(real_model):
+    """num_layers > total decoder layer count is rejected with a clear message.
+
+    Step 23 lifted the sliding-only cap; both attention kinds are
+    supported now, but asking for more layers than the checkpoint has
+    is still a fast ValueError.
+    """
+    with pytest.raises(ValueError, match="exceeds the .* decoder layers"):
         apex.MoEModel.from_pretrained(
             real_checkpoint_path(),
             max_memory_gb=2.0,
-            num_layers=99,
+            num_layers=999,
             verbose=False,
         )
 

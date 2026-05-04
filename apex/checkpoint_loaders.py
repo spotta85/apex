@@ -118,7 +118,7 @@ def load_layer_norms(path, layout, layer_id: int) -> dict:
     }
 
 
-def load_attention_weights(path, layout, layer_id: int) -> dict:
+def load_attention_weights(path, layout, layer_id: int, *, k_eq_v: bool = False) -> dict:
     """Load + dequantize layer `layer_id`'s q/k/v/o + q_norm/k_norm.
 
     Returns a dict with keys {q_weight, k_weight, v_weight, o_weight,
@@ -127,6 +127,12 @@ def load_attention_weights(path, layout, layer_id: int) -> dict:
     BF16. Mirrors `apex.real_router.MultiLayerRealRouter._load_router_weight`
     (the same `QuantizedTensor` + `dequantize` pattern, just over four
     projections instead of one).
+
+    `k_eq_v=True` (step 23) is for Gemma 4 full_attention layers where
+    V is tied to K and there is no `v_proj` on disk. The returned dict
+    sets `v_weight=None` — `attention_decode_step` interprets that as
+    "alias K to V after k_norm". Sliding-attention layers always pass
+    `k_eq_v=False` (the default) since they do ship a v_proj.
     """
     path = Path(path)
     weight_map = read_safetensors_index(path)
@@ -147,7 +153,9 @@ def load_attention_weights(path, layout, layer_id: int) -> dict:
     return {
         "q_weight": _load_proj(layout.attn_q_proj_tensors(layer_id)),
         "k_weight": _load_proj(layout.attn_k_proj_tensors(layer_id)),
-        "v_weight": _load_proj(layout.attn_v_proj_tensors(layer_id)),
+        "v_weight": (
+            None if k_eq_v else _load_proj(layout.attn_v_proj_tensors(layer_id))
+        ),
         "o_weight": _load_proj(layout.attn_o_proj_tensors(layer_id)),
         "q_norm": _load(layout.attn_q_norm(layer_id)),
         "k_norm": _load(layout.attn_k_norm(layer_id)),

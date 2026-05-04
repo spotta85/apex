@@ -1,21 +1,27 @@
-"""Step 21 benchmark: layer-count vs latency / memory on real Gemma 4.
+"""Step 21/23 benchmark: layer-count vs latency / memory on real Gemma 4.
 
-Sweeps `num_layers` ∈ {1, 2, 4} (or whatever the user passes) and
-prints a single comparison table:
+Sweeps `num_layers` (default {1, 2, 4}; pass `--layers 8 16 30` for
+the step 23 full-attention sweep) and prints a single table:
 
-    L | load (s) | gen (s) | tok/s | peak expert | peak total | evictions
-    1 |    27.3  |   3.1   | 0.97  |  385 MB     |  385 MB    |    0
-    2 |    27.5  |   6.1   | 0.49  |  613 MB     |  613 MB    |    0
-    4 |    27.9  |  12.5   | 0.24  | 1202 MB     | 1203 MB    |    0
+    L | load(s) | gen(s) | tok/s | peak expert | kv | peak total | evict | finite | budget
+
+Step 23 unlocked layer counts > 5 (sliding cap on Gemma 4); the
+sweep now mixes sliding + full_attention layers when L ≥ 6, so
+per-trial peak expert grows non-uniformly (full layers have a
+different MoE weight footprint than sliding layers).
 
 The expensive piece is embedding dequant (~3 GB), which dominates
-load time and is constant across L. Decode time scales roughly
-linearly with L (each token does L attention + L MoE passes).
+load time and is constant across L on first run, then mostly
+amortized by OS page cache on subsequent loads.
 
 Run:
     uv run python scripts/benchmark_layer_scaling.py \
         --path /Users/spotta/Desktop/models/gemma4/gemma-4-26b-a4b-it-nvfp4 \
         --max-tokens 3 --max-memory-gb 4 --layers 1 2 4
+    # or for the step 23 unlock:
+    uv run python scripts/benchmark_layer_scaling.py \
+        --path /Users/spotta/Desktop/models/gemma4/gemma-4-26b-a4b-it-nvfp4 \
+        --max-tokens 2 --max-memory-gb 8 --layers 8 16 30
 """
 
 import argparse

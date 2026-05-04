@@ -44,6 +44,11 @@ def test_audit_script_runs_on_real_checkpoint():
         "q heads: 16",
         "kv heads: 8",
         "rope theta (sliding): 10000",
+        # Step 23: full-attention extras now appear as ✓ rows.
+        "full-attn global_head_dim: 512",
+        "full-attn num_global_key_value_heads: 2",
+        "full-attn rope_theta: 1000000",
+        "full-attn partial_rotary_factor: 0.25",
         "[ok] audit complete",
     ]:
         assert needle in out, f"missing {needle!r} in audit output"

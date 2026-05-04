@@ -45,3 +45,43 @@ def test_from_path_is_frozen():
     cfg = ModelConfig.from_path(real_checkpoint_path())
     with pytest.raises(Exception):
         cfg.hidden_size = 1  # frozen dataclass disallows assignment
+
+
+# --- Step 23A: full_attention extras --------------------------------------
+
+@skip_if_no_real_checkpoint()
+def test_full_attention_extras_match_gemma4_known_values():
+    cfg = ModelConfig.from_path(real_checkpoint_path())
+    assert cfg.head_dim_full == 512
+    assert cfg.num_kv_heads_full == 2
+    assert cfg.attention_k_eq_v is True
+    assert cfg.partial_rotary_factor_full == 0.25
+    assert cfg.rope_theta_full == 1_000_000.0
+
+
+@skip_if_no_real_checkpoint()
+def test_per_layer_accessors_distinguish_sliding_vs_full():
+    cfg = ModelConfig.from_path(real_checkpoint_path())
+    # Layer 0 = sliding
+    assert not cfg.is_full_attention(0)
+    assert cfg.head_dim_for_layer(0) == cfg.head_dim
+    assert cfg.num_kv_heads_for_layer(0) == cfg.num_kv_heads
+    assert cfg.rope_theta_for_layer(0) == cfg.rope_theta_sliding
+    assert cfg.rotary_dim_for_layer(0) == cfg.head_dim  # full rotation
+    assert not cfg.attention_k_eq_v_for_layer(0)
+    # Layer 5 = full
+    assert cfg.is_full_attention(5)
+    assert cfg.head_dim_for_layer(5) == 512
+    assert cfg.num_kv_heads_for_layer(5) == 2
+    assert cfg.rope_theta_for_layer(5) == 1_000_000.0
+    # 512 * 0.25 = 128 rotated dims
+    assert cfg.rotary_dim_for_layer(5) == 128
+    assert cfg.attention_k_eq_v_for_layer(5)
+
+
+@skip_if_no_real_checkpoint()
+def test_out_of_range_layer_treated_as_sliding():
+    """Defensive: OOB layer_id falls back to sliding semantics, no crash."""
+    cfg = ModelConfig.from_path(real_checkpoint_path())
+    assert not cfg.is_full_attention(9999)
+    assert cfg.head_dim_for_layer(9999) == cfg.head_dim

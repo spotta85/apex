@@ -10,15 +10,21 @@ generation loop can read them as plain attributes without poking back
 into JSON. Whatever the underlying file calls a thing, we surface it
 under a stable Python name.
 
-Two Gemma 4 quirks worth noting:
+Three Gemma 4 quirks worth noting:
 
   - `eos_token_id` may be a scalar (1) or a list ([1, 106, 50]) on disk;
     `.eos_token_ids` is always a tuple so the decode loop can `if id
     in self.config.eos_token_ids`.
   - Per-layer RoPE: Gemma 4 uses different `rope_theta` for sliding
-    vs full attention. We surface only the sliding value here because
-    full_attention layers (5+) aren't supported by the runtime yet
-    (they tie K=V and use partial RoPE — a separate sprint).
+    vs full attention (10000 vs 1e6). Both are exposed; consumers
+    pick via `rope_theta_for_layer(L)`.
+  - Full-attention extras (step 23): on top of a different head_dim
+    (`global_head_dim`, e.g. 512), full layers also have a different
+    KV-head count (`num_global_key_value_heads`, e.g. 2 instead of 8),
+    tie K=V (`attention_k_eq_v=True`, no `v_proj` on disk), and use
+    partial RoPE (`partial_rotary_factor=0.25`). The per-layer
+    accessors `head_dim_for_layer`, `num_kv_heads_for_layer`,
+    `rotary_dim_for_layer`, `rope_theta_for_layer` hide the branch.
 """
 
 from dataclasses import dataclass
@@ -56,6 +62,25 @@ class ModelConfig:
     eos_token_ids: tuple
 
     rope_theta_sliding: float
+
+    # --- Step 23: full_attention extras ---
+    # `global_head_dim`: head_dim used by full_attention layers.
+    # On Gemma 4 = 512 (vs 256 for sliding).
+    head_dim_full: int
+    # `num_global_key_value_heads`: KV-head count for full layers.
+    # On Gemma 4 = 2 (vs 8 for sliding).
+    num_kv_heads_full: int
+    # `attention_k_eq_v`: when True, full_attention layers don't have
+    # `v_proj` on disk — V is tied to K (a memory + compute saving
+    # the model was trained with).
+    attention_k_eq_v: bool
+    # `partial_rotary_factor`: fraction of head_dim that gets RoPE.
+    # On Gemma 4 = 0.25 → first 128 of 512 dims rotated, last 384 left
+    # alone (the unrotated dims absorb position-invariant features).
+    partial_rotary_factor_full: float
+    # Different RoPE base for full_attention. Bigger base = longer
+    # frequency wavelengths = better long-range positional sensitivity.
+    rope_theta_full: float
 
     @classmethod
     def from_path(cls, path, *, layout_name=None) -> "ModelConfig":
@@ -98,11 +123,35 @@ class ModelConfig:
         else:
             eos_ids = (int(eos),)
 
-        # Gemma 4 nests RoPE per layer-type; sliding is the only path
-        # the runtime exercises today.
+        # Gemma 4 nests RoPE per layer-type. Step 23 wires the
+        # full_attention values too; pre-step-23 only the sliding
+        # value was consumed.
         rope = text_cfg.get("rope_parameters", {})
         sliding_rope = rope.get("sliding_attention", {})
         rope_theta_sliding = float(sliding_rope.get("rope_theta", 10000.0))
+        full_rope = rope.get("full_attention", {})
+        # `partial_rotary_factor` is only present for full_attention
+        # in Gemma 4; default to 1.0 (full rotation) for layouts that
+        # omit it.
+        partial_factor_full = float(
+            full_rope.get("partial_rotary_factor", 1.0)
+        )
+        rope_theta_full = float(full_rope.get("rope_theta", rope_theta_sliding))
+
+        # Full-attention shape extras. Default to the sliding values
+        # when the model doesn't differentiate (most non-Gemma models),
+        # so checkpoints with a homogeneous attention shape continue
+        # to work without touching these knobs.
+        head_dim_full = int(
+            text_cfg.get("global_head_dim", text_cfg["head_dim"])
+        )
+        num_kv_heads_full = int(
+            text_cfg.get(
+                "num_global_key_value_heads",
+                text_cfg["num_key_value_heads"],
+            )
+        )
+        attention_k_eq_v = bool(text_cfg.get("attention_k_eq_v", False))
 
         return cls(
             path=path,
@@ -130,16 +179,23 @@ class ModelConfig:
             ),
             eos_token_ids=eos_ids,
             rope_theta_sliding=rope_theta_sliding,
+            head_dim_full=head_dim_full,
+            num_kv_heads_full=num_kv_heads_full,
+            attention_k_eq_v=attention_k_eq_v,
+            partial_rotary_factor_full=partial_factor_full,
+            rope_theta_full=rope_theta_full,
         )
 
     @property
     def num_sliding_layers(self) -> int:
         """Count of leading layers using sliding_attention.
 
-        The runtime only supports sliding-attention layers today; this
-        is the natural cap for `num_layers` in `from_pretrained`. On
-        Gemma 4 this returns 5 (layers 0-4 are sliding, layer 5 is
-        full_attention with K=V tied).
+        Used historically (pre-step-23) as the cap for `num_layers`
+        in `from_pretrained` because the runtime only supported
+        sliding-attention layers. As of step 23 the runtime also
+        supports `full_attention` layers, so the relevant cap is
+        `num_hidden_layers`. This property still describes the
+        contiguous prefix of sliding layers; on Gemma 4 it returns 5.
         """
         count = 0
         for kind in self.layer_types:
@@ -148,3 +204,55 @@ class ModelConfig:
             else:
                 break
         return count
+
+    def is_full_attention(self, layer_id: int) -> bool:
+        """Whether `layer_id` uses full_attention (vs sliding_attention).
+
+        Out-of-range layer ids return False — defensive default for
+        configs that don't include `layer_types` (every layer is
+        treated as sliding-style). Real Gemma 4 always provides the
+        list, so the fallback is a safety net for synthetic configs.
+        """
+        if 0 <= layer_id < len(self.layer_types):
+            return self.layer_types[layer_id] == "full_attention"
+        return False
+
+    def head_dim_for_layer(self, layer_id: int) -> int:
+        """Per-layer head_dim. Full layers use `head_dim_full`."""
+        return self.head_dim_full if self.is_full_attention(layer_id) else self.head_dim
+
+    def num_kv_heads_for_layer(self, layer_id: int) -> int:
+        """Per-layer KV head count. Full layers may shrink to `num_kv_heads_full`."""
+        return (
+            self.num_kv_heads_full
+            if self.is_full_attention(layer_id)
+            else self.num_kv_heads
+        )
+
+    def rope_theta_for_layer(self, layer_id: int) -> float:
+        """Per-layer RoPE base. Full layers use `rope_theta_full`."""
+        return (
+            self.rope_theta_full
+            if self.is_full_attention(layer_id)
+            else self.rope_theta_sliding
+        )
+
+    def rotary_dim_for_layer(self, layer_id: int) -> int:
+        """How many of head_dim's dims are rotated by RoPE for `layer_id`.
+
+        Sliding layers always rotate the full head_dim (factor=1.0).
+        Full layers use `partial_rotary_factor_full` (Gemma 4: 0.25
+        of 512 = 128). Result is always even — RoPE rotates pairs.
+        """
+        head_dim = self.head_dim_for_layer(layer_id)
+        if self.is_full_attention(layer_id):
+            rotary_dim = int(head_dim * self.partial_rotary_factor_full)
+            # RoPE pairs adjacent halves; force even.
+            if rotary_dim % 2 != 0:
+                rotary_dim -= 1
+            return rotary_dim
+        return head_dim
+
+    def attention_k_eq_v_for_layer(self, layer_id: int) -> bool:
+        """Whether `layer_id` ties V to K (no v_proj on disk)."""
+        return self.attention_k_eq_v and self.is_full_attention(layer_id)

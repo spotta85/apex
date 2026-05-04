@@ -137,22 +137,40 @@ def main():
     full = sum(1 for kind in config.layer_types if kind == "full_attention")
     _info("total layers", len(config.layer_types))
     _info(f"sliding (supported, 0-{sliding-1})", sliding)
-    _info(f"full (NOT yet supported)", full)
+    _info("full (supported as of step 23)", full)
     if full > 0:
-        full_attn_extras = {
-            "attention_k_eq_v": text_raw.get("attention_k_eq_v"),
-            "global_head_dim": text_raw.get("global_head_dim"),
-            "rope_theta_full":
-                rope.get("full_attention", {}).get("rope_theta"),
-            "partial_rotary_factor":
-                rope.get("full_attention", {}).get("partial_rotary_factor"),
-        }
-        for k, v in full_attn_extras.items():
-            _info(f"  full-attn {k}", v)
+        # Step 23 turned these from info-only to ✓ rows; the runtime
+        # consumes them per-layer via `config.*_for_layer(L)`.
+        _row(config.attention_k_eq_v == bool(text_raw.get("attention_k_eq_v")),
+             "  full-attn attention_k_eq_v", config.attention_k_eq_v)
+        _row(config.head_dim_full == text_raw.get("global_head_dim"),
+             "  full-attn global_head_dim", config.head_dim_full)
+        _row(
+            config.num_kv_heads_full
+                == text_raw.get("num_global_key_value_heads"),
+            "  full-attn num_global_key_value_heads",
+            config.num_kv_heads_full,
+        )
+        _row(
+            config.rope_theta_full
+                == rope.get("full_attention", {}).get("rope_theta"),
+            "  full-attn rope_theta",
+            config.rope_theta_full,
+        )
+        _row(
+            config.partial_rotary_factor_full
+                == rope.get("full_attention", {}).get("partial_rotary_factor"),
+            "  full-attn partial_rotary_factor",
+            config.partial_rotary_factor_full,
+        )
+        rotary_dim = int(
+            config.head_dim_full * config.partial_rotary_factor_full,
+        )
+        _info("  full-attn rotary_dim (derived)", rotary_dim)
 
     print()
-    print(f"max generate(num_layers): {config.num_sliding_layers} "
-          f"(sliding-attention cap)")
+    print(f"max generate(num_layers): {config.num_hidden_layers} "
+          f"(both sliding + full attention)")
     print()
     print("[ok] audit complete")
 

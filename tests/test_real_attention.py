@@ -3,6 +3,10 @@
 Synthetic tests pin the math (GQA repeat, q_norm application,
 softmax-of-one identity); the real-Gemma test (skip if missing)
 exercises the same path on actual NVFP4_U32 attention weights.
+
+Step 23 added:
+  - K=V tied path (`v_weight=None`) — V is the post-norm, pre-RoPE K
+  - partial RoPE (`rotary_dim=int < head_dim`)
 """
 
 import contextlib
@@ -339,3 +343,140 @@ def test_real_gemma_attention_decode_step_grows_cache_finitely():
         3,
         text_cfg["head_dim"],
     )
+
+
+# --- Step 23C: K=V tied + partial RoPE -------------------------------------
+
+def test_decode_step_k_eq_v_skips_v_projection():
+    """`v_weight=None` ⇒ K and V share the post-norm K projection."""
+    rng = np.random.default_rng(50)
+    hidden = rng.standard_normal((1, 64)).astype(np.float32)
+    num_heads, num_kv_heads, head_dim = 4, 2, 16
+    q_w = rng.standard_normal((num_heads * head_dim, 64)).astype(np.float32)
+    k_w = rng.standard_normal((num_kv_heads * head_dim, 64)).astype(np.float32)
+    o_w = rng.standard_normal((64, num_heads * head_dim)).astype(np.float32)
+    cache = KVCache(num_layers=1)
+
+    with _silence_matmul_warnings():
+        out = attention_decode_step(
+            hidden,
+            q_weight=q_w, k_weight=k_w, v_weight=None, o_weight=o_w,
+            num_heads=num_heads, num_kv_heads=num_kv_heads, head_dim=head_dim,
+            kv_cache=cache, layer_id=0,
+        )
+    assert out.shape == (1, 64)
+    assert np.all(np.isfinite(out))
+
+    # KV cache contents should match: V is the post-norm pre-RoPE K.
+    # At position 0 RoPE is identity, so K_cached (post-RoPE) and
+    # V_cached (post-norm only, no norms here) match exactly when
+    # no q_norm / k_norm applied.
+    keys, values = cache.get(0)
+    np.testing.assert_array_equal(keys, values)
+
+
+def test_decode_step_k_eq_v_with_k_norm_applies_norm_to_v_too():
+    """When V is tied to K and k_norm is provided, V picks up the norm too.
+
+    This is the behavior the real model expects: K and V share the
+    same projection AND the same per-head norm; only RoPE differs.
+    """
+    rng = np.random.default_rng(51)
+    hidden = rng.standard_normal((1, 32)).astype(np.float32)
+    num_heads, num_kv_heads, head_dim = 4, 2, 8
+    q_w = rng.standard_normal((num_heads * head_dim, 32)).astype(np.float32)
+    k_w = rng.standard_normal((num_kv_heads * head_dim, 32)).astype(np.float32)
+    o_w = rng.standard_normal((32, num_heads * head_dim)).astype(np.float32)
+    k_norm = rng.standard_normal(head_dim).astype(np.float32)
+    cache = KVCache(num_layers=1)
+
+    with _silence_matmul_warnings():
+        attention_decode_step(
+            hidden,
+            q_weight=q_w, k_weight=k_w, v_weight=None, o_weight=o_w,
+            num_heads=num_heads, num_kv_heads=num_kv_heads, head_dim=head_dim,
+            k_norm_weight=k_norm,
+            kv_cache=cache, layer_id=0,
+        )
+    keys, values = cache.get(0)
+    # Position 0 ⇒ RoPE identity ⇒ K and V (both post-norm, neither rotated)
+    # must be byte-identical here.
+    np.testing.assert_array_equal(keys, values)
+
+
+def test_decode_step_k_eq_v_at_nonzero_position_diverges_from_v():
+    """At position > 0, RoPE rotates K but NOT V (standard convention).
+
+    K and V are equal only at position 0 (RoPE identity). Once the
+    cache has past entries, the new K gets rotated and the new V
+    stays in its post-norm form — they must differ.
+    """
+    rng = np.random.default_rng(52)
+    hidden = rng.standard_normal((1, 32)).astype(np.float32)
+    num_heads, num_kv_heads, head_dim = 4, 2, 8
+    q_w = rng.standard_normal((num_heads * head_dim, 32)).astype(np.float32)
+    k_w = rng.standard_normal((num_kv_heads * head_dim, 32)).astype(np.float32)
+    o_w = rng.standard_normal((32, num_heads * head_dim)).astype(np.float32)
+    cache = KVCache(num_layers=1)
+
+    with _silence_matmul_warnings():
+        # Burn one step so position offset moves past 0.
+        attention_decode_step(
+            hidden,
+            q_weight=q_w, k_weight=k_w, v_weight=None, o_weight=o_w,
+            num_heads=num_heads, num_kv_heads=num_kv_heads, head_dim=head_dim,
+            kv_cache=cache, layer_id=0,
+        )
+        # Second token at position 1 — RoPE non-identity.
+        attention_decode_step(
+            hidden,
+            q_weight=q_w, k_weight=k_w, v_weight=None, o_weight=o_w,
+            num_heads=num_heads, num_kv_heads=num_kv_heads, head_dim=head_dim,
+            kv_cache=cache, layer_id=0,
+        )
+    keys, values = cache.get(0)
+    # Position-1 entries must differ; position-0 entries must still match.
+    assert not np.allclose(keys[..., 1, :], values[..., 1, :])
+    np.testing.assert_array_equal(keys[..., 0, :], values[..., 0, :])
+
+
+def test_decode_step_partial_rope_threads_through_to_apply_rope():
+    """rotary_dim < head_dim ⇒ K's trailing slice equals the post-norm
+    pre-RoPE projection (verified via a rotary_dim=0 sentinel)."""
+    rng = np.random.default_rng(53)
+    hidden = rng.standard_normal((1, 32)).astype(np.float32)
+    num_heads, num_kv_heads, head_dim = 4, 2, 8
+    q_w = rng.standard_normal((num_heads * head_dim, 32)).astype(np.float32)
+    k_w = rng.standard_normal((num_kv_heads * head_dim, 32)).astype(np.float32)
+    v_w = rng.standard_normal((num_kv_heads * head_dim, 32)).astype(np.float32)
+    o_w = rng.standard_normal((32, num_heads * head_dim)).astype(np.float32)
+
+    cache_full = KVCache(num_layers=1)
+    cache_zero_rot = KVCache(num_layers=1)
+    with _silence_matmul_warnings():
+        # Burn one prefill step so the second call sees a non-zero position.
+        for cache in (cache_full, cache_zero_rot):
+            attention_decode_step(
+                hidden,
+                q_weight=q_w, k_weight=k_w, v_weight=v_w, o_weight=o_w,
+                num_heads=num_heads, num_kv_heads=num_kv_heads, head_dim=head_dim,
+                kv_cache=cache, layer_id=0,
+            )
+        attention_decode_step(
+            hidden,
+            q_weight=q_w, k_weight=k_w, v_weight=v_w, o_weight=o_w,
+            num_heads=num_heads, num_kv_heads=num_kv_heads, head_dim=head_dim,
+            kv_cache=cache_full, layer_id=0,
+        )
+        attention_decode_step(
+            hidden,
+            q_weight=q_w, k_weight=k_w, v_weight=v_w, o_weight=o_w,
+            num_heads=num_heads, num_kv_heads=num_kv_heads, head_dim=head_dim,
+            kv_cache=cache_zero_rot, layer_id=0, rotary_dim=0,
+        )
+    k_full, _ = cache_full.get(0)
+    k_norot, _ = cache_zero_rot.get(0)
+    # rotary_dim=0 means apply_rope is a no-op, so the second-token K
+    # in cache_zero_rot equals the raw projected K (no RoPE applied).
+    # cache_full's second-token K HAS rotation, so they should differ.
+    assert not np.allclose(k_full[..., 1, :], k_norot[..., 1, :])

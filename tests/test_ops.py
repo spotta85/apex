@@ -198,5 +198,79 @@ def test_apply_rope_odd_head_dim_raises():
     # Pair-rotation requires an even head_dim; surface a clear error
     # rather than producing a silently truncated rotation.
     x = np.zeros((1, 1, 1, 7), dtype=np.float32)
-    with pytest.raises(ValueError, match="head_dim must be even"):
+    with pytest.raises(ValueError, match="rotary_dim must be even"):
         apply_rope(x, position_offset=0)
+
+
+# --- Step 23B: partial RoPE -------------------------------------------------
+
+def test_apply_rope_partial_passes_through_tail_unchanged():
+    """rotary_dim < head_dim ⇒ the trailing slice must be untouched."""
+    rng = np.random.default_rng(7)
+    head_dim, rotary_dim = 16, 8
+    x = rng.standard_normal((1, 2, 3, head_dim)).astype(np.float32)
+    out = apply_rope(x, position_offset=5, rotary_dim=rotary_dim)
+    np.testing.assert_array_equal(out[..., rotary_dim:], x[..., rotary_dim:])
+
+
+def test_apply_rope_partial_rotates_only_the_first_slice():
+    """The first `rotary_dim` features must change; the rest must not."""
+    rng = np.random.default_rng(8)
+    head_dim, rotary_dim = 16, 8
+    x = rng.standard_normal((1, 2, 3, head_dim)).astype(np.float32)
+    out = apply_rope(x, position_offset=5, rotary_dim=rotary_dim)
+    # Rotated slice should generally differ (extremely improbable
+    # that any randomly generated slice happens to be invariant).
+    assert not np.allclose(out[..., :rotary_dim], x[..., :rotary_dim])
+
+
+def test_apply_rope_partial_position_zero_is_still_identity():
+    """Position 0: cos=1, sin=0 ⇒ identity even when partial.
+
+    Uses seq=1 (a single decode-step token) so the only position
+    encountered is `position_offset + 0 = 0`. With seq>1 even
+    position_offset=0 rotates positions 1, 2, … which would not be
+    the identity.
+    """
+    rng = np.random.default_rng(9)
+    x = rng.standard_normal((1, 1, 1, 16)).astype(np.float32)
+    out = apply_rope(x, position_offset=0, rotary_dim=8)
+    np.testing.assert_allclose(out, x, rtol=1e-6)
+
+
+def test_apply_rope_partial_zero_rotary_dim_is_passthrough():
+    """rotary_dim=0 ⇒ no-op (a benign degenerate case, not an error)."""
+    x = np.arange(32, dtype=np.float32).reshape(1, 1, 2, 16)
+    out = apply_rope(x, position_offset=10, rotary_dim=0)
+    np.testing.assert_array_equal(out, x)
+
+
+def test_apply_rope_partial_rotary_dim_larger_than_head_raises():
+    x = np.zeros((1, 1, 1, 8), dtype=np.float32)
+    with pytest.raises(ValueError, match="cannot exceed head_dim"):
+        apply_rope(x, position_offset=0, rotary_dim=16)
+
+
+def test_apply_rope_partial_with_rotary_dim_equals_head_matches_full():
+    """rotary_dim=head_dim should produce the exact same output as the default."""
+    rng = np.random.default_rng(10)
+    x = rng.standard_normal((1, 2, 3, 8)).astype(np.float32)
+    out_default = apply_rope(x, position_offset=4, theta=10000.0)
+    out_explicit = apply_rope(x, position_offset=4, theta=10000.0, rotary_dim=8)
+    np.testing.assert_array_equal(out_default, out_explicit)
+
+
+def test_apply_rope_partial_preserves_pair_norms_on_rotated_slice():
+    """Pair norms in the rotated slice must still be preserved (it's a rotation)."""
+    rng = np.random.default_rng(11)
+    head_dim, rotary_dim = 32, 16
+    half = rotary_dim // 2
+    x = rng.standard_normal((1, 1, 4, head_dim)).astype(np.float32)
+    out = apply_rope(x, position_offset=3, rotary_dim=rotary_dim)
+    in_pair_norms = (
+        x[..., :half] ** 2 + x[..., half:rotary_dim] ** 2
+    )
+    out_pair_norms = (
+        out[..., :half] ** 2 + out[..., half:rotary_dim] ** 2
+    )
+    np.testing.assert_allclose(in_pair_norms, out_pair_norms, rtol=1e-5)

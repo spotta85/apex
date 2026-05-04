@@ -24,9 +24,10 @@ it) but is rebuilt at the start of each `generate` so independent
 prompts don't share history — cleanest semantics for the MVP.
 
 Caveats today:
-  - num_layers is capped at `config.num_sliding_layers` (5 on Gemma 4).
-    Layers 5+ are full_attention with K=V tied (head_dim=512, partial
-    RoPE) and aren't supported by the runtime yet.
+  - num_layers is capped at `config.num_hidden_layers` (30 on Gemma 4)
+    as of step 23. Both sliding_attention and full_attention layers
+    are supported. Per-layer head_dim / num_kv_heads / RoPE / K=V-tied
+    attention are wired via `config.head_dim_for_layer(L)` etc.
   - backend="numpy" is the only choice — the FakeBackend NumPy MoE.
   - Sampling is greedy by default (`temperature=0.0`); temperature > 0
     delegates to `apex.sampling.sample`.
@@ -169,12 +170,12 @@ class MoEModel:
 
         config = ModelConfig.from_path(path, layout_name=layout)
 
-        max_supported = config.num_sliding_layers
+        # Step 23 lifted the cap from `num_sliding_layers` to
+        # `num_hidden_layers` — both attention kinds are supported now.
+        max_supported = config.num_hidden_layers
         if max_supported == 0:
             raise ValueError(
-                f"checkpoint at {config.path} has no sliding_attention "
-                "layers; the runtime only supports sliding-attention "
-                "decoder layers today"
+                f"checkpoint at {config.path} has no decoder layers"
             )
         if num_layers is None:
             num_layers = max_supported
@@ -185,16 +186,18 @@ class MoEModel:
         elif num_layers > max_supported:
             raise ValueError(
                 f"num_layers={num_layers} exceeds the "
-                f"{max_supported} supported sliding-attention layers; "
-                "layer 5+ uses full_attention with K=V tied and isn't "
-                "supported yet"
+                f"{max_supported} decoder layers in this checkpoint"
             )
 
         if verbose:
+            num_full = sum(
+                1 for L in range(num_layers) if config.is_full_attention(L)
+            )
+            num_sliding = num_layers - num_full
             print(f"loading checkpoint: {config.path}")
             print(f"  layout: {config.layout_name}")
             print(f"  layers: {num_layers}/{config.num_hidden_layers} "
-                  f"(sliding-attention only)")
+                  f"({num_sliding} sliding + {num_full} full)")
             print(f"  experts: {config.num_experts} "
                   f"top_k={config.top_k_experts}")
 
@@ -208,10 +211,17 @@ class MoEModel:
         per_layer_attn = []
         per_layer_norms = []
         for layer_id in range(num_layers):
+            kind = "full" if config.is_full_attention(layer_id) else "sliding"
             if verbose:
-                print(f"  loading layer {layer_id} attention + norms")
+                print(f"  loading layer {layer_id} attention + norms ({kind})")
             per_layer_attn.append(
-                load_attention_weights(config.path, config.layout, layer_id)
+                load_attention_weights(
+                    config.path, config.layout, layer_id,
+                    # Full layers don't ship a v_proj — the tied flag
+                    # tells the loader to skip it and pass v_weight=None
+                    # downstream to attention_decode_step.
+                    k_eq_v=config.attention_k_eq_v_for_layer(layer_id),
+                )
             )
             per_layer_norms.append(
                 load_layer_norms(config.path, config.layout, layer_id)
@@ -409,8 +419,12 @@ class MoEModel:
         """Per-token forward through embed → N layers → final norm → lm_head.
 
         Returns `(1, vocab_size)` logits with softcap applied. Internal
-        helper shared by `_forward_ids` and (in the future) any other
-        non-sampling path.
+        helper shared by `_forward_ids` and `_make_step_fn`.
+
+        Step 23: each layer's attention shape (head_dim, num_kv_heads,
+        rope_theta, rotary_dim, K=V-tied) is per-layer, picked via
+        `config.*_for_layer(L)` so sliding and full layers can be
+        intermixed without a separate code path.
         """
         config = self.config
         hidden = embed_token(self.embedding, token_id)
@@ -420,15 +434,16 @@ class MoEModel:
             attn_kwargs = dict(
                 q_weight=attn_weights["q_weight"],
                 k_weight=attn_weights["k_weight"],
-                v_weight=attn_weights["v_weight"],
+                v_weight=attn_weights["v_weight"],  # None for k_eq_v layers
                 o_weight=attn_weights["o_weight"],
                 num_heads=config.num_attention_heads,
-                num_kv_heads=config.num_kv_heads,
-                head_dim=config.head_dim,
+                num_kv_heads=config.num_kv_heads_for_layer(layer_id),
+                head_dim=config.head_dim_for_layer(layer_id),
                 q_norm_weight=attn_weights["q_norm"],
                 k_norm_weight=attn_weights["k_norm"],
                 rms_eps=config.rms_norm_eps,
-                rope_theta=config.rope_theta_sliding,
+                rope_theta=config.rope_theta_for_layer(layer_id),
+                rotary_dim=config.rotary_dim_for_layer(layer_id),
             )
 
             def moe_call(h, lid=layer_id):
