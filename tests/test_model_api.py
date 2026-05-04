@@ -129,3 +129,38 @@ def test_real_memory_report_after_generate_includes_kv(real_model):
 def test_real_generate_zero_max_tokens_raises(real_model):
     with pytest.raises(ValueError, match="max_tokens must be positive"):
         real_model.generate("Hello", max_tokens=0, verbose=False)
+
+
+# --- generate_chat (step 22B) ----------------------------------------------
+
+@skip_if_no_real_checkpoint()
+def test_real_generate_chat_returns_string(real_model):
+    """End-to-end: messages in, string out, type str. Same shape as generate."""
+    text = real_model.generate_chat(
+        [{"role": "user", "content": "Hello"}],
+        max_tokens=2,
+        verbose=False,
+    )
+    assert isinstance(text, str)
+
+
+@skip_if_no_real_checkpoint()
+def test_real_generate_chat_uses_more_prompt_tokens_than_plain(real_model):
+    """Templated render expands the prompt — KV must reflect more tokens.
+
+    `apply_chat_template` wraps the user content in `<|turn>user…<turn|>`
+    markers + opens the model turn, so the encoded id list is strictly
+    longer than `encode("Hello")`. This catches the failure mode where
+    `generate_chat` accidentally falls back to plain encoding.
+    """
+    real_model.generate("Hello", max_tokens=1, verbose=False)
+    plain_kv = real_model.memory_report().kv_cache_bytes
+    real_model.generate_chat(
+        [{"role": "user", "content": "Hello"}],
+        max_tokens=1, verbose=False,
+    )
+    chat_kv = real_model.memory_report().kv_cache_bytes
+    assert chat_kv > plain_kv, (
+        f"chat KV {chat_kv} should exceed plain KV {plain_kv} "
+        "(chat-template adds turn markers)"
+    )

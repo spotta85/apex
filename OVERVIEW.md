@@ -5,7 +5,7 @@ APEX is a from-scratch Mixture-of-Experts (MoE) inference runtime focused on **b
 ## How to test
 
 ```bash
-# Full unit suite (316 always-on tests; +34 real-Gemma tests run when
+# Full unit suite (321 always-on tests; +47 real-Gemma tests run when
 # REAL_MOE_PATH points at a checkpoint)
 uv run pytest -q
 
@@ -35,6 +35,8 @@ uv run python scripts/demo_tokenizer_generate.py     # text in / text out genera
 uv run python examples/quickstart.py                 # MoEModel.generate() one-liner API (step 20)
 uv run python examples/quickstart_multilayer.py      # 1/2/4-layer scaling sweep with memory reports (step 21)
 uv run python scripts/benchmark_layer_scaling.py     # tokens/sec + memory comparison table (step 21)
+uv run python scripts/audit_config.py                # config audit vs runtime assumptions (step 22A)
+uv run python scripts/structural_logit_sanity.py     # top-K logits + cross-prompt diversity (step 22C)
 ```
 
 Diagnostic scripts:
@@ -144,10 +146,10 @@ weighted-combine via apex.moe_layer.run_moe_layer
 | `generation.py` | `embed_token` (row lookup), `final_logits` (tied lm_head + softcap). Re-exports `sample_argmax` from `apex.sampling` | `embed_token`, `final_logits`, `sample_argmax` |
 | `sampling.py` | `sample_argmax` (greedy) and `sample(logits, *, temperature, rng)` (T=0 ⇒ argmax; T>0 ⇒ scaled categorical) | `sample_argmax`, `sample` |
 | `prefill.py` | `prefill(prompt_ids, *, step_fn)` — loop step_fn over prompt tokens, return last prediction (= first generated). Stateless; KV cache lives in step_fn's closure | `prefill` |
-| `tokenizer.py` | Thin wrapper over HF `tokenizers` lib. `Tokenizer.from_pretrained(path)` loads `tokenizer.json` + reads BOS id from `config.json`. `encode` prepends BOS by default; `decode` skips special tokens by default | `Tokenizer` |
+| `tokenizer.py` | Thin wrapper over HF `tokenizers` lib. `Tokenizer.from_pretrained(path)` loads `tokenizer.json` + reads BOS id from `config.json` + chat template from `chat_template.jinja` or `tokenizer_config.json`. `encode` prepends BOS by default; `decode` skips special tokens by default; `apply_chat_template`/`encode_chat` render via `jinja2` (step 22B) | `Tokenizer` |
 | `checkpoint_loaders.py` | High-level component loaders: `read_text_config`, `load_embedding`, `load_final_norm`, `load_layer_norms`, `load_attention_weights`. Built on `safetensors_loader` + `dequant` | five loader functions |
 | `config.py` | `ModelConfig` (frozen dataclass). `from_path(checkpoint_dir)` parses `text_config` once into hidden_size, head counts, head_dim, RoPE theta, EOS ids tuple, layer_types, etc. `num_sliding_layers` property = how many decoder layers the runtime currently supports | `ModelConfig` |
-| `model.py` | `MoEModel` — the user-facing API. `from_pretrained(path, max_memory_gb)` eager-loads tokenizer + embedding + per-layer attn/norms + cache + manager + router; `generate(prompt, max_tokens, temperature) → str` runs encode → prefill → decode-loop → decode; `memory_report()` returns the joined `RuntimeMemoryReport` | `MoEModel` |
+| `model.py` | `MoEModel` — the user-facing API. `from_pretrained(path, max_memory_gb)` eager-loads tokenizer + embedding + per-layer attn/norms + cache + manager + router; `generate(prompt, max_tokens, temperature) → str` runs encode → prefill → decode-loop → decode; `generate_chat(messages, **template_kwargs)` formats via the chat template first; `forward(prompt) → logits` returns raw `(1, vocab)` logits without sampling; `memory_report()` returns the joined `RuntimeMemoryReport` | `MoEModel` |
 | `__init__.py` | Public API surface: `MoEModel`, `Tokenizer`, `ModelConfig`, `KVCache`, `MemoryReport`, `KVMemoryReport`, `RuntimeMemoryReport` | `apex.MoEModel`, … |
 
 ### `apex/backends/` — compute
@@ -204,6 +206,8 @@ weighted-combine via apex.moe_layer.run_moe_layer
 | `demo_prefill.py` | Real prompt prefill via `apex.prefill.prefill`: 5-token prompt + 3-token decode tail; per-step KV cache length printout matches the step 18 spec format (step 18) |
 | `demo_tokenizer_generate.py` | Text-in / text-out generation: `Tokenizer.encode("Hello world")` → BOS + token ids → prefill + decode loop → `Tokenizer.decode` back to text (step 19) |
 | `benchmark_layer_scaling.py` | Sweeps `num_layers` ∈ {1, 2, 4} on the MoEModel and prints a `L | load(s) | gen(s) | tok/s | peak expert | kv | peak total | evict | finite | budget` comparison table (step 21) |
+| `audit_config.py` | Walks every hyperparameter the runtime touches and prints a ✓/✗ row per field against the raw `text_config` value (step 22A) |
+| `structural_logit_sanity.py` | Forwards 4 prompts through `MoEModel.forward`, prints top-10 token tables + cross-prompt jaccard, asserts argmax varies (step 22C) |
 
 ### `examples/`
 
@@ -214,11 +218,11 @@ weighted-combine via apex.moe_layer.run_moe_layer
 
 ### `tests/`
 
-48 test modules, 316 always-on tests + 34 real-Gemma skipif tests (350 with `REAL_MOE_PATH` set). `tests/_world.py` provides `FakeStore` + re-exports the fake-world writers from `apex._fake_weights`. Real-Gemma tests live in `tests/test_real_moe_cache.py`, `tests/test_real_moe_two_layer.py`, `tests/test_runtime_real_integration.py`, `tests/test_real_memory_budget.py`, `tests/test_real_prefetch.py`, `tests/test_real_attention.py`, `tests/test_real_decoder.py`, and `tests/test_real_generation.py` — all auto-skip unless `REAL_MOE_PATH` (or a known local default path) resolves.
+50 test modules, 321 always-on tests + 47 real-Gemma skipif tests (368 with `REAL_MOE_PATH` set). `tests/_world.py` provides `FakeStore` + re-exports the fake-world writers from `apex._fake_weights`. Real-Gemma tests live in `tests/test_real_moe_cache.py`, `tests/test_real_moe_two_layer.py`, `tests/test_runtime_real_integration.py`, `tests/test_real_memory_budget.py`, `tests/test_real_prefetch.py`, `tests/test_real_attention.py`, `tests/test_real_decoder.py`, and `tests/test_real_generation.py` — all auto-skip unless `REAL_MOE_PATH` (or a known local default path) resolves.
 
 ---
 
-## What's done (steps 1–21)
+## What's done (steps 1–22)
 
 1–3. Bounded LRU cache, prefetcher, Markov predictor, metrics.
 4. SwiGLU FFN experts (gate/up/down bundles via `ExpertWeights`).
@@ -247,6 +251,7 @@ weighted-combine via apex.moe_layer.run_moe_layer
 19. Tokenizer integration: `apex/tokenizer.py:Tokenizer` wraps the pure-Rust `tokenizers` library (`Tokenizer.from_file` on `<path>/tokenizer.json`) and reads `bos_token_id` from `<path>/config.json` to replicate `transformers.GemmaTokenizer.add_bos_token=True` behavior. `scripts/demo_tokenizer_generate.py` accepts `--prompt "Hello world"`, encodes to `[2, 9259, 1902]` (BOS + 2 tokens), runs prefill + decode, and decodes generated ids back to text — completing the text-in / text-out path.
 20. User-facing API: `from apex import MoEModel` is now a real surface. `apex/config.py:ModelConfig.from_path` parses `text_config` once into a frozen snapshot (hidden_size, head counts, RoPE theta, EOS ids tuple, sliding-vs-full layer cap). `apex/sampling.py:sample` adds temperature-scaled categorical sampling (T=0 collapses to argmax — `apex.generation.sample_argmax` re-exports it for back-compat). `apex/model.py:MoEModel.from_pretrained(path, max_memory_gb=8)` eager-loads tokenizer + embedding + per-layer attn/norms + cache + manager + router; `model.generate(prompt, max_tokens, temperature) → str` runs encode → prefill → decode loop → decode, stopping on EOS. `model.memory_report()` returns the joined `RuntimeMemoryReport`. `examples/quickstart.py` is the three-call quickstart. Clear errors: missing dir → FileNotFoundError; unsupported backend / non-positive memory / num_layers > sliding cap → ValueError.
 21. Layer scaling + benchmarking: multi-layer real generation (up to the sliding-attention cap, 5 on Gemma 4) verified with `tests/test_model_multilayer_real.py` (8 new real-Gemma tests covering 2/4-layer generation, budget respected, KV scales linearly, tight-budget eviction still finite, EOS short-circuit). `examples/quickstart_multilayer.py` runs a `[1, 2, 4]`-layer sweep with per-trial memory reports; `scripts/benchmark_layer_scaling.py` prints a `L | load(s) | gen(s) | tok/s | peak expert | kv | peak total | evict | finite | budget` comparison table. Real run: tokens/sec halves per layer doubling (3.0 → 1.8 → 0.9 tok/s); peak expert grows linearly (318 MB → 590 MB → 1202 MB); kv stays in MB-range; budget respected at every L. **Bug fix included:** `apex/attention.py` was dividing fp32 scores by `np.sqrt(head_dim)` (numpy.float64), which silently promoted the layer's output to fp64 and doubled per-layer KV bytes from layer 1 onward. Cast scale to fp32; KV now uniform fp32 across layers. `MoEModel._last_generated_ids` exposes the authoritative generated-id list (re-encoding decoded text doesn't round-trip when output is non-printable bytes).
+22. Correctness audit + chat template + structural sanity. **22A:** `scripts/audit_config.py` walks every hyperparameter the runtime uses (hidden, head counts, head_dim, RoPE theta, RMS eps, softcap, BOS/EOS, layer types) and prints ✓ vs the raw `text_config` value plus an info row for unsupported full_attention extras (`attention_k_eq_v`, `global_head_dim=512`, `partial_rotary_factor=0.25`, `rope_theta_full=1e6`). **22B:** `apex/tokenizer.py:Tokenizer.apply_chat_template` + `encode_chat` render Gemma 4's 347-line `chat_template.jinja` (auto-loaded standalone or from `tokenizer_config.json["chat_template"]`) via `jinja2` with `loopcontrols`. `MoEModel.generate_chat(messages, **template_kwargs)` is the one-call API; KV reflects the templated render (markers + turn headers add tokens vs plain `generate`). **22C:** `MoEModel.forward(prompt) → logits` returns raw `(1, vocab)` logits without sampling — built on a new shared `_compute_logits` helper that `_make_step_fn` now also calls (single source of truth). `tests/test_logit_sanity_real.py` locks structural properties: shape, finite, softcap respected, four different prompts produce different argmax (non-degenerate), KV length matches prompt token count. `scripts/structural_logit_sanity.py` prints per-prompt top-10 + cross-prompt jaccard. **22D explicitly deferred:** num_layers > 5 needs a full_attention path (K=V tied, head_dim=512, partial RoPE factor=0.25, rope_theta=1e6) — substantial enough to be its own sprint.
 
 ---
 
@@ -254,8 +259,9 @@ weighted-combine via apex.moe_layer.run_moe_layer
 
 ### Near term
 
+- **Step 22D: full_attention layers (8/16/30 layer smoke)** — Gemma 4 layers 5/11/17/23/29 use full_attention with K=V tied (no v_proj on disk), head_dim=512, and partial RoPE (rotary_factor=0.25, theta=1e6). Needed for any decoder pass that goes past 5 layers, which blocks 22D's "8/16/30 layer smoke benchmark" and step 24's "more layers, better generation quality" goal. Heterogeneous head_dim per layer also requires KVCache to track per-layer shapes.
+- **Reference-logits parity (step 22C deferred half)** — structural sanity already passes; an exact / approximate comparison against an HF transformers or `mlx-lm` baseline would lock the math down. Heavy dep we deliberately deferred.
 - **Batched-prompt prefill (multi-token attention with causal mask)** — current `prefill` calls `step_fn` once per prompt token (O(prompt_len) sequential). A real batched prefill would process the whole prompt in a single multi-token attention call, cutting wall time for long prompts.
-- **Layer heterogeneity for full-attention layers** — Gemma 4 layers 5/11/17/23/29 use full_attention with K=V tied (no v_proj on disk), head_dim=512, and partial RoPE (rotary_factor=0.25, theta=1e6). Needed for any decoder pass that goes past 5 layers.
 - **Dense-MLP shared expert** — Gemma 4 carries both routed MoE and a dense MLP per layer (with the `_1`/`_2` parallel norm variants); driving both would change residual sums.
 - **MLX path for real weights** — `MLXBackend` already does SwiGLU; needs a `dequantize` step that produces `mx.array` directly to avoid the numpy round-trip. Same applies to `apex/ops.py`, `apex/attention.py`, `apex/decoder.py`, `apex/generation.py`, `apex/kv_cache.py` (NumPy-only today).
 - **Trained predictor on real-Gemma traces** — step 15 proved the prefetch path works on real layers; an actual trained `MarkovPredictor` (instead of the router-peek fallback) would let prefetch overlap with attention/norm in a real model loop. Needs trace data we don't have yet.

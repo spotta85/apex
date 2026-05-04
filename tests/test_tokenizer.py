@@ -1,4 +1,4 @@
-"""Tests for apex/tokenizer.py — BOS handling + clear error messages.
+"""Tests for apex/tokenizer.py — BOS handling + chat template + clear errors.
 
 The wrapper-level tests use synthetic edge cases (missing files);
 the real round-trip tests use the local Gemma 4 checkpoint via
@@ -11,6 +11,17 @@ from apex.tokenizer import Tokenizer
 from tests._synthetic_nvfp4 import (
     real_checkpoint_path,
     skip_if_no_real_checkpoint,
+)
+
+
+# Minimal HF-style template for synthetic tests — covers `messages`
+# iteration + `add_generation_prompt`, the two contract pieces our
+# wrapper guarantees. Real templates are tested against Gemma below.
+_FAKE_TEMPLATE = (
+    "{% for m in messages %}"
+    "<|{{ m.role }}|>{{ m.content }}<|end|>"
+    "{% endfor %}"
+    "{% if add_generation_prompt %}<|assistant|>{% endif %}"
 )
 
 
@@ -82,6 +93,87 @@ def test_real_gemma_decode_with_special_tokens_keeps_them():
     assert len(text) > len(
         tok.decode([2, 9259, 1902], skip_special_tokens=True),
     )
+
+
+# --- Chat template tests ----------------------------------------------------
+
+def test_apply_chat_template_without_template_raises(tmp_path):
+    """Tokenizer constructed with no chat template must fail clearly."""
+    tok = Tokenizer(tokenizer=None, chat_template=None)
+    with pytest.raises(ValueError, match="no chat template"):
+        tok.apply_chat_template([{"role": "user", "content": "hi"}])
+
+
+def test_apply_chat_template_renders_synthetic_template():
+    """Render a hand-built template with `messages` + `add_generation_prompt`."""
+    tok = Tokenizer(tokenizer=None, chat_template=_FAKE_TEMPLATE)
+    out = tok.apply_chat_template(
+        [
+            {"role": "user", "content": "Hello"},
+            {"role": "assistant", "content": "Hi"},
+        ],
+        add_generation_prompt=True,
+    )
+    assert out == "<|user|>Hello<|end|><|assistant|>Hi<|end|><|assistant|>"
+
+
+def test_apply_chat_template_add_generation_prompt_false_omits_assistant_marker():
+    tok = Tokenizer(tokenizer=None, chat_template=_FAKE_TEMPLATE)
+    out = tok.apply_chat_template(
+        [{"role": "user", "content": "Hello"}],
+        add_generation_prompt=False,
+    )
+    assert out == "<|user|>Hello<|end|>"
+
+
+def test_apply_chat_template_passes_kwargs_into_render():
+    """Extra template kwargs flow into the Jinja render context."""
+    tok = Tokenizer(
+        tokenizer=None,
+        chat_template="{{ greeting }} {{ messages[0].content }}",
+    )
+    out = tok.apply_chat_template(
+        [{"role": "user", "content": "world"}],
+        add_generation_prompt=False,
+        greeting="Hello",
+    )
+    assert out == "Hello world"
+
+
+@skip_if_no_real_checkpoint()
+def test_from_pretrained_loads_chat_template_for_gemma():
+    """Gemma 4 ships chat_template.jinja standalone; wrapper picks it up."""
+    tok = Tokenizer.from_pretrained(real_checkpoint_path())
+    assert tok.chat_template is not None
+    # Sanity: the template's text references the iteration variable.
+    assert "messages" in tok.chat_template
+
+
+@skip_if_no_real_checkpoint()
+def test_apply_chat_template_real_gemma_renders_user_turn():
+    """Default render of one user message produces Gemma's turn markers."""
+    tok = Tokenizer.from_pretrained(real_checkpoint_path())
+    out = tok.apply_chat_template(
+        [{"role": "user", "content": "Hello"}],
+        add_generation_prompt=True,
+    )
+    # Gemma 4 uses `<|turn>` / `<turn|>` markers — assert the user
+    # content is wrapped and that the model's turn header follows.
+    assert "user" in out and "Hello" in out
+    assert "model" in out  # add_generation_prompt opens the model turn
+
+
+@skip_if_no_real_checkpoint()
+def test_encode_chat_round_trip_starts_with_bos():
+    """encode_chat must prepend BOS just like plain encode does."""
+    tok = Tokenizer.from_pretrained(real_checkpoint_path())
+    ids = tok.encode_chat(
+        [{"role": "user", "content": "Hello"}],
+        add_generation_prompt=True,
+    )
+    assert isinstance(ids, list)
+    assert ids[0] == tok.bos_token_id
+    assert len(ids) > 1
 
 
 @skip_if_no_real_checkpoint()

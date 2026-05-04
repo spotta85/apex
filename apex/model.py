@@ -270,20 +270,78 @@ class MoEModel:
 
         Returns the decoded continuation only (no prompt prefix).
         """
-        if max_tokens <= 0:
-            raise ValueError(f"max_tokens must be positive, got {max_tokens}")
-
         prompt_ids = self.tokenizer.encode(prompt)
         if not prompt_ids:
             raise ValueError("prompt encoded to zero tokens")
+        return self._generate_from_ids(
+            prompt_ids,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            verbose=verbose,
+            prompt_label=prompt,
+        )
+
+    def generate_chat(
+        self,
+        messages: list,
+        *,
+        max_tokens: int = 64,
+        temperature: float = 0.0,
+        verbose: bool = False,
+        **template_kwargs,
+    ) -> str:
+        """Format `messages` via the chat template, then generate.
+
+        `messages` is the standard HF list-of-dicts format
+        (`{"role": ..., "content": ...}`). The chat template renders
+        with `add_generation_prompt=True`, so generation continues
+        directly into the model's reply.
+
+        `template_kwargs` are forwarded to the chat template (e.g.
+        Gemma 4's `enable_thinking=True`). Returns the decoded model
+        reply (no prompt prefix).
+
+        Raises ValueError if the checkpoint has no chat template.
+        """
+        prompt_ids = self.tokenizer.encode_chat(
+            messages,
+            add_generation_prompt=True,
+            **template_kwargs,
+        )
+        if not prompt_ids:
+            raise ValueError("rendered chat encoded to zero tokens")
+        return self._generate_from_ids(
+            prompt_ids,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            verbose=verbose,
+            prompt_label=f"<chat with {len(messages)} message(s)>",
+        )
+
+    def _generate_from_ids(
+        self,
+        prompt_ids: list,
+        *,
+        max_tokens: int,
+        temperature: float,
+        verbose: bool,
+        prompt_label: str,
+    ) -> str:
+        """Shared prefill + decode-loop body for `generate` / `generate_chat`.
+
+        `prompt_label` is just for the verbose trace — both entry
+        points hand it a human-readable rendering so the trace is
+        legible without the caller having to peek at the ids.
+        """
+        if max_tokens <= 0:
+            raise ValueError(f"max_tokens must be positive, got {max_tokens}")
 
         kv = KVCache(num_layers=self.num_layers)
         self._last_kv = kv
-
         step_fn = self._make_step_fn(kv, temperature=temperature)
 
         if verbose:
-            print(f"prompt ({len(prompt_ids)} tokens): {prompt!r}")
+            print(f"prompt ({len(prompt_ids)} tokens): {prompt_label!r}")
             print(f"prefilling {len(prompt_ids)} prompt tokens...")
 
         first_id = prefill(prompt_ids, step_fn=step_fn)
@@ -311,6 +369,98 @@ class MoEModel:
 
         return self.tokenizer.decode(generated)
 
+    def forward(self, prompt: str) -> "np.ndarray":
+        """Run prefill on `prompt` and return the next-token logits.
+
+        Returns shape `(1, vocab_size)`. The KV cache built during
+        this forward pass is left on `self._last_kv` so subsequent
+        `memory_report()` reflects the prompt's KV. No sampling,
+        no decode loop, no softcap removal — exactly what the model
+        sees right before sampling.
+
+        Useful for step 22C structural sanity (top-k diversity, finite
+        check) and for any future reference-logits comparison against
+        an HF/MLX baseline. The `temperature` knob lives on `generate`,
+        not here — `forward` returns raw logits so callers compose.
+        """
+        prompt_ids = self.tokenizer.encode(prompt)
+        if not prompt_ids:
+            raise ValueError("prompt encoded to zero tokens")
+        return self._forward_ids(prompt_ids)
+
+    def _forward_ids(self, prompt_ids: list) -> "np.ndarray":
+        """Implementation of forward(); shared with future variants.
+
+        Builds a fresh KVCache, runs prefill via a logits-returning
+        step closure, returns the logits at the *last* prefill step
+        (the one that would feed the decode loop). Uses the same
+        per-layer math as `_make_step_fn` but stops before sampling.
+        """
+        if not prompt_ids:
+            raise ValueError("prompt_ids must not be empty (zero tokens)")
+        kv = KVCache(num_layers=self.num_layers)
+        self._last_kv = kv
+        logits = None
+        for token_id in prompt_ids:
+            logits = self._compute_logits(token_id, kv)
+        return logits
+
+    def _compute_logits(self, token_id: int, kv: KVCache):
+        """Per-token forward through embed → N layers → final norm → lm_head.
+
+        Returns `(1, vocab_size)` logits with softcap applied. Internal
+        helper shared by `_forward_ids` and (in the future) any other
+        non-sampling path.
+        """
+        config = self.config
+        hidden = embed_token(self.embedding, token_id)
+        for layer_id in range(self.num_layers):
+            attn_weights = self.per_layer_attn[layer_id]
+            norms = self.per_layer_norms[layer_id]
+            attn_kwargs = dict(
+                q_weight=attn_weights["q_weight"],
+                k_weight=attn_weights["k_weight"],
+                v_weight=attn_weights["v_weight"],
+                o_weight=attn_weights["o_weight"],
+                num_heads=config.num_attention_heads,
+                num_kv_heads=config.num_kv_heads,
+                head_dim=config.head_dim,
+                q_norm_weight=attn_weights["q_norm"],
+                k_norm_weight=attn_weights["k_norm"],
+                rms_eps=config.rms_norm_eps,
+                rope_theta=config.rope_theta_sliding,
+            )
+
+            def moe_call(h, lid=layer_id):
+                with nvfp4_matmul_warnings():
+                    ids, weights = self.router.route(lid, h)
+                    return run_moe_layer(
+                        h, ids, weights,
+                        lambda eid: self.manager.ensure_loaded(lid, eid),
+                        self.backend,
+                    )
+
+            with nvfp4_matmul_warnings():
+                hidden = decoder_decode_step(
+                    hidden,
+                    norms=norms,
+                    attn_kwargs=attn_kwargs,
+                    moe_call=moe_call,
+                    kv_cache=kv,
+                    layer_id=layer_id,
+                    rms_eps=config.rms_norm_eps,
+                )
+        hidden = rms_norm(
+            hidden, self.final_norm_w,
+            eps=config.rms_norm_eps, gemma_unit_offset=True,
+        )
+        with nvfp4_matmul_warnings():
+            logits = final_logits(
+                hidden, self.embedding,
+                softcap=config.final_logit_softcapping,
+            )
+        return logits
+
     def memory_report(self):
         """Joined expert + KV memory snapshot.
 
@@ -324,70 +474,14 @@ class MoEModel:
         return runtime_snapshot(self.cache, self.metrics, kv)
 
     def _make_step_fn(self, kv: KVCache, *, temperature: float):
-        """Build the per-token forward closure used by prefill + decode.
+        """Build the `step_fn(token_id) -> next_token_id` closure for prefill/decode.
 
-        Captures everything constant across tokens (embedding, layer
-        weights, KV cache, sampling temperature) so the returned
-        callable matches `prefill`'s `step_fn(token_id) -> int` shape.
+        Body is `_compute_logits` + `sample` — keeps the per-layer math
+        in one place so any future correctness fix lands in both
+        `generate*` and `forward`.
         """
-        config = self.config
-        embedding = self.embedding
-        final_norm_w = self.final_norm_w
-        per_layer_attn = self.per_layer_attn
-        per_layer_norms = self.per_layer_norms
-        manager = self.manager
-        backend = self.backend
-        router = self.router
-        num_layers = self.num_layers
-
         def step(token_id: int) -> int:
-            hidden = embed_token(embedding, token_id)
-            for layer_id in range(num_layers):
-                attn_weights = per_layer_attn[layer_id]
-                norms = per_layer_norms[layer_id]
-                attn_kwargs = dict(
-                    q_weight=attn_weights["q_weight"],
-                    k_weight=attn_weights["k_weight"],
-                    v_weight=attn_weights["v_weight"],
-                    o_weight=attn_weights["o_weight"],
-                    num_heads=config.num_attention_heads,
-                    num_kv_heads=config.num_kv_heads,
-                    head_dim=config.head_dim,
-                    q_norm_weight=attn_weights["q_norm"],
-                    k_norm_weight=attn_weights["k_norm"],
-                    rms_eps=config.rms_norm_eps,
-                    rope_theta=config.rope_theta_sliding,
-                )
-
-                def moe_call(h, lid=layer_id):
-                    with nvfp4_matmul_warnings():
-                        ids, weights = router.route(lid, h)
-                        return run_moe_layer(
-                            h, ids, weights,
-                            lambda eid: manager.ensure_loaded(lid, eid),
-                            backend,
-                        )
-
-                with nvfp4_matmul_warnings():
-                    hidden = decoder_decode_step(
-                        hidden,
-                        norms=norms,
-                        attn_kwargs=attn_kwargs,
-                        moe_call=moe_call,
-                        kv_cache=kv,
-                        layer_id=layer_id,
-                        rms_eps=config.rms_norm_eps,
-                    )
-
-            hidden = rms_norm(
-                hidden, final_norm_w,
-                eps=config.rms_norm_eps, gemma_unit_offset=True,
-            )
-            with nvfp4_matmul_warnings():
-                logits = final_logits(
-                    hidden, embedding,
-                    softcap=config.final_logit_softcapping,
-                )
+            logits = self._compute_logits(token_id, kv)
             assert np.all(np.isfinite(logits)), "logits must be finite"
             return sample(logits, temperature=temperature)
 
