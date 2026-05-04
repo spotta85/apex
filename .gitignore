@@ -1,4 +1,3 @@
-# Python-generated files
 __pycache__/
 *.py[oc]
 build/
@@ -6,10 +5,8 @@ dist/
 wheels/
 *.egg-info
 
-# Virtual environments
 .venv
 
-# Demo runtime artifacts
 traces/runtime_traces.jsonl
 traces/runtime_gate_traces.jsonl
 traces/runtime_safetensors_traces.jsonl
@@ -20,3 +17,5 @@ traces/safetensors_traces.jsonl
 traces/gguf_traces.jsonl
 experts/
 weights/
+
+docs/*.md
