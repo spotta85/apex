@@ -261,7 +261,12 @@ class MoEModel:
         quant_store = quantized_store_for_layout(config.path, config.layout)
         store = DequantizingExpertStore(quant_store, verbose=False)
         manager = ExpertManager(store=store, cache=cache, metrics=metrics)
-        backend_obj = FakeBackend()
+        # Step 26A: pick the FFN activation from the checkpoint's
+        # `hidden_activation`. Gemma 4 = gelu_pytorch_tanh; Mixtral /
+        # Qwen / synthetic = silu. Using SiLU against a GeLU-trained
+        # checkpoint compounds layer-after-layer into incoherent
+        # output, so this read is load-bearing for quality.
+        backend_obj = FakeBackend(activation=config.hidden_activation)
         router = MultiLayerRealRouter(
             config.path, config.layout, top_k=config.top_k_experts,
         )

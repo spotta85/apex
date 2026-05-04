@@ -88,6 +88,17 @@ class ModelConfig:
     # for models that don't differentiate (every layer attends globally).
     sliding_window: int | None
 
+    # --- Step 26A: FFN activation function ------------------------------
+    # `hidden_activation` from text_config. Gemma 4 = "gelu_pytorch_tanh"
+    # (tanh-approximation GELU); Mixtral / Qwen MoE = "silu"; default
+    # falls back to "silu" because that's what every public MoE used
+    # before Gemma 4. The backend reads this on construction and picks
+    # the matching activation in run_expert / dense MLP. Using SiLU
+    # against a GeLU-trained model is a major source of incoherence —
+    # SiLU and GeLU have similar shapes but the layer-after-layer error
+    # compounds quickly across 30 decoder layers.
+    hidden_activation: str
+
     @classmethod
     def from_path(cls, path, *, layout_name=None) -> "ModelConfig":
         """Detect layout, read text_config, return a fully-populated ModelConfig.
@@ -164,6 +175,15 @@ class ModelConfig:
         sliding_window = text_cfg.get("sliding_window")
         sliding_window = int(sliding_window) if sliding_window is not None else None
 
+        # Step 26A: FFN activation choice. Gemma 4 ships
+        # `hidden_activation: gelu_pytorch_tanh`; older configs use
+        # `hidden_act` (also a string). Try both keys, default to silu
+        # so synthetic / Mixtral / Qwen layouts that omit the field
+        # keep their pre-step-26 behavior byte-identical.
+        hidden_activation = text_cfg.get(
+            "hidden_activation", text_cfg.get("hidden_act", "silu"),
+        )
+
         return cls(
             path=path,
             layout_name=resolved_layout_name,
@@ -196,6 +216,7 @@ class ModelConfig:
             partial_rotary_factor_full=partial_factor_full,
             rope_theta_full=rope_theta_full,
             sliding_window=sliding_window,
+            hidden_activation=str(hidden_activation),
         )
 
     @property

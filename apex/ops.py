@@ -1,11 +1,13 @@
 """Tiny numerical primitives for transformer building blocks.
 
-Four pure functions, all NumPy:
+Six pure functions, all NumPy:
 
   - rms_norm(x, weight, eps, *, gemma_unit_offset=False)
   - linear(x, weight, bias=None)
   - softmax(x, axis=-1)
   - apply_rope(x, *, position_offset, theta)
+  - silu(x)                   — x * sigmoid(x), the SwiGLU activation
+  - gelu_tanh(x)              — Gemma 4's `gelu_pytorch_tanh` activation
 
 Why "tiny": these are the lowest-cost layer of math that decoder layers
 need (attention pre-norm, projection matmuls, attention softmax). They
@@ -173,3 +175,76 @@ def apply_rope(
     return np.concatenate([rotated, x_pass], axis=-1).astype(
         x.dtype, copy=False,
     )
+
+
+def silu(x):
+    """SiLU (Swish) activation: x * sigmoid(x).
+
+    The "Swi" in SwiGLU. Mixtral / Qwen MoE / older Gemma all use
+    this in their FFN gate path.
+
+    Computed as ``x / (1 + exp(-x))`` to avoid an explicit sigmoid
+    call — same value, fewer FLOPs in fp32. For very negative x the
+    `exp(-x)` overflows; we accept that since the fp32 dynamic range
+    is wide enough that the resulting `inf` divides to 0 cleanly.
+    """
+    return x / (1.0 + np.exp(-x))
+
+
+# Tanh-approximation GELU magic numbers (PyTorch's
+# `nn.functional.gelu(x, approximate='tanh')` and Gemma's
+# `gelu_pytorch_tanh`). Constants pre-computed in fp32 so the inner
+# loop doesn't re-allocate for every call.
+_GELU_TANH_CUBIC = np.float32(0.044715)
+_GELU_TANH_SQRT_2_OVER_PI = np.float32(0.7978845608028654)  # sqrt(2/pi)
+
+
+def gelu_tanh(x):
+    """GELU with tanh approximation (Gemma 4's `gelu_pytorch_tanh`).
+
+    Formula:
+        0.5 * x * (1 + tanh(sqrt(2/π) * (x + 0.044715 * x³)))
+
+    Bit-equivalent to PyTorch's
+    ``F.gelu(x, approximate='tanh')`` and HF transformers'
+    ``ACT2FN['gelu_pytorch_tanh']``. Used in Gemma 4's MLP gate path
+    and dense feedforward — substituting SiLU here against a
+    GeLU-trained model is the single biggest source of math drift
+    we found at L=8 (it was emitting unused-token gibberish).
+
+    SiLU and GeLU have similar shapes — both are smooth approximations
+    of ReLU near zero — but they diverge meaningfully outside the
+    [-3, 3] range, and that error compounds across 30 decoder layers.
+    """
+    inner = _GELU_TANH_SQRT_2_OVER_PI * (
+        x + _GELU_TANH_CUBIC * x * x * x
+    )
+    return 0.5 * x * (1.0 + np.tanh(inner))
+
+
+# Lookup table so backends + tests can pick the activation by the
+# string name the config provides ("silu" / "gelu_pytorch_tanh"),
+# instead of branching at the call site. Adding a new activation
+# means appending one entry.
+ACTIVATIONS = {
+    "silu": silu,
+    "swish": silu,                  # alias HF emits sometimes
+    "gelu_pytorch_tanh": gelu_tanh,
+    "gelu_new": gelu_tanh,          # HF's `gelu_new` is the same formula
+}
+
+
+def get_activation(name: str):
+    """Resolve `name` to an activation callable.
+
+    Raises ValueError naming the unknown activation rather than
+    silently falling back — quietly defaulting to silu against a
+    GeLU-trained model is exactly the bug we're fixing.
+    """
+    fn = ACTIVATIONS.get(name)
+    if fn is None:
+        raise ValueError(
+            f"unknown activation {name!r}; "
+            f"available: {sorted(ACTIVATIONS)}"
+        )
+    return fn
