@@ -1,12 +1,13 @@
 # APEX — Overview
 
-APEX is a from-scratch Mixture-of-Experts (MoE) inference runtime focused on **bounded-memory expert loading**: the user sets `max_memory_mb` and APEX loads experts on demand, caches them LRU, and evicts when over budget. Built up in tightly-scoped MVP steps. As of step 20, `from apex import MoEModel` is the headline API; as of step 23, all 30 decoder layers of Gemma 4 26B-A4B-IT-NVFP4 (sliding + full attention, K=V tied, partial RoPE) run end-to-end with bounded memory and LRU eviction.
+APEX is a from-scratch Mixture-of-Experts (MoE) inference runtime focused on **bounded-memory expert loading**: the user sets `max_memory_mb` and APEX loads experts on demand, caches them LRU, and evicts when over budget. Built up in tightly-scoped MVP steps. As of step 20, `from apex import MoEModel` is the headline API; as of step 23, all 30 decoder layers of Gemma 4 26B-A4B-IT-NVFP4 (sliding + full attention, K=V tied, partial RoPE) run end-to-end with bounded memory and LRU eviction; as of step 24, router scaling + dense MLP + sliding-window scope + chat-mode EOT stop are all wired in (output is not yet coherent — coherence still needs more, see step 24 in the changelog).
 
 ## How to test
 
 ```bash
-# Full unit suite (332 always-on tests; +58 real-Gemma tests run when
-# REAL_MOE_PATH points at a checkpoint)
+# Full unit suite (343 always-on tests; +70 real-Gemma tests run when
+# REAL_MOE_PATH points at a checkpoint, +3 xfail-tolerant coherence
+# probes that document where output quality still needs work)
 uv run pytest -q
 
 # Seven fake-MoE demos — each exercises a different combination of
@@ -37,6 +38,8 @@ uv run python examples/quickstart_multilayer.py      # 1/2/4-layer scaling sweep
 uv run python scripts/benchmark_layer_scaling.py     # tokens/sec + memory comparison table (step 21)
 uv run python scripts/audit_config.py                # config audit vs runtime assumptions (step 22A)
 uv run python scripts/structural_logit_sanity.py     # top-K logits + cross-prompt diversity (step 22C)
+uv run python scripts/audit_router.py                # scaled vs unscaled router top-k (step 24A)
+uv run python scripts/benchmark_quality.py           # per-prompt × per-L quality sweep (step 24F)
 ```
 
 Diagnostic scripts:
@@ -218,11 +221,11 @@ weighted-combine via apex.moe_layer.run_moe_layer
 
 ### `tests/`
 
-51 test modules, 332 always-on tests + 58 real-Gemma skipif tests (390 with `REAL_MOE_PATH` set). `tests/_world.py` provides `FakeStore` + re-exports the fake-world writers from `apex._fake_weights`. Real-Gemma tests live in `tests/test_real_moe_cache.py`, `tests/test_real_moe_two_layer.py`, `tests/test_runtime_real_integration.py`, `tests/test_real_memory_budget.py`, `tests/test_real_prefetch.py`, `tests/test_real_attention.py`, `tests/test_real_decoder.py`, and `tests/test_real_generation.py` — all auto-skip unless `REAL_MOE_PATH` (or a known local default path) resolves.
+53 test modules, 343 always-on tests + 70 real-Gemma skipif tests + 3 xfail-tolerant coherence probes (413 pass + 3 xfail with `REAL_MOE_PATH` set). `tests/_world.py` provides `FakeStore` + re-exports the fake-world writers from `apex._fake_weights`. Real-Gemma tests live in `tests/test_real_moe_cache.py`, `tests/test_real_moe_two_layer.py`, `tests/test_runtime_real_integration.py`, `tests/test_real_memory_budget.py`, `tests/test_real_prefetch.py`, `tests/test_real_attention.py`, `tests/test_real_decoder.py`, and `tests/test_real_generation.py` — all auto-skip unless `REAL_MOE_PATH` (or a known local default path) resolves.
 
 ---
 
-## What's done (steps 1–23)
+## What's done (steps 1–24)
 
 1–3. Bounded LRU cache, prefetcher, Markov predictor, metrics.
 4. SwiGLU FFN experts (gate/up/down bundles via `ExpertWeights`).
@@ -253,6 +256,13 @@ weighted-combine via apex.moe_layer.run_moe_layer
 21. Layer scaling + benchmarking: multi-layer real generation (up to the sliding-attention cap, 5 on Gemma 4) verified with `tests/test_model_multilayer_real.py` (8 new real-Gemma tests covering 2/4-layer generation, budget respected, KV scales linearly, tight-budget eviction still finite, EOS short-circuit). `examples/quickstart_multilayer.py` runs a `[1, 2, 4]`-layer sweep with per-trial memory reports; `scripts/benchmark_layer_scaling.py` prints a `L | load(s) | gen(s) | tok/s | peak expert | kv | peak total | evict | finite | budget` comparison table. Real run: tokens/sec halves per layer doubling (3.0 → 1.8 → 0.9 tok/s); peak expert grows linearly (318 MB → 590 MB → 1202 MB); kv stays in MB-range; budget respected at every L. **Bug fix included:** `apex/attention.py` was dividing fp32 scores by `np.sqrt(head_dim)` (numpy.float64), which silently promoted the layer's output to fp64 and doubled per-layer KV bytes from layer 1 onward. Cast scale to fp32; KV now uniform fp32 across layers. `MoEModel._last_generated_ids` exposes the authoritative generated-id list (re-encoding decoded text doesn't round-trip when output is non-printable bytes).
 22. Correctness audit + chat template + structural sanity. **22A:** `scripts/audit_config.py` walks every hyperparameter the runtime uses (hidden, head counts, head_dim, RoPE theta, RMS eps, softcap, BOS/EOS, layer types) and prints ✓ vs the raw `text_config` value plus an info row for unsupported full_attention extras (`attention_k_eq_v`, `global_head_dim=512`, `partial_rotary_factor=0.25`, `rope_theta_full=1e6`). **22B:** `apex/tokenizer.py:Tokenizer.apply_chat_template` + `encode_chat` render Gemma 4's 347-line `chat_template.jinja` (auto-loaded standalone or from `tokenizer_config.json["chat_template"]`) via `jinja2` with `loopcontrols`. `MoEModel.generate_chat(messages, **template_kwargs)` is the one-call API; KV reflects the templated render (markers + turn headers add tokens vs plain `generate`). **22C:** `MoEModel.forward(prompt) → logits` returns raw `(1, vocab)` logits without sampling — built on a new shared `_compute_logits` helper that `_make_step_fn` now also calls (single source of truth). `tests/test_logit_sanity_real.py` locks structural properties: shape, finite, softcap respected, four different prompts produce different argmax (non-degenerate), KV length matches prompt token count. `scripts/structural_logit_sanity.py` prints per-prompt top-10 + cross-prompt jaccard. **22D explicitly deferred:** num_layers > 5 needs a full_attention path (K=V tied, head_dim=512, partial RoPE factor=0.25, rope_theta=1e6) — substantial enough to be its own sprint.
 23. **Full-attention path: real Gemma 4 30-layer generation works.** ModelConfig parses the full_attention extras (`global_head_dim=512`, `num_global_key_value_heads=2`, `partial_rotary_factor=0.25`, `rope_theta=1e6`, `attention_k_eq_v=True`) and exposes per-layer accessors `head_dim_for_layer(L)`, `num_kv_heads_for_layer(L)`, `rope_theta_for_layer(L)`, `rotary_dim_for_layer(L)`, `attention_k_eq_v_for_layer(L)`. `apex/ops.py:apply_rope` gained a `rotary_dim` param for partial RoPE (rotates first slice; tail passes through). `apex/attention.py:attention_decode_step` accepts `v_weight=None` for K=V-tied layers — V is aliased after k_norm but before RoPE, so V picks up the per-head normalization but keeps its un-rotated values. `apex/checkpoint_loaders.py:load_attention_weights(..., k_eq_v=True)` skips the (missing on disk) `v_proj`. `MoEModel.from_pretrained` lifted its cap from `num_sliding_layers` to `num_hidden_layers` and builds per-layer attn_kwargs by layer type. Real benchmark on the local Gemma 4 26B-A4B-IT-NVFP4 with `--max-memory-gb 8`: L=8 → 2.6s/2 tok = 0.76 tok/s @ 2.4 GB; L=16 → 8.0s/2 tok = 0.25 tok/s @ 4.8 GB; **L=30 → 16.9s/2 tok = 0.12 tok/s @ 8.2 GB peak with 51 LRU evictions, finite, budget respected**. Tests: `tests/test_full_attention_real.py` (8 new) + `tests/test_real_attention.py` (4 new K=V/partial-RoPE) + `tests/test_ops.py` (7 partial-RoPE) + `tests/test_model_config.py` (3 accessor) = 22 new tests proving the layer-5 path.
+24. **Generation quality fixes (still pre-coherence).** Five focused commits closing math + ergonomics gaps that 30-layer generation was running with:
+    - **24A** — router scaling. `router.scale` (per-feature, applied to hidden BEFORE projection) and `router.per_expert_scale` (per-expert, applied to logits BEFORE top-k) were ignored. Now plumbed through `apex.moe_layer.route()` via new `hidden_scale` / `per_expert_scale` kwargs (default None ⇒ pre-step-24 byte-identical for Mixtral/Qwen). On Gemma 4 layer 0 the top-k softmax distribution went from near-uniform (top expert 0.18) to extremely peaky (0.997). `scripts/audit_router.py` prints scaled vs unscaled routing.
+    - **24B** — dense MLP shared path. Each Gemma 4 layer ships both routed MoE *and* a parallel dense FFN (`mlp.{gate,up,down}_proj`, intermediate=2112). The dense half was unused. New `apex/checkpoint_loaders.py:load_dense_mlp_weights` (AFFINE_UINT8_U32 dequant — same pipeline as router); `apex/decoder.py:decoder_decode_step` accepts `dense_mlp_call=None` (parallel branch summed before `post_ffn_norm`). `MoEModel.per_layer_dense_mlp` is non-evictable (~71 MB/layer × 30 layers ≈ 2.1 GB on top of the LRU expert cache budget).
+    - **24C** — sliding-window attention scope. `attention_decode_step(window_size=int|None)` trims K/V on read for sliding layers (Gemma 4: 1024). No-op for prompts ≤ window. Cache itself is not modified (eviction inside KVCache still out of scope). `ModelConfig.sliding_window_for_layer(L)` returns the per-layer cap; full layers get None and attend globally.
+    - **24D** — chat-mode EOT stop. `Tokenizer.eot_token_id` reads `<turn|>` (id 106 on Gemma 4) from `tokenizer_config.json`. `MoEModel.generate_chat` stops on EOS ∪ EOT; plain `generate` keeps EOS-only. Without this, `generate_chat` would generate past the model's intended turn boundary into the next user turn.
+    - **24E** — three xfail-tolerant plausible-top-K tests document the coherence goal: `"The capital of France is"` should top-K Paris/France, `"2 + 2 ="` should top-K `4`, etc. All three xfail today (output not coherent yet); they exist as the gating signal for when 24A+B+C+D get us to coherence.
+    - **24F** — `scripts/benchmark_quality.py` runs a 4-prompt × N-layer sweep with EOS-hit / longest-run / tok/s / peak / evictions reporting. **Honest result:** at L=8 with everything on, generation produces tokens like `'<unused10>'` and immediately hits EOS — finite, budget-respected, and not coherent. Coherence likely needs more (the `_1`/`_2` parallel norm variants we still skip, or HF/MLX reference parity to find the remaining math drift). The plumbing for every remaining quality fix is now in place.
 
 ---
 
@@ -260,19 +270,19 @@ weighted-combine via apex.moe_layer.run_moe_layer
 
 ### Near term
 
-- **Reference-logits parity (step 22C deferred half)** — structural sanity already passes; an exact / approximate comparison against an HF transformers or `mlx-lm` baseline would lock the numerics down end-to-end. Heavy dep we deliberately deferred.
-- **Generation quality (step 24)** — 30-layer generation works mechanically as of step 23 but the output is still gibberish on most prompts. Likely culprits in priority order: (a) router doesn't apply `router.scale` / `per_expert_scale`; (b) dense-MLP shared expert path missing (Gemma adds a parallel dense FFN to the routed MoE output); (c) sliding-window attention scope limit not enforced (we attend to the full cache, not just the last 1024 tokens — moot for short prompts); (d) NVFP4 dequant numerical accuracy. Step 24 should triage these.
-- **Sliding-window attention scope** — Gemma 4 sliding layers cap attention to the last 1024 tokens. We currently attend to the full cache, which is mathematically wrong for prompts > 1024 tokens (and a slow extra matmul for short prompts). Add a `window_size` kwarg to `attention_decode_step`.
+- **Generation coherence (step 24 follow-up)** — step 24 plumbed every quality fix we identified (router scaling, dense MLP parallel branch, sliding-window scope, EOT stop) and the runtime is now finite + budget-respected at 30 layers, but the L=8 benchmark still emits unused-token gibberish that hits EOS immediately. The next investigation paths in priority order:
+  - **`_1`/`_2` parallel norm variants** — Gemma 4 ships `pre_feedforward_layernorm_2`, `post_feedforward_layernorm_1`, `post_feedforward_layernorm_2` per layer. Step 24 left these on disk and shared the unsuffixed `pre_ffn` / `post_ffn` between routed and dense paths. The most likely fix is that each branch wants its own pre/post norm pair (routed: `pre_ffn` + `post_ffn`; dense: `pre_ffn_2` + `post_ffn_2` or similar). `apex/checkpoint_loaders.py:load_layer_norms` would need to surface the variants and `apex/decoder.py:decoder_decode_step` would need separate norm slots for the dense branch.
+  - **Reference-logits parity (step 22C deferred half)** — three xfail-tolerant plausibility tests (`tests/test_logit_sanity_real.py`) document the coherence target but only structurally. An exact (or approximate) comparison against HF transformers / `mlx-lm` for a single forward pass would localize the remaining math drift to a specific layer / op. Heavy dep we deliberately deferred.
+  - **Router-extras formula** — step 24A applies `hidden * router.scale` then `(hidden @ proj.T) * router.per_expert_scale` then top-k. The shapes match and the audit shows visible peaking, but the multiplicative-vs-additive choice and pre-vs-post softmax order are an educated guess; reference parity would confirm.
+  - **MoE expert combination** — `run_moe_layer` does a per-token `sum(w_i * expert_i(h))`. Gemma may use a different combination (e.g. weight renormalization across the top-k slice with per-expert biases, or a different SwiGLU activation order in the expert).
 - **Batched-prompt prefill (multi-token attention with causal mask)** — current `prefill` calls `step_fn` once per prompt token (O(prompt_len) sequential). A real batched prefill would process the whole prompt in a single multi-token attention call, cutting wall time for long prompts.
-- **Dense-MLP shared expert** — Gemma 4 carries both routed MoE and a dense MLP per layer (with the `_1`/`_2` parallel norm variants); driving both would change residual sums.
 - **MLX path for real weights** — `MLXBackend` already does SwiGLU; needs a `dequantize` step that produces `mx.array` directly to avoid the numpy round-trip. Same applies to `apex/ops.py`, `apex/attention.py`, `apex/decoder.py`, `apex/generation.py`, `apex/kv_cache.py` (NumPy-only today).
 - **Trained predictor on real-Gemma traces** — step 15 proved the prefetch path works on real layers; an actual trained `MarkovPredictor` (instead of the router-peek fallback) would let prefetch overlap with attention/norm in a real model loop. Needs trace data we don't have yet.
 
 ### Medium term
 
-- **Shared experts** — both Qwen MoE and Gemma 4 have an always-on dense FFN per layer alongside routed experts. Needs runtime + cache work, not just naming.
+- **Qwen shared experts** — Qwen MoE also ships an always-on dense FFN per layer; step 24B wired the equivalent for Gemma 4 only. The Qwen layout would need its own `dense_mlp_*` accessors and the `MoEModel` loader path generalized (currently only loads dense MLP weights when the layout returns non-None).
 - **Multi-token batches** — `route()` already supports batch dim; runtime + cache assume batch=1.
-- **Gemma 4 router scaling** — the model has `router.scale` and `router.per_expert_scale` tensors that bias scoring; APEX's `route()` ignores them. Stub a layout method `router_extras(L)`.
 - **GGUF quantized formats** — Q4_0 / Q4_K_M etc. New entry in `dequant.py` + a `QuantizedGGUFExpertStore`.
 - **Recovering from cache pressure** — eviction today is pure LRU; could weigh by routing-frequency hints from the predictor.
 

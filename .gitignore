@@ -18,4 +18,4 @@ traces/gguf_traces.jsonl
 experts/
 weights/
 
-docs/*.md
+docs/plan-next.md
