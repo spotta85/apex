@@ -93,6 +93,8 @@ def apply_rope(
     position_offset: int = 0,
     theta: float = 10000.0,
     rotary_dim: int | None = None,
+    rope_type: str = "default",
+    rope_factor: float = 1.0,
 ):
     """Apply Rotary Position Embedding along the last axis (head_dim).
 
@@ -104,30 +106,44 @@ def apply_rope(
     rotating a new decode-step token. Pass `0` to rotate a fresh
     prompt prefix from position 0.
 
-    Convention: HF / Gemma "split half" pairing on the rotated slice.
-    The first `rotary_dim/2` features pair with the second `rotary_dim/2`
-    features (NOT the interleaved `2i, 2i+1` pairing of the original
-    RoPE paper); HF Gemma stores weights in the split-half convention.
+    Convention: HF / Gemma "split half" pairing across the FULL
+    `head_dim`. Element index `i` (for `i < head_dim/2`) pairs with
+    `i + head_dim/2`. This is invariant under partial RoPE: the
+    pairing is determined by `head_dim`, not by `rotary_dim`. The
+    pre-step-26F implementation paired within the rotated slice
+    (`(i, i + rotary_dim/2)` for `i < rotary_dim/2`), which silently
+    produces a different rotation than the model was trained with
+    when `rotary_dim < head_dim`.
 
     `theta` is the base of the inverse-frequency series. Gemma 4
-    sliding-attention layers use 10000.0 (the default); full-attention
-    layers use 1000000.0.
+    sliding-attention layers use 10000.0; full-attention layers use
+    1000000.0.
 
-    `rotary_dim` controls partial RoPE (Gemma 4 full-attention layers
-    rotate only the first 25% of dims):
+    `rotary_dim` controls partial RoPE:
 
-      - `None` (default) ⇒ rotate the full head_dim — original behavior.
-      - integer < head_dim ⇒ rotate only the first `rotary_dim` dims;
-        the trailing `head_dim - rotary_dim` dims pass through unchanged.
+      - `None` (default) ⇒ rotate the full head_dim.
+      - integer < head_dim ⇒ rotate only the first `rotary_dim/2`
+        pair indices (those that fall within the first half of the
+        head_dim split). The remaining `(head_dim - rotary_dim) / 2`
+        pair indices use freq=inf ⇒ angle=0 ⇒ no rotation. The
+        ELEMENTS those pairs touch (`rotary_dim/2 ... head_dim/2`
+        and `rotary_dim/2 + head_dim/2 ... head_dim`) are passed
+        through unchanged.
 
-    Why partial RoPE: leaving a tail of dims unrotated lets the model
-    learn position-invariant features alongside positional ones — Gemma
-    4's full-attention layers use this with `partial_rotary_factor=0.25`.
+    `rope_type='default'` uses the standard exponent
+    `2i / rotary_dim` (matches `mlx.nn.RoPE`).
+
+    `rope_type='proportional'` uses the Gemma 4 full_attention
+    exponent `2i / head_dim` (matches `mlx_lm.models.rope_utils.
+    ProportionalRoPE`). The exponent denominator is the FULL
+    head_dim, so for `rotary_dim < head_dim` the per-pair angles
+    are smaller than under default — meaningfully different
+    rotation rates. `rope_factor` is an additional multiplier on
+    the freq base (default 1.0).
 
     Position 0 is the identity rotation (cos(0)=1, sin(0)=0), so
     `apply_rope(x, position_offset=0)` on a single-token tensor
-    returns x unchanged regardless of `rotary_dim` — matches the
-    "16C is correct at position 0" invariant from the smoke tests.
+    returns x unchanged regardless of `rotary_dim` / `rope_type`.
     """
     seq = x.shape[-2]
     head_dim = x.shape[-1]
@@ -144,47 +160,59 @@ def apply_rope(
         raise ValueError(
             f"rotary_dim must be even for RoPE; got {rotary_dim}"
         )
+    if head_dim % 2:
+        raise ValueError(
+            f"head_dim must be even for split-half RoPE; got {head_dim}"
+        )
     if rotary_dim == 0:
         # Degenerate "no RoPE" case — return unchanged. Easier to
         # support than to make every caller branch.
         return x
 
-    # Per-pair inverse frequencies in fp32 over the rotated slice.
-    # The doubled emb below broadcasts the same per-pair angle to both
-    # halves, which is what the split-half rotate_half expects.
-    half = rotary_dim // 2
-    inv_freq = 1.0 / (
-        theta ** (np.arange(half, dtype=np.float32) * 2.0 / rotary_dim)
-    )
+    # Per-pair inverse frequencies in fp32. Length = head_dim/2 pairs.
+    # Pairs at index i < rotary_dim/2 get rotated; pairs at index
+    # i >= rotary_dim/2 get inv_freq=0 (no rotation, freq=inf).
+    half_full = head_dim // 2
+    half_rot = rotary_dim // 2
+
+    if rope_type == "proportional":
+        # ProportionalRoPE: exponents divide by head_dim (NOT rotary_dim).
+        # Matches mlx_lm.models.rope_utils.ProportionalRoPE.
+        exponents = (
+            np.arange(0, rotary_dim, 2, dtype=np.float32) / head_dim
+        )
+        freq_base = np.float32(rope_factor) * (theta ** exponents)
+    elif rope_type == "default":
+        # Standard RoPE: exponents divide by rotary_dim.
+        exponents = np.arange(half_rot, dtype=np.float32) * 2.0 / rotary_dim
+        freq_base = theta ** exponents
+    else:
+        raise ValueError(
+            f"unknown rope_type {rope_type!r}; "
+            f"available: 'default', 'proportional'"
+        )
+
+    # Build full-head_dim/2 inv_freq array: rotated pairs use
+    # 1/freq_base; trailing tail-pairs use 0 (no rotation).
+    inv_freq = np.zeros(half_full, dtype=np.float32)
+    inv_freq[:half_rot] = 1.0 / freq_base
+
     positions = (
         np.arange(seq, dtype=np.float32) + float(position_offset)
     )
-    freqs = np.outer(positions, inv_freq)             # (seq, half)
-    emb = np.concatenate([freqs, freqs], axis=-1)     # (seq, rotary_dim)
+    freqs = np.outer(positions, inv_freq)             # (seq, half_full)
+    emb = np.concatenate([freqs, freqs], axis=-1)     # (seq, head_dim)
     cos = np.cos(emb)
     sin = np.sin(emb)
 
-    if rotary_dim == head_dim:
-        # Full-rotation fast path — no slice / concat. Same math as
-        # the original implementation; preserved so the no-partial
-        # smoke benchmarks don't pay the slice cost.
-        rotated_half = np.concatenate(
-            [-x[..., half:], x[..., :half]], axis=-1,
-        )
-        return (x * cos + rotated_half * sin).astype(x.dtype, copy=False)
-
-    # Partial RoPE: rotate the first `rotary_dim`, pass through the
-    # tail. Slicing along axis -1 keeps the seq axis intact for the
-    # broadcast against (seq, rotary_dim) cos/sin tables.
-    x_rot = x[..., :rotary_dim]
-    x_pass = x[..., rotary_dim:]
+    # Split-half rotation across the FULL head_dim. The unrotated
+    # tail-pairs (indices >= half_rot) have angle 0 ⇒ cos=1, sin=0
+    # ⇒ rotation is identity for those elements. So we don't need
+    # a separate slice path — the math is uniform.
     rotated_half = np.concatenate(
-        [-x_rot[..., half:], x_rot[..., :half]], axis=-1,
+        [-x[..., half_full:], x[..., :half_full]], axis=-1,
     )
-    rotated = x_rot * cos + rotated_half * sin
-    return np.concatenate([rotated, x_pass], axis=-1).astype(
-        x.dtype, copy=False,
-    )
+    return (x * cos + rotated_half * sin).astype(x.dtype, copy=False)
 
 
 def silu(x):

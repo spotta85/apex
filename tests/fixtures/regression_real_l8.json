@@ -8,63 +8,63 @@
   "prompts": {
     "The capital of France is": {
       "token_ids": [
-        1301,
-        884,
-        5672,
-        5392,
+        1082,
         6220,
-        1082,
-        1082,
-        1082
+        53609,
+        1753,
+        6220,
+        6220,
+        4890,
+        3519
       ],
-      "text": " ComualPL\u306a\u3044 lack than than than",
+      "text": " than lack Certainly\u0939\u0940 lack lack longer\u0441\u044c",
       "hit_eos": false,
-      "longest_run": 3
+      "longest_run": 2
     },
     "2 + 2 =": {
       "token_ids": [
-        5392,
-        1301,
-        4217,
+        1902,
+        1902,
         1902,
         6220,
-        1902,
-        3519,
-        5672
+        19632,
+        5392,
+        3765,
+        1493
       ],
-      "text": "\u306a\u3044 Com matter world lack world\u0441\u044cPL",
+      "text": " world world world lack Eh\u306a\u3044testing",
       "hit_eos": false,
-      "longest_run": 1
+      "longest_run": 3
     },
     "Once upon a time": {
       "token_ids": [
-        19632,
+        5672,
+        5672,
         5392,
-        12929,
-        12929,
-        6220,
+        2288,
+        3666,
         2524,
-        6133,
-        2524
+        2946,
+        5392
       ],
-      "text": " Eh\u306a\u3044 Ram Ram lackially wrongially",
+      "text": "PLPL\u306a\u3044\\] mindiallyzy\u306a\u3044",
       "hit_eos": false,
       "longest_run": 2
     },
     "def fibonacci(n):": {
       "token_ids": [
         3666,
-        884,
-        884,
-        13388,
+        6220,
+        5700,
+        3519,
+        3666,
         1301,
-        1323,
-        4534,
+        1301,
         1301
       ],
-      "text": " mindualual contro Com\u093f\u0915 Mark Com",
+      "text": " mind lack attention\u0441\u044c mind Com Com Com",
       "hit_eos": false,
-      "longest_run": 2
+      "longest_run": 3
     }
   }
 }

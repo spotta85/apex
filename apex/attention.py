@@ -62,6 +62,7 @@ def attention_decode_step(
     rms_eps: float = 1e-6,
     rope_theta: float = 10000.0,
     rotary_dim: int | None = None,
+    rope_type: str = "default",
     window_size: int | None = None,
     attn_scale: float | None = None,
 ):
@@ -162,11 +163,11 @@ def attention_decode_step(
     position_offset = kv_cache.length(layer_id)
     q = apply_rope(
         q, position_offset=position_offset,
-        theta=rope_theta, rotary_dim=rotary_dim,
+        theta=rope_theta, rotary_dim=rotary_dim, rope_type=rope_type,
     )
     k = apply_rope(
         k, position_offset=position_offset,
-        theta=rope_theta, rotary_dim=rotary_dim,
+        theta=rope_theta, rotary_dim=rotary_dim, rope_type=rope_type,
     )
 
     # Commit this step's k/v to the cache before reading; the new

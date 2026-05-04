@@ -297,6 +297,17 @@ class ModelConfig:
             else self.rope_theta_sliding
         )
 
+    def rope_type_for_layer(self, layer_id: int) -> str:
+        """Per-layer RoPE flavor.
+
+        Step 26F: Gemma 4 full_attention layers use ProportionalRoPE
+        (`rope_type: "proportional"` in `text_config.rope_parameters
+        ["full_attention"]`); sliding layers use standard
+        (`rope_type: "default"`). Defaults to "default" for layouts
+        that don't differentiate (every other model in the suite).
+        """
+        return "proportional" if self.is_full_attention(layer_id) else "default"
+
     def rotary_dim_for_layer(self, layer_id: int) -> int:
         """How many of head_dim's dims are rotated by RoPE for `layer_id`.
 

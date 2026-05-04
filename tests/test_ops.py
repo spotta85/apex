@@ -204,24 +204,49 @@ def test_apply_rope_odd_head_dim_raises():
 
 # --- Step 23B: partial RoPE -------------------------------------------------
 
-def test_apply_rope_partial_passes_through_tail_unchanged():
-    """rotary_dim < head_dim ⇒ the trailing slice must be untouched."""
+def test_apply_rope_partial_leaves_unrotated_tail_pairs_unchanged():
+    """Elements untouched by RoPE must equal input.
+
+    Step 26F corrected the partial-RoPE pairing to match HF/Gemma:
+    pairs are `(i, i + head_dim/2)` (across the FULL head_dim split),
+    and only pairs with `i < rotary_dim/2` get rotated. So the
+    elements that pass through unchanged are at indices
+      `[rotary_dim/2, head_dim/2)` ∪ `[rotary_dim/2 + head_dim/2, head_dim)`
+    not the trailing `[rotary_dim:]` slice the pre-26F implementation
+    was producing.
+    """
     rng = np.random.default_rng(7)
     head_dim, rotary_dim = 16, 8
+    half_full = head_dim // 2     # = 8
+    half_rot = rotary_dim // 2    # = 4
     x = rng.standard_normal((1, 2, 3, head_dim)).astype(np.float32)
     out = apply_rope(x, position_offset=5, rotary_dim=rotary_dim)
-    np.testing.assert_array_equal(out[..., rotary_dim:], x[..., rotary_dim:])
+
+    # Untouched: indices [half_rot, half_full) and [half_rot + half_full, head_dim).
+    np.testing.assert_array_equal(
+        out[..., half_rot:half_full], x[..., half_rot:half_full],
+    )
+    np.testing.assert_array_equal(
+        out[..., half_rot + half_full:], x[..., half_rot + half_full:],
+    )
 
 
-def test_apply_rope_partial_rotates_only_the_first_slice():
-    """The first `rotary_dim` features must change; the rest must not."""
+def test_apply_rope_partial_rotates_pair_indices_below_half_rot():
+    """Pair indices `[0, rotary_dim/2)` rotate; elements at those
+    pair positions and their mates at `+ head_dim/2` must change."""
     rng = np.random.default_rng(8)
     head_dim, rotary_dim = 16, 8
+    half_full = head_dim // 2      # 8
+    half_rot = rotary_dim // 2     # 4
     x = rng.standard_normal((1, 2, 3, head_dim)).astype(np.float32)
     out = apply_rope(x, position_offset=5, rotary_dim=rotary_dim)
-    # Rotated slice should generally differ (extremely improbable
-    # that any randomly generated slice happens to be invariant).
-    assert not np.allclose(out[..., :rotary_dim], x[..., :rotary_dim])
+    # Rotated pair indices touch elements [0, half_rot) and
+    # [half_full, half_full + half_rot). Both should change.
+    assert not np.allclose(out[..., :half_rot], x[..., :half_rot])
+    assert not np.allclose(
+        out[..., half_full:half_full + half_rot],
+        x[..., half_full:half_full + half_rot],
+    )
 
 
 def test_apply_rope_partial_position_zero_is_still_identity():
@@ -260,17 +285,26 @@ def test_apply_rope_partial_with_rotary_dim_equals_head_matches_full():
     np.testing.assert_array_equal(out_default, out_explicit)
 
 
-def test_apply_rope_partial_preserves_pair_norms_on_rotated_slice():
-    """Pair norms in the rotated slice must still be preserved (it's a rotation)."""
+def test_apply_rope_partial_preserves_full_split_pair_norms_when_rotated():
+    """Per-pair `(i, i + head_dim/2)` norms preserved on rotated indices.
+
+    Step 26F: pairs span the FULL head_dim split. For rotated pair
+    indices `i in [0, rotary_dim/2)`, the rotation is a 2-D rotation
+    of `(x[i], x[i + head_dim/2])` so the per-pair sum-of-squares is
+    invariant.
+    """
     rng = np.random.default_rng(11)
     head_dim, rotary_dim = 32, 16
-    half = rotary_dim // 2
+    half_full = head_dim // 2
+    half_rot = rotary_dim // 2
     x = rng.standard_normal((1, 1, 4, head_dim)).astype(np.float32)
     out = apply_rope(x, position_offset=3, rotary_dim=rotary_dim)
     in_pair_norms = (
-        x[..., :half] ** 2 + x[..., half:rotary_dim] ** 2
+        x[..., :half_rot] ** 2
+        + x[..., half_full:half_full + half_rot] ** 2
     )
     out_pair_norms = (
-        out[..., :half] ** 2 + out[..., half:rotary_dim] ** 2
+        out[..., :half_rot] ** 2
+        + out[..., half_full:half_full + half_rot] ** 2
     )
     np.testing.assert_allclose(in_pair_norms, out_pair_norms, rtol=1e-5)

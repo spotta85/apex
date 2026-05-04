@@ -579,6 +579,10 @@ class MoEModel:
                 rms_eps=config.rms_norm_eps,
                 rope_theta=config.rope_theta_for_layer(layer_id),
                 rotary_dim=config.rotary_dim_for_layer(layer_id),
+                # Step 26F: full_attention layers use ProportionalRoPE
+                # (different exponent denominator + factor multiplier).
+                # Sliding layers stay on 'default' RoPE.
+                rope_type=config.rope_type_for_layer(layer_id),
                 # Step 24C: sliding layers get the window_size cap;
                 # full_attention layers (and models without
                 # `sliding_window` in text_config) get None ⇒ global.
