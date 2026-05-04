@@ -5,7 +5,7 @@ APEX is a from-scratch Mixture-of-Experts (MoE) inference runtime focused on **b
 ## How to test
 
 ```bash
-# Full unit suite (293 always-on tests; +10 real-Gemma tests run when
+# Full unit suite (298 always-on tests; +10 real-Gemma tests run when
 # REAL_MOE_PATH points at a checkpoint)
 uv run pytest -q
 
@@ -118,7 +118,7 @@ weighted-combine via apex.moe_layer.run_moe_layer
 | `gate_router.py` | Real top-k routing via `hidden @ gate.npy` | `GateRouter` |
 | `real_router.py` | Lazy per-layer router loading/dequant from real sharded safetensors | `MultiLayerRealRouter` |
 | `metrics.py` | Counters (cache_hit/miss/eviction, prefetch_hit/miss) | `Metrics` |
-| `memory.py` | `MemoryReport` + `snapshot(cache, metrics)` — joined budget/peak/hits/misses/evictions report with `budget_respected` predicate | `MemoryReport`, `snapshot` |
+| `memory.py` | `MemoryReport` (expert cache) + `KVMemoryReport` (per-layer KV bytes) + `RuntimeMemoryReport` (joined) with `expert_cache_bytes` / `kv_cache_bytes` / `total_runtime_bytes` properties. Three `*_snapshot` constructors | `MemoryReport`, `KVMemoryReport`, `RuntimeMemoryReport`, `snapshot`, `kv_snapshot`, `runtime_snapshot` |
 | `trace_recorder.py` | Append-only JSONL transition log for predictor training | `TraceRecorder` |
 | `types.py` | `ExpertWeights(gate_proj, up_proj, down_proj)` | dataclass |
 
@@ -193,11 +193,11 @@ weighted-combine via apex.moe_layer.run_moe_layer
 
 ### `tests/`
 
-42 test modules, 293 always-on tests + 10 real-Gemma skipif tests (303 with `REAL_MOE_PATH` set). `tests/_world.py` provides `FakeStore` + re-exports the fake-world writers from `apex._fake_weights`. Real-Gemma tests live in `tests/test_real_moe_cache.py`, `tests/test_real_moe_two_layer.py`, `tests/test_runtime_real_integration.py`, `tests/test_real_memory_budget.py`, `tests/test_real_prefetch.py`, `tests/test_real_attention.py`, `tests/test_real_decoder.py`, and `tests/test_real_generation.py` — all auto-skip unless `REAL_MOE_PATH` (or a known local default path) resolves.
+42 test modules, 298 always-on tests + 10 real-Gemma skipif tests (308 with `REAL_MOE_PATH` set). `tests/_world.py` provides `FakeStore` + re-exports the fake-world writers from `apex._fake_weights`. Real-Gemma tests live in `tests/test_real_moe_cache.py`, `tests/test_real_moe_two_layer.py`, `tests/test_runtime_real_integration.py`, `tests/test_real_memory_budget.py`, `tests/test_real_prefetch.py`, `tests/test_real_attention.py`, `tests/test_real_decoder.py`, and `tests/test_real_generation.py` — all auto-skip unless `REAL_MOE_PATH` (or a known local default path) resolves.
 
 ---
 
-## What's done (steps 1–17D)
+## What's done (steps 1–17E)
 
 1–3. Bounded LRU cache, prefetcher, Markov predictor, metrics.
 4. SwiGLU FFN experts (gate/up/down bundles via `ExpertWeights`).
@@ -221,6 +221,7 @@ weighted-combine via apex.moe_layer.run_moe_layer
 17B. RoPE primitive: `apex/ops.py:apply_rope` — split-half RoPE matching HF/Gemma convention. Position 0 is identity (cos(0)=1, sin(0)=0), so the step-16 smoke math survives unchanged when wired through this code path. 6 unit tests.
 17C. KV-cache attention: `apex/attention.py:attention_decode_step` (canonical implementation reading + writing the cache, applying RoPE at the cache's current length). `single_token_attention` becomes a thin wrapper that constructs a fresh 1-layer KVCache and calls the canonical path — single source of truth for the attention math.
 17D. Multi-token generation: `apex/decoder.py:decoder_decode_step` (canonical sandwich-norm decoder threading KVCache through to attention) + `scripts/demo_generate_with_kv.py` running real Gemma 4 layer 0 with prefill + decode loops. KV cache grows monotonically (5 tokens × 1 layer × 8 KV heads × 256 head_dim × 4 bytes × 2 = 81920 bytes).
+17E. Separate memory budgets: `apex/memory.py:KVMemoryReport` (per-layer KV bytes) + `RuntimeMemoryReport` (joined view with `expert_cache_bytes`, `kv_cache_bytes`, `total_runtime_bytes`). `demo_generate_with_kv.py` now prints a joined `=== memory ===` block at the end of generation: e.g. `expert cache: 385.7 MB (peak 385.7 MB / budget 512.0 MB), kv cache: 0.1 MB, total: 385.8 MB`. KV is non-evictable during generation; the joined report surfaces it next to the LRU expert budget so operators can size both deliberately.
 
 ---
 
@@ -228,7 +229,6 @@ weighted-combine via apex.moe_layer.run_moe_layer
 
 ### Near term
 
-- **Step 17E — separate memory budgets** — track KV cache bytes alongside the LRU expert-cache `MemoryReport`. KV is non-evictable during generation; surfacing it next to the expert budget lets the operator size both deliberately.
 - **Real prefill (multi-token attention with causal mask)** — current prefill calls `decoder_decode_step` once per prompt token (O(prompt_len) sequential). A real `attention_prefill` would batch the prompt into a single (1, S, hidden) attention with a causal mask, cutting wall time substantially for long prompts.
 - **Tokenizer integration** — `demo_one_token_generate.py` and `demo_generate_with_kv.py` currently print token ids only. Adding `tokenizers` (small Rust dep, no torch) lets the demos accept string prompts and decode predicted ids.
 - **Layer heterogeneity for full-attention layers** — Gemma 4 layers 5/11/17/23/29 use full_attention with K=V tied (no v_proj on disk), head_dim=512, and partial RoPE (rotary_factor=0.25, theta=1e6). Needed for any decoder pass that goes past 5 layers.

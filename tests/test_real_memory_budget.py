@@ -22,7 +22,15 @@ from apex.backends.fake_backend import FakeBackend
 from apex.dequant import DequantizingExpertStore
 from apex.expert_cache import ExpertCache
 from apex.expert_manager import ExpertManager
-from apex.memory import MemoryReport, snapshot
+from apex.kv_cache import KVCache
+from apex.memory import (
+    KVMemoryReport,
+    MemoryReport,
+    RuntimeMemoryReport,
+    kv_snapshot,
+    runtime_snapshot,
+    snapshot,
+)
 from apex.metrics import Metrics
 from apex.runtime import Runtime
 from tests._synthetic_nvfp4 import (
@@ -221,3 +229,76 @@ def test_real_gemma_under_small_budget_evicts_and_stays_in_budget():
     # budget forces some evictions before layer 1 finishes loading.
     assert report.evictions > 0
     assert report.cache_misses == 16
+
+
+# --- Step 17E: KV + joined runtime memory reports ----------------------
+
+def _kv_array(seq_len: int, value: float = 0.0):
+    """(1, num_kv_heads=2, seq_len, head_dim=4) ndarray = 32 * seq_len bytes."""
+    return np.full((1, 2, seq_len, 4), value, dtype=np.float32)
+
+
+def test_kv_snapshot_empty_cache_is_zero_bytes():
+    """A fresh KVCache reports zero per-layer and zero total."""
+    cache = KVCache(num_layers=3)
+    report = kv_snapshot(cache)
+    assert isinstance(report, KVMemoryReport)
+    assert report.per_layer_bytes == (0, 0, 0)
+    assert report.total_bytes == 0
+
+
+def test_kv_snapshot_per_layer_bytes_match_appended_arrays():
+    """Append to two of three layers; the unused layer reports 0."""
+    cache = KVCache(num_layers=3)
+    # Layer 0: 2 seq positions ⇒ 2 tensors × 2 × 2 × 4 floats × 4 bytes = 128.
+    cache.append(0, _kv_array(2), _kv_array(2))
+    # Layer 2: 1 position ⇒ 64 bytes.
+    cache.append(2, _kv_array(1), _kv_array(1))
+    report = kv_snapshot(cache)
+    assert report.per_layer_bytes == (128, 0, 64)
+    assert report.total_bytes == 192
+
+
+def test_kv_snapshot_total_matches_kvcache_property():
+    """The report's total must agree with KVCache.total_bytes."""
+    cache = KVCache(num_layers=2)
+    cache.append(0, _kv_array(3), _kv_array(3))
+    cache.append(1, _kv_array(5), _kv_array(5))
+    report = kv_snapshot(cache)
+    assert report.total_bytes == cache.total_bytes
+
+
+def test_runtime_snapshot_total_is_sum_of_expert_plus_kv():
+    """RuntimeMemoryReport.total = expert.current_bytes + kv.total_bytes."""
+    metrics = Metrics()
+    cache = ExpertCache(max_memory_mb=1, verbose=False, metrics=metrics)
+    cache.put((0, 0), _expert(1))   # _BYTES_PER_EXPERT = 64
+    kv = KVCache(num_layers=1)
+    kv.append(0, _kv_array(1), _kv_array(1))   # 64 bytes total
+
+    report = runtime_snapshot(cache, metrics, kv)
+    assert isinstance(report, RuntimeMemoryReport)
+    assert report.expert_cache_bytes == _BYTES_PER_EXPERT
+    assert report.kv_cache_bytes == 64
+    assert report.total_runtime_bytes == _BYTES_PER_EXPERT + 64
+
+
+def test_runtime_snapshot_drills_into_expert_and_kv_components():
+    """`.expert` is the MemoryReport, `.kv` is the KVMemoryReport — round-trip."""
+    metrics = Metrics()
+    cache = ExpertCache(max_memory_mb=1, verbose=False, metrics=metrics)
+    cache.put((0, 0), _expert(1))
+    metrics.on_foreground_hit((0, 0))
+    metrics.on_foreground_miss((0, 1))
+    kv = KVCache(num_layers=2)
+    kv.append(1, _kv_array(2), _kv_array(2))
+
+    report = runtime_snapshot(cache, metrics, kv)
+    # .expert mirrors snapshot(cache, metrics) field-for-field.
+    expert_only = snapshot(cache, metrics)
+    assert report.expert == expert_only
+    assert report.expert.cache_hits == 1
+    assert report.expert.cache_misses == 1
+    # .kv mirrors kv_snapshot(kv) field-for-field.
+    assert report.kv == kv_snapshot(kv)
+    assert report.kv.per_layer_bytes == (0, 128)

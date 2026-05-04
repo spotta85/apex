@@ -1,27 +1,24 @@
-"""Memory budget reporting for the expert cache.
+"""Memory budget reporting for the expert cache + KV cache.
 
-The runtime + cache + metrics each track one slice of "how much memory
-APEX is using and whether it stayed under budget":
+Three immutable snapshots:
 
-  - cache.max_memory_bytes  the budget itself
-  - cache.current_bytes     bytes resident *right now*
-  - cache.peak_bytes        high-water mark across the cache's lifetime
-  - metrics.cache_hits      foreground requests served from cache
-  - metrics.cache_misses    foreground requests that triggered a load
-  - metrics.evictions       LRU drops because of budget pressure
+  - MemoryReport         expert cache (LRU, evictable). Tracks budget,
+                         current/peak bytes, hits/misses/evictions.
+  - KVMemoryReport       KV cache (monotonic, non-evictable during
+                         generation). Tracks per-layer + total bytes.
+  - RuntimeMemoryReport  joined view: expert + kv + total. The shape
+                         the step 17E spec calls out.
 
-`MemoryReport` collects all of those into one immutable snapshot so
-demos / tests can pass the report around without dragging the live
-cache + metrics objects with them. `snapshot(cache, metrics)` is the
-canonical constructor; `print_summary` produces the human-readable
-trace lines step 14's demo emits.
+`snapshot(cache, metrics)` builds the expert one, `kv_snapshot(kv_cache)`
+builds the KV one, and `runtime_snapshot(cache, metrics, kv_cache)`
+builds the joined one (composing the other two so callers can still
+drill into either side cleanly).
 
 Why a separate module instead of folding into Metrics: peak_bytes lives
-on the cache (cache is what observes its own bytes), while hits/misses
-live on Metrics. A small reporter that joins them is the simplest
-seam — Metrics keeps its single-responsibility, the cache keeps its
-single-responsibility, and the reporter is the only place that has
-to know about both.
+on the cache, hits/misses live on Metrics, KV lives on KVCache. A small
+reporter that joins them is the simplest seam — each producer keeps its
+single-responsibility and the reporter is the only place that has to
+know about all three.
 """
 
 from dataclasses import dataclass
@@ -84,4 +81,101 @@ def snapshot(cache, metrics) -> MemoryReport:
         cache_hits=metrics.cache_hits,
         cache_misses=metrics.cache_misses,
         evictions=metrics.evictions,
+    )
+
+
+@dataclass(frozen=True)
+class KVMemoryReport:
+    """Per-layer KV cache memory snapshot.
+
+    `per_layer_bytes[L]` is the sum of nbytes for layer L's keys +
+    values (or 0 if the layer hasn't been touched). `total_bytes` is
+    the sum across all layers. KV memory is non-evictable during
+    generation, so there's no `budget_respected` notion here — operators
+    set their generation budget by limiting sequence length, not by
+    asking the cache to drop entries.
+    """
+
+    per_layer_bytes: tuple
+    total_bytes: int
+
+    def print_summary(self):
+        """Print the total + each non-zero layer's contribution."""
+        print(f"kv cache total: {format_mb(self.total_bytes)}")
+        for layer_id, nbytes in enumerate(self.per_layer_bytes):
+            # Skip empty layers — common during sub-model smokes that
+            # only drive layer 0 of a larger num_layers KVCache.
+            if nbytes:
+                print(f"  layer {layer_id}: {format_mb(nbytes)}")
+
+
+def kv_snapshot(kv_cache) -> KVMemoryReport:
+    """Build a KVMemoryReport from a live KVCache.
+
+    Walks every layer slot and asks for `keys`/`values` shape; uses
+    `nbytes` when present, 0 otherwise. The total comes from
+    `kv_cache.total_bytes` so the joined report stays consistent with
+    whatever accounting KVCache itself uses.
+    """
+    per_layer = []
+    for layer_id in range(kv_cache.num_layers):
+        keys, values = kv_cache.get(layer_id)
+        layer_bytes = 0
+        if keys is not None:
+            layer_bytes += int(keys.nbytes)
+        if values is not None:
+            layer_bytes += int(values.nbytes)
+        per_layer.append(layer_bytes)
+    return KVMemoryReport(
+        per_layer_bytes=tuple(per_layer),
+        total_bytes=int(kv_cache.total_bytes),
+    )
+
+
+@dataclass(frozen=True)
+class RuntimeMemoryReport:
+    """Joined view of expert (LRU, evictable) + KV (monotonic, not) memory.
+
+    `expert_cache_bytes`, `kv_cache_bytes`, `total_runtime_bytes` are
+    the three numbers the step 17 spec calls out. Drill into `.expert`
+    or `.kv` for the full per-side detail (hits/misses/peak on the
+    expert side, per-layer breakdown on the KV side).
+    """
+
+    expert: MemoryReport
+    kv: KVMemoryReport
+
+    @property
+    def expert_cache_bytes(self) -> int:
+        return self.expert.current_bytes
+
+    @property
+    def kv_cache_bytes(self) -> int:
+        return self.kv.total_bytes
+
+    @property
+    def total_runtime_bytes(self) -> int:
+        return self.expert_cache_bytes + self.kv_cache_bytes
+
+    def print_summary(self):
+        """One-screen view: expert (with peak/budget context), kv, total."""
+        print(
+            f"expert cache: {format_mb(self.expert_cache_bytes)} "
+            f"(peak {format_mb(self.expert.peak_bytes)} / "
+            f"budget {format_mb(self.expert.budget_bytes)})"
+        )
+        print(f"kv cache:     {format_mb(self.kv_cache_bytes)}")
+        print(f"total:        {format_mb(self.total_runtime_bytes)}")
+
+
+def runtime_snapshot(cache, metrics, kv_cache) -> RuntimeMemoryReport:
+    """Joined snapshot from a live ExpertCache + Metrics + KVCache.
+
+    The three are independent objects that each track one slice of
+    runtime memory; this composes them so demos / tests can hand
+    around a single immutable summary instead of three live handles.
+    """
+    return RuntimeMemoryReport(
+        expert=snapshot(cache, metrics),
+        kv=kv_snapshot(kv_cache),
     )

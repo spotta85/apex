@@ -47,6 +47,7 @@ from apex.expert_cache import ExpertCache
 from apex.expert_manager import ExpertManager
 from apex.generation import embed_token, final_logits, sample_argmax
 from apex.kv_cache import KVCache
+from apex.memory import runtime_snapshot
 from apex.metrics import Metrics
 from apex.moe_layer import run_moe_layer
 from apex.ops import rms_norm
@@ -240,11 +241,15 @@ def main():
     print()
     print(f"prompt:    {prompt_ids}")
     print(f"generated: {generated}")
-    print(
-        f"final kv_cache length: {kv.length(0)}  "
-        f"bytes: {kv.total_bytes}  "
-        f"({kv.total_bytes / (1024 * 1024):.2f} MB)"
-    )
+    print(f"final kv_cache length: {kv.length(0)}")
+
+    # Joined runtime memory: expert (LRU, evictable) + KV (monotonic).
+    # Total = both — operators sizing a machine for generation need to
+    # plan for the expert budget AND the KV cache, not just one.
+    print()
+    print("=== memory ===")
+    runtime_snapshot(cache, metrics, kv).print_summary()
+
     print()
     print("[ok] real multi-token generation passed")
 
