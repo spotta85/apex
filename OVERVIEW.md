@@ -5,7 +5,7 @@ APEX is a from-scratch Mixture-of-Experts (MoE) inference runtime focused on **b
 ## How to test
 
 ```bash
-# Full unit suite (316 always-on tests; +26 real-Gemma tests run when
+# Full unit suite (316 always-on tests; +34 real-Gemma tests run when
 # REAL_MOE_PATH points at a checkpoint)
 uv run pytest -q
 
@@ -33,6 +33,8 @@ uv run python scripts/demo_generate_with_kv.py       # multi-token gen with KV c
 uv run python scripts/demo_prefill.py                # prompt prefill + decode tail (step 18)
 uv run python scripts/demo_tokenizer_generate.py     # text in / text out generation (step 19)
 uv run python examples/quickstart.py                 # MoEModel.generate() one-liner API (step 20)
+uv run python examples/quickstart_multilayer.py      # 1/2/4-layer scaling sweep with memory reports (step 21)
+uv run python scripts/benchmark_layer_scaling.py     # tokens/sec + memory comparison table (step 21)
 ```
 
 Diagnostic scripts:
@@ -201,20 +203,22 @@ weighted-combine via apex.moe_layer.run_moe_layer
 | `demo_generate_with_kv.py` | Multi-token generation: prefill prompt token-by-token through `decoder_decode_step` (KVCache grows monotonically), then decode N more tokens (step 17D) |
 | `demo_prefill.py` | Real prompt prefill via `apex.prefill.prefill`: 5-token prompt + 3-token decode tail; per-step KV cache length printout matches the step 18 spec format (step 18) |
 | `demo_tokenizer_generate.py` | Text-in / text-out generation: `Tokenizer.encode("Hello world")` → BOS + token ids → prefill + decode loop → `Tokenizer.decode` back to text (step 19) |
+| `benchmark_layer_scaling.py` | Sweeps `num_layers` ∈ {1, 2, 4} on the MoEModel and prints a `L | load(s) | gen(s) | tok/s | peak expert | kv | peak total | evict | finite | budget` comparison table (step 21) |
 
 ### `examples/`
 
 | Script | Purpose |
 |--------|---------|
 | `quickstart.py` | Three-call MoEModel API: `MoEModel.from_pretrained(path, max_memory_gb=8)` → `model.generate("Explain MoE simply.", max_tokens=32)` → `model.memory_report().print_summary()` (step 20) |
+| `quickstart_multilayer.py` | Layer-count sweep: builds a fresh `MoEModel` at `num_layers ∈ [1, 2, 4]` and prints memory + timing per trial (step 21) |
 
 ### `tests/`
 
-47 test modules, 316 always-on tests + 26 real-Gemma skipif tests (342 with `REAL_MOE_PATH` set). `tests/_world.py` provides `FakeStore` + re-exports the fake-world writers from `apex._fake_weights`. Real-Gemma tests live in `tests/test_real_moe_cache.py`, `tests/test_real_moe_two_layer.py`, `tests/test_runtime_real_integration.py`, `tests/test_real_memory_budget.py`, `tests/test_real_prefetch.py`, `tests/test_real_attention.py`, `tests/test_real_decoder.py`, and `tests/test_real_generation.py` — all auto-skip unless `REAL_MOE_PATH` (or a known local default path) resolves.
+48 test modules, 316 always-on tests + 34 real-Gemma skipif tests (350 with `REAL_MOE_PATH` set). `tests/_world.py` provides `FakeStore` + re-exports the fake-world writers from `apex._fake_weights`. Real-Gemma tests live in `tests/test_real_moe_cache.py`, `tests/test_real_moe_two_layer.py`, `tests/test_runtime_real_integration.py`, `tests/test_real_memory_budget.py`, `tests/test_real_prefetch.py`, `tests/test_real_attention.py`, `tests/test_real_decoder.py`, and `tests/test_real_generation.py` — all auto-skip unless `REAL_MOE_PATH` (or a known local default path) resolves.
 
 ---
 
-## What's done (steps 1–20)
+## What's done (steps 1–21)
 
 1–3. Bounded LRU cache, prefetcher, Markov predictor, metrics.
 4. SwiGLU FFN experts (gate/up/down bundles via `ExpertWeights`).
@@ -242,6 +246,7 @@ weighted-combine via apex.moe_layer.run_moe_layer
 18. Real prompt prefill: `apex/prefill.py:prefill(prompt_ids, *, step_fn)` extracts the prefill loop into a reusable + testable primitive. KV cache lives in `step_fn`'s closure so prefill itself stays stateless. `scripts/demo_prefill.py` drives a 5-token prompt then 3-token decode tail, printing `kv cache length: N` per step. `scripts/demo_generate_with_kv.py` refactored to use the same `prefill` function — single source of truth.
 19. Tokenizer integration: `apex/tokenizer.py:Tokenizer` wraps the pure-Rust `tokenizers` library (`Tokenizer.from_file` on `<path>/tokenizer.json`) and reads `bos_token_id` from `<path>/config.json` to replicate `transformers.GemmaTokenizer.add_bos_token=True` behavior. `scripts/demo_tokenizer_generate.py` accepts `--prompt "Hello world"`, encodes to `[2, 9259, 1902]` (BOS + 2 tokens), runs prefill + decode, and decodes generated ids back to text — completing the text-in / text-out path.
 20. User-facing API: `from apex import MoEModel` is now a real surface. `apex/config.py:ModelConfig.from_path` parses `text_config` once into a frozen snapshot (hidden_size, head counts, RoPE theta, EOS ids tuple, sliding-vs-full layer cap). `apex/sampling.py:sample` adds temperature-scaled categorical sampling (T=0 collapses to argmax — `apex.generation.sample_argmax` re-exports it for back-compat). `apex/model.py:MoEModel.from_pretrained(path, max_memory_gb=8)` eager-loads tokenizer + embedding + per-layer attn/norms + cache + manager + router; `model.generate(prompt, max_tokens, temperature) → str` runs encode → prefill → decode loop → decode, stopping on EOS. `model.memory_report()` returns the joined `RuntimeMemoryReport`. `examples/quickstart.py` is the three-call quickstart. Clear errors: missing dir → FileNotFoundError; unsupported backend / non-positive memory / num_layers > sliding cap → ValueError.
+21. Layer scaling + benchmarking: multi-layer real generation (up to the sliding-attention cap, 5 on Gemma 4) verified with `tests/test_model_multilayer_real.py` (8 new real-Gemma tests covering 2/4-layer generation, budget respected, KV scales linearly, tight-budget eviction still finite, EOS short-circuit). `examples/quickstart_multilayer.py` runs a `[1, 2, 4]`-layer sweep with per-trial memory reports; `scripts/benchmark_layer_scaling.py` prints a `L | load(s) | gen(s) | tok/s | peak expert | kv | peak total | evict | finite | budget` comparison table. Real run: tokens/sec halves per layer doubling (3.0 → 1.8 → 0.9 tok/s); peak expert grows linearly (318 MB → 590 MB → 1202 MB); kv stays in MB-range; budget respected at every L. **Bug fix included:** `apex/attention.py` was dividing fp32 scores by `np.sqrt(head_dim)` (numpy.float64), which silently promoted the layer's output to fp64 and doubled per-layer KV bytes from layer 1 onward. Cast scale to fp32; KV now uniform fp32 across layers. `MoEModel._last_generated_ids` exposes the authoritative generated-id list (re-encoding decoded text doesn't round-trip when output is non-printable bytes).
 
 ---
 
