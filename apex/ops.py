@@ -31,12 +31,19 @@ def rms_norm(x, weight, eps: float = 1e-6, *, gemma_unit_offset: bool = False):
 
     Standard form: ``output = x / sqrt(mean(x^2) + eps) * weight``.
 
+    `weight=None` skips the scale entirely — equivalent to
+    `mlx_lm.models.gemma4_text.RMSNormNoScale`. Used for V projection
+    in Gemma 4 attention (V gets a plain RMS normalization with no
+    learnable scale, while Q and K get the standard scaled RMSNorm).
+
     `gemma_unit_offset=True` switches to Gemma's RMSNorm convention
     where the stored weight is a delta-from-1.0
     (``output = x_normed * (1 + weight)``). This matters because
     Gemma's checkpoint weights are centered around zero, not one;
     forgetting the +1 silently zeros out activations and the smoke
     test would still "pass" (finite + correctly shaped, just wrong).
+    Mutually exclusive with `weight=None` (you can't unit-offset a
+    missing weight).
 
     Verified against ``transformers/.../modeling_gemma.py:GemmaRMSNorm``.
 
@@ -47,6 +54,9 @@ def rms_norm(x, weight, eps: float = 1e-6, *, gemma_unit_offset: bool = False):
     x_f32 = x.astype(np.float32, copy=False)
     var = np.mean(x_f32 * x_f32, axis=-1, keepdims=True)
     x_normed = x_f32 / np.sqrt(var + eps)
+    if weight is None:
+        # RMSNormNoScale — no learnable scale, no +1 offset.
+        return x_normed.astype(x.dtype, copy=False)
     scale = (1.0 + weight) if gemma_unit_offset else weight
     return (x_normed * scale).astype(x.dtype, copy=False)
 

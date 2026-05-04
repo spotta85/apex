@@ -8,63 +8,63 @@
   "prompts": {
     "The capital of France is": {
       "token_ids": [
-        1753,
-        1753,
-        1753,
-        1753,
-        1753,
-        1753,
-        1753,
-        1753
+        1301,
+        884,
+        5672,
+        5392,
+        6220,
+        1082,
+        1082,
+        1082
       ],
-      "text": "\u0939\u0940\u0939\u0940\u0939\u0940\u0939\u0940\u0939\u0940\u0939\u0940\u0939\u0940\u0939\u0940",
-      "hit_eos": false,
-      "longest_run": 8
-    },
-    "2 + 2 =": {
-      "token_ids": [
-        1753,
-        1753,
-        1753,
-        251,
-        251,
-        1753,
-        251,
-        251
-      ],
-      "text": "\u0939\u0940\u0939\u0940\u0939\u0940\r\r\u0939\u0940\r\r",
+      "text": " ComualPL\u306a\u3044 lack than than than",
       "hit_eos": false,
       "longest_run": 3
     },
+    "2 + 2 =": {
+      "token_ids": [
+        5392,
+        1301,
+        4217,
+        1902,
+        6220,
+        1902,
+        3519,
+        5672
+      ],
+      "text": "\u306a\u3044 Com matter world lack world\u0441\u044cPL",
+      "hit_eos": false,
+      "longest_run": 1
+    },
     "Once upon a time": {
       "token_ids": [
-        1753,
-        1753,
-        1753,
-        1753,
-        1753,
-        1753,
-        1753,
-        1753
+        19632,
+        5392,
+        12929,
+        12929,
+        6220,
+        2524,
+        6133,
+        2524
       ],
-      "text": "\u0939\u0940\u0939\u0940\u0939\u0940\u0939\u0940\u0939\u0940\u0939\u0940\u0939\u0940\u0939\u0940",
+      "text": " Eh\u306a\u3044 Ram Ram lackially wrongially",
       "hit_eos": false,
-      "longest_run": 8
+      "longest_run": 2
     },
     "def fibonacci(n):": {
       "token_ids": [
-        1753,
-        1753,
-        1753,
-        1753,
-        1753,
-        1753,
-        1753,
-        1753
+        3666,
+        884,
+        884,
+        13388,
+        1301,
+        1323,
+        4534,
+        1301
       ],
-      "text": "\u0939\u0940\u0939\u0940\u0939\u0940\u0939\u0940\u0939\u0940\u0939\u0940\u0939\u0940\u0939\u0940",
+      "text": " mindualual contro Com\u093f\u0915 Mark Com",
       "hit_eos": false,
-      "longest_run": 8
+      "longest_run": 2
     }
   }
 }

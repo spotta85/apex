@@ -583,6 +583,20 @@ class MoEModel:
                 # full_attention layers (and models without
                 # `sliding_window` in text_config) get None ⇒ global.
                 window_size=config.sliding_window_for_layer(layer_id),
+                # Step 26E: Gemma 4's reference uses scale=1.0 in
+                # scaled_dot_product_attention because its q_norm +
+                # k_norm bring Q/K rows to unit RMS already; the
+                # standard 1/sqrt(d) on top of that over-suppresses
+                # attention scores. Auto-detect: when q_norm and
+                # k_norm are both loaded, take 1.0; otherwise (Mixtral,
+                # Qwen, synthetic — no q/k norms) keep the standard
+                # 1/sqrt(d) by passing None.
+                attn_scale=(
+                    1.0
+                    if (attn_weights["q_norm"] is not None
+                        and attn_weights["k_norm"] is not None)
+                    else None
+                ),
             )
 
             # Per-layer router capture buffer. The closure below writes

@@ -348,7 +348,15 @@ def test_real_gemma_attention_decode_step_grows_cache_finitely():
 # --- Step 23C: K=V tied + partial RoPE -------------------------------------
 
 def test_decode_step_k_eq_v_skips_v_projection():
-    """`v_weight=None` ⇒ K and V share the post-norm K projection."""
+    """`v_weight=None` ⇒ V is projected through k_weight (no separate v_proj).
+
+    With NO q_norm / k_norm provided: K gets RoPE only, V gets
+    no norm and no RoPE. At position 0 RoPE is identity, so K
+    and V are byte-equal because both are just `linear(hidden,
+    k_weight)`. Step 26E only kicks in v_norm when k_norm is
+    present (the Gemma signature) — which is checked by the
+    sibling `..._with_k_norm_applies_separate_v_norm` test.
+    """
     rng = np.random.default_rng(50)
     hidden = rng.standard_normal((1, 64)).astype(np.float32)
     num_heads, num_kv_heads, head_dim = 4, 2, 16
@@ -367,19 +375,22 @@ def test_decode_step_k_eq_v_skips_v_projection():
     assert out.shape == (1, 64)
     assert np.all(np.isfinite(out))
 
-    # KV cache contents should match: V is the post-norm pre-RoPE K.
-    # At position 0 RoPE is identity, so K_cached (post-RoPE) and
-    # V_cached (post-norm only, no norms here) match exactly when
-    # no q_norm / k_norm applied.
+    # No k_norm given → no v_norm applied. RoPE position 0 is identity
+    # → K and V are both `linear(hidden, k_weight)`, byte-equal.
     keys, values = cache.get(0)
     np.testing.assert_array_equal(keys, values)
 
 
-def test_decode_step_k_eq_v_with_k_norm_applies_norm_to_v_too():
-    """When V is tied to K and k_norm is provided, V picks up the norm too.
+def test_decode_step_k_eq_v_with_k_norm_applies_separate_v_norm():
+    """When V is tied to K and k_norm is provided, V gets RMSNormNoScale.
 
-    This is the behavior the real model expects: K and V share the
-    same projection AND the same per-head norm; only RoPE differs.
+    Step 26E corrected the V-norm wiring: in the K=V-tied path, V
+    starts as the raw `linear(hidden, k_weight)` projection (NOT
+    post-k_norm K), then gets a `RMSNormNoScale` (RMS without
+    learnable scale) — matching mlx_lm's gemma4_text Attention.
+    K still gets the learnable k_norm + RoPE. So K and V at
+    position 0 are NO LONGER equal: V's magnitude is unit-RMS, K's
+    is k_norm-scaled.
     """
     rng = np.random.default_rng(51)
     hidden = rng.standard_normal((1, 32)).astype(np.float32)
@@ -399,9 +410,13 @@ def test_decode_step_k_eq_v_with_k_norm_applies_norm_to_v_too():
             kv_cache=cache, layer_id=0,
         )
     keys, values = cache.get(0)
-    # Position 0 ⇒ RoPE identity ⇒ K and V (both post-norm, neither rotated)
-    # must be byte-identical here.
-    np.testing.assert_array_equal(keys, values)
+    # K had learnable k_norm (gemma_unit_offset, +1 scale); V had
+    # RMSNormNoScale (no scale). Different math ⇒ different values.
+    assert not np.allclose(keys, values)
+    # V's per-head magnitude should be ~unit RMS (RMSNormNoScale
+    # output). RMS of values along the head_dim axis ≈ 1.
+    v_rms = np.sqrt(np.mean(values * values, axis=-1))
+    assert np.all(np.abs(v_rms - 1.0) < 0.05)
 
 
 def test_decode_step_k_eq_v_at_nonzero_position_diverges_from_v():

@@ -63,6 +63,7 @@ def attention_decode_step(
     rope_theta: float = 10000.0,
     rotary_dim: int | None = None,
     window_size: int | None = None,
+    attn_scale: float | None = None,
 ):
     """One decode step of self-attention with a KVCache.
 
@@ -87,6 +88,18 @@ def attention_decode_step(
 
     `rotary_dim=None` rotates the full head_dim (sliding behavior).
     Pass an integer < head_dim for partial RoPE (full layers).
+
+    `attn_scale=None` falls back to the standard `1/sqrt(head_dim)`
+    scaling. Gemma 4 — which applies q_norm + k_norm to bring Q/K
+    rows to unit RMS — passes 1.0 (no extra scaling), per
+    `mlx_lm.models.gemma4_text:Attention.__init__` line 203:
+    `self.scale = 1.0`. Step 26E.
+
+    Step 26E also makes V pick up `RMSNormNoScale` (a plain RMS
+    normalization with no learnable weight) when `k_norm_weight` is
+    provided — the Gemma family ships `v_norm` alongside q/k norms
+    for stability, and APEX previously skipped it (V was either raw
+    projected or aliased to post-k-norm K).
     """
     # Project Q always; project K once. V either gets its own
     # projection or is aliased to K below (after k_norm, before RoPE)
@@ -113,10 +126,25 @@ def attention_decode_step(
     if k_norm_weight is not None:
         k = rms_norm(k, k_norm_weight, eps=rms_eps, gemma_unit_offset=True)
 
-    # K=V-tied path: V picks up the post-norm K but NOT RoPE. Alias
-    # before the RoPE rebind below so V keeps the un-rotated values.
+    # K=V-tied path: V picks up the K projection (alias) but NOT
+    # k_norm or RoPE. Reference applies its own v_norm (RMSNormNoScale)
+    # below.
     if v is None:
-        v = k
+        # `linear(hidden, k_weight)` is what `k` was BEFORE k_norm;
+        # we need to re-project (or capture pre-norm K) to get the
+        # un-normalized V. Cheapest path: project hidden through
+        # k_weight again. The duplicate matmul is the price of
+        # keeping k post-norm separate from v pre-norm.
+        v = linear(hidden, k_weight).reshape(1, num_kv_heads, 1, head_dim)
+
+    # Step 26E: V gets `RMSNormNoScale` — a plain RMS normalization
+    # with no learnable scale weight — when q_norm/k_norm are
+    # configured. (mlx_lm/models/gemma4_text.py:217 wires
+    # `RMSNormNoScale(self.head_dim, eps=...)` whenever has_kv.)
+    # When q/k norms are absent (Mixtral / Qwen / synthetic), skip
+    # v_norm to keep those paths byte-identical.
+    if k_norm_weight is not None:
+        v = rms_norm(v, weight=None, eps=rms_eps)
 
     # RoPE at this token's position in the sequence — the cache's
     # current length IS the next position (0-indexed). At position 0
@@ -166,6 +194,10 @@ def attention_decode_step(
 
     # Scaled dot product. q: (1, H, 1, D); k_all.T: (1, H, D, S).
     # scores: (1, H, 1, S). softmax over the S axis.
+    # Step 26E: `attn_scale=None` falls back to `1/sqrt(head_dim)` (the
+    # standard transformer scale). Gemma 4 passes 1.0 explicitly
+    # because its q_norm + k_norm already bring Q/K rows to unit RMS,
+    # so the additional 1/sqrt(d) would over-suppress attention scores.
     # `np.sqrt(int)` returns numpy.float64; dividing an fp32 score
     # array by an fp64 scalar promotes the result to fp64 — and that
     # promotion then propagates through softmax, the v matmul, and
@@ -174,7 +206,11 @@ def attention_decode_step(
     # silently doubles the per-layer KV bytes (visible in
     # `kv_snapshot.per_layer_bytes`). Cast the divisor to fp32 to
     # keep the whole attention path in single precision.
-    scale = np.float32(head_dim) ** -0.5
+    scale = (
+        np.float32(attn_scale)
+        if attn_scale is not None
+        else (np.float32(head_dim) ** -0.5)
+    )
     scores = (q @ k_all.transpose(0, 1, 3, 2)) * scale
     weights = softmax(scores, axis=-1)
     attn = weights @ v_all                          # (1, H, 1, D)
