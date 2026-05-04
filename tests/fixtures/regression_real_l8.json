@@ -1,0 +1,45 @@
+{
+  "params": {
+    "num_layers": 8,
+    "max_tokens": 8,
+    "max_memory_gb": 8.0,
+    "temperature": 0.0
+  },
+  "prompts": {
+    "The capital of France is": {
+      "token_ids": [
+        16,
+        1
+      ],
+      "text": "<unused10>",
+      "hit_eos": true,
+      "longest_run": 1
+    },
+    "2 + 2 =": {
+      "token_ids": [
+        25,
+        1
+      ],
+      "text": "<unused19>",
+      "hit_eos": true,
+      "longest_run": 1
+    },
+    "Once upon a time": {
+      "token_ids": [
+        1
+      ],
+      "text": "",
+      "hit_eos": true,
+      "longest_run": 1
+    },
+    "def fibonacci(n):": {
+      "token_ids": [
+        12,
+        1
+      ],
+      "text": "<unused6>",
+      "hit_eos": true,
+      "longest_run": 1
+    }
+  }
+}
