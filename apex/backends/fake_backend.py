@@ -1,9 +1,12 @@
-"""Fake compute backend (NumPy).
+"""NumPy compute backend (class name `FakeBackend` is historical).
 
-A real backend would call into MLX, llama.cpp, a CUDA kernel, etc.
-For the MVP we just do NumPy matmul + a configurable gate activation
-so the runtime can move data through the pipeline and produce real
-arrays.
+Despite the name this is not a stub: it is the dense-fp32 NumPy
+backend `MoEModel` uses for `backend="numpy"` on real checkpoints.
+`apex.backends.mlx_backend.MLXBackend` is the Apple-Silicon (MLX)
+counterpart; a CUDA or llama.cpp backend would follow the same
+interface. It does plain NumPy matmul + a configurable gate
+activation, so the runtime can move data through the pipeline and
+produce real arrays.
 
 Step 4 made `run_expert` a SwiGLU FFN; the HF-orientation refactor
 flipped the projection shapes so APEX matches every public Transformer
@@ -16,8 +19,9 @@ Step 26A made `act` per-checkpoint. Mixtral / Qwen MoE / older Gemma
 ship `hidden_act: silu` ⇒ SiLU. Gemma 4 ships
 `hidden_activation: gelu_pytorch_tanh` ⇒ tanh-approximation GELU. The
 backend reads the choice once at construction so per-call dispatch
-stays a single attribute lookup. Defaulting to "silu" keeps every
-synthetic / Mixtral / Qwen test path byte-identical.
+stays a single attribute lookup. Defaulting to "silu" is the right
+choice for synthetic / Mixtral / Qwen checkpoints; Gemma 4 callers
+must pass `gelu_pytorch_tanh` (`MoEModel` does, from the config).
 
 Backend interface:
   - name                          string, used in trace lines

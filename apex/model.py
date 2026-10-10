@@ -28,7 +28,9 @@ Caveats today:
     as of step 23. Both sliding_attention and full_attention layers
     are supported. Per-layer head_dim / num_kv_heads / RoPE / K=V-tied
     attention are wired via `config.head_dim_for_layer(L)` etc.
-  - backend="numpy" is the only choice — the FakeBackend NumPy MoE.
+  - backend="numpy" (FakeBackend, dense fp32 NumPy MoE) or
+    backend="mlx" (MLXBackend, expert matmuls on the Apple-Silicon
+    GPU via unified memory). Same math; "mlx" is the fast path.
   - Sampling is greedy by default (`temperature=0.0`); temperature > 0
     delegates to `apex.sampling.sample`.
 """
@@ -45,6 +47,7 @@ if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
 from apex.backends.fake_backend import FakeBackend
+from apex.backends.mlx_backend import MLXBackend
 from apex.checkpoint_loaders import (
     load_attention_weights,
     load_dense_mlp_weights,
@@ -75,7 +78,7 @@ from scripts._real_moe_helpers import (
 )
 
 
-_SUPPORTED_BACKENDS = ("numpy",)
+_SUPPORTED_BACKENDS = ("numpy", "mlx")
 
 
 class MoEModel:
@@ -260,13 +263,29 @@ class MoEModel:
         )
         quant_store = quantized_store_for_layout(config.path, config.layout)
         store = DequantizingExpertStore(quant_store, verbose=False)
-        manager = ExpertManager(store=store, cache=cache, metrics=metrics)
         # Step 26A: pick the FFN activation from the checkpoint's
         # `hidden_activation`. Gemma 4 = gelu_pytorch_tanh; Mixtral /
         # Qwen / synthetic = silu. Using SiLU against a GeLU-trained
         # checkpoint compounds layer-after-layer into incoherent
         # output, so this read is load-bearing for quality.
-        backend_obj = FakeBackend(activation=config.hidden_activation)
+        #
+        # backend="mlx" runs expert matmuls on MLX (GPU / unified
+        # memory) instead of NumPy. Its `prepare_expert` converts the
+        # dequantized bundle to mx.array ONCE; passing the backend to
+        # the manager (below) means the cache stores that mx-native
+        # bundle, so every cache hit hands back ready-to-compute
+        # tensors and pays no conversion cost.
+        if backend == "mlx":
+            backend_obj = MLXBackend(activation=config.hidden_activation)
+        else:
+            backend_obj = FakeBackend(activation=config.hidden_activation)
+        # Pass the backend to the manager so ensure_loaded runs
+        # backend.prepare_expert before caching. Without this the cache
+        # holds raw dequantized NumPy arrays and an MLX backend would
+        # re-convert on every expert call — defeating the cache.
+        manager = ExpertManager(
+            store=store, cache=cache, metrics=metrics, backend=backend_obj,
+        )
         router = MultiLayerRealRouter(
             config.path, config.layout, top_k=config.top_k_experts,
         )
@@ -625,11 +644,13 @@ class MoEModel:
                             list(weights) if not hasattr(weights, "tolist")
                             else weights.tolist()
                         )
-                    return run_moe_layer(
-                        h, ids, weights,
+                    h_native = self.backend.prepare_hidden(h)
+                    out = run_moe_layer(
+                        h_native, ids, weights,
                         lambda eid: self.manager.ensure_loaded(lid, eid),
                         self.backend,
                     )
+                    return self.backend.to_numpy(out)
 
             # Step 26B: split route + experts so the decoder can route
             # on the RAW post-attn hidden (matches Gemma 4 reference)
@@ -652,11 +673,20 @@ class MoEModel:
 
             def experts_call(h, ids, weights, lid=layer_id):
                 with nvfp4_matmul_warnings():
-                    return run_moe_layer(
-                        h, ids, weights,
+                    # Convert the hidden into the backend's native form
+                    # (mx.array for MLX; passthrough for NumPy) so the
+                    # expert matmuls stay on-device, then convert the
+                    # combined result back to NumPy for the NumPy-based
+                    # decoder (rms_norm / residual adds). MLX is lazy, so
+                    # run_moe_layer's weighted sum builds one graph and
+                    # to_numpy forces a single eval at the boundary.
+                    h_native = self.backend.prepare_hidden(h)
+                    out = run_moe_layer(
+                        h_native, ids, weights,
                         lambda eid: self.manager.ensure_loaded(lid, eid),
                         self.backend,
                     )
+                    return self.backend.to_numpy(out)
 
             # Step 24B: parallel dense MLP. ExpertWeights bundle is the
             # natural container — same shape contract as one routed
@@ -671,9 +701,18 @@ class MoEModel:
                     up_proj=dense_weights["up_weight"],
                     down_proj=dense_weights["down_weight"],
                 )
+                # Convert the dense bundle to the backend's native form
+                # (mx.array for MLX). The dense MLP weights live in
+                # non-evictable RAM, so we prepare them once per layer
+                # here rather than every token. NumPy backend's
+                # prepare_expert is a passthrough.
+                bundle = self.backend.prepare_expert(bundle)
                 def dense_mlp_call(h, b=bundle):
                     with nvfp4_matmul_warnings():
-                        return self.backend.run_expert(h, b)
+                        h_native = self.backend.prepare_hidden(h)
+                        return self.backend.to_numpy(
+                            self.backend.run_expert(h_native, b)
+                        )
 
             decoder_trace = {} if trace_layers is not None else None
             # Step 26B: pull the optional `layer_scalar` out of the
