@@ -16,6 +16,7 @@ traces/gate_traces.jsonl
 traces/safetensors_traces.jsonl
 traces/gguf_traces.jsonl
 traces/parity_*.json
+traces/parity_*.npz
 experts/
 weights/
 
