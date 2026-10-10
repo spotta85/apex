@@ -8,61 +8,61 @@
   "prompts": {
     "The capital of France is": {
       "token_ids": [
+        89534,
         1082,
-        6220,
-        53609,
-        1753,
-        6220,
-        6220,
-        4890,
-        3519
+        969,
+        497,
+        497,
+        497,
+        1595,
+        1476
       ],
-      "text": " than lack Certainly\u0939\u0940 lack lack longer\u0441\u044c",
+      "text": " \uc544\ub2cc thanizeererer wayward",
       "hit_eos": false,
-      "longest_run": 2
+      "longest_run": 3
     },
     "2 + 2 =": {
       "token_ids": [
-        1902,
-        1902,
-        1902,
-        6220,
-        19632,
-        5392,
-        3765,
-        1493
+        6977,
+        688,
+        497,
+        497,
+        497,
+        1595,
+        579,
+        15574
       ],
-      "text": " world world world lack Eh\u306a\u3044testing",
+      "text": "================ineererer way st\u0d41\u0d1f\u0d46",
       "hit_eos": false,
       "longest_run": 3
     },
     "Once upon a time": {
       "token_ids": [
-        5672,
-        5672,
-        5392,
-        2288,
-        3666,
-        2524,
-        2946,
-        5392
+        8042,
+        1082,
+        497,
+        497,
+        206,
+        921,
+        497,
+        497
       ],
-      "text": "PLPL\u306a\u3044\\] mindiallyzy\u306a\u3044",
+      "text": "\u094d\u091e thanerer<code>\u0928\u0947erer",
       "hit_eos": false,
       "longest_run": 2
     },
     "def fibonacci(n):": {
       "token_ids": [
-        3666,
-        6220,
-        5700,
         3519,
-        3666,
-        1301,
-        1301,
-        1301
+        1082,
+        497,
+        497,
+        497,
+        1595,
+        579,
+        192110
       ],
-      "text": " mind lack attention\u0441\u044c mind Com Com Com",
+      "text": "\u0441\u044c thanererer way styse",
       "hit_eos": false,
       "longest_run": 3
     }
