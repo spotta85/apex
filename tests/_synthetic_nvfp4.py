@@ -104,14 +104,25 @@ def real_checkpoint_path():
 
 
 def skip_if_no_real_checkpoint():
-    """Decorator: skip a test if the real-Gemma checkpoint is not on disk."""
-    return pytest.mark.skipif(
+    """Decorator: skip a test if the real-Gemma checkpoint is not on disk.
+
+    Also tags the test `real_checkpoint`, so the fast synthetic suite is
+    `pytest -m "not real_checkpoint"`. Selecting by marker rather than
+    by name matters: several "real"-named files hold synthetic tests
+    that a `-k "not real"` filter would silently drop.
+    """
+    skip = pytest.mark.skipif(
         real_checkpoint_path() is None,
         reason=(
             f"real Gemma 4 NVFP4 checkpoint not found at "
             f"{DEFAULT_REAL_PATH} (set ${REAL_PATH_ENV} to override)"
         ),
     )
+
+    def decorate(test):
+        return pytest.mark.real_checkpoint(skip(test))
+
+    return decorate
 
 
 def real_layout_and_quant_store(path):

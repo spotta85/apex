@@ -17,3 +17,8 @@ dev = [
     "mlx-lm>=0.32.0",
     "pytest>=9.0.3",
 ]
+
+[tool.pytest.ini_options]
+markers = [
+    "real_checkpoint: needs the real Gemma 4 checkpoint on disk (auto-skipped when absent)",
+]
