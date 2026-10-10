@@ -3,15 +3,18 @@
 Everything in the runtime that needs an expert goes through
 `ensure_loaded` — that's the choke point that decides whether to serve
 from RAM (cache hit) or pay the disk cost (cache miss). Centralizing it
-also means there's exactly one place that prints the hit/miss/eviction
-trace, which is what makes the MVP demo legible.
+also means there's exactly one place that prints the hit/miss trace
+(evictions are reported by `ExpertCache.put`, in verbose mode), which
+is what makes the MVP demo legible.
 
 Two callers come through here:
   - foreground: the runtime, mid-compute. We print "cache hit/miss" and
     bump foreground metrics.
-  - prefetch: AsyncPrefetcher's worker thread. We stay quiet (the
-    prefetcher prints its own line) and skip the foreground counters
-    (the prefetcher tracks prefetch-specific metrics).
+  - prefetch: AsyncPrefetcher's worker thread. We skip the hit/miss
+    lines (the prefetcher prints its own line) and the foreground
+    counters (the prefetcher tracks prefetch-specific metrics). The
+    "prepared expert for backend" line below is not source-gated, so it
+    can still appear for prefetch loads under a non-passthrough backend.
 
 When a backend is supplied, `ensure_loaded` also calls
 `backend.prepare_expert(...)` between `store.load` and `cache.put`.

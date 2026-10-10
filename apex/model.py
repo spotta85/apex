@@ -1,6 +1,8 @@
 """MoEModel — drag-and-drop user-facing inference API.
 
-Two methods is the whole surface:
+Two calls cover the common case (the full public surface is
+`from_pretrained`, `generate`, `generate_chat`, `forward`,
+`forward_with_trace` and `memory_report`):
 
     model = MoEModel.from_pretrained(path, max_memory_gb=8)
     text  = model.generate("Explain MoE simply.", max_tokens=64)
@@ -484,7 +486,7 @@ class MoEModel:
         return self._forward_ids(prompt_ids)
 
     def _forward_ids(self, prompt_ids: list) -> "np.ndarray":
-        """Implementation of forward(); shared with future variants.
+        """Implementation of forward(), taking token ids instead of text.
 
         Builds a fresh KVCache, runs prefill via a logits-returning
         step closure, returns the logits at the *last* prefill step
@@ -583,7 +585,7 @@ class MoEModel:
         is appended to with one dict per layer carrying the router's
         top-k decision and the post-attn-norm / MoE / dense intermediate
         tensors (raw, for the caller to extract norms or top-k from).
-        Default None ⇒ zero overhead, byte-identical pre-step-25 path.
+        Default None ⇒ no tracing work.
         """
         config = self.config
         hidden = embed_token(self.embedding, token_id)

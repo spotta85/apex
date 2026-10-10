@@ -14,9 +14,12 @@ and the real-checkpoint smoke test:
 The expert_loader argument is a callable `expert_id -> ExpertWeights`
 so the same `run_moe_layer` works whether you're loading from disk
 or producing experts inline. For real quantized checkpoints, the
-typical loader is
+typical loader goes through the cache + manager
 
-    lambda eid: dequantize_bundle(store.load(layer_id, eid))
+    lambda eid: manager.ensure_loaded(layer_id, eid)
+
+(store.load → dequantize → backend.prepare_expert → ExpertCache; see
+`apex.expert_manager`).
 
 Step 26D rewrote `route()`'s formula to match the Gemma 4 reference
 (`mlx_lm.models.gemma4_text:Router.__call__`):
@@ -30,10 +33,15 @@ Step 26D rewrote `route()`'s formula to match the Gemma 4 reference
     top-k. It is applied to the SELECTED top-k softmax weights as a
     multiplicative scale at the gathered indices. Top-k selection
     runs on the raw post-projection logits; per-expert-scale only
-    reweights the chosen winners.
+    reweights the chosen winners, and the weights are NOT renormalised
+    afterwards.
 
-Both still default to None for synthetic / Mixtral / Qwen routers
-(byte-identical to pre-step-24A behavior in those layouts).
+Net formula: `rms_norm(hidden, router.scale * hidden_size**-0.5)` →
+projection → top-k → softmax over just the top-k logits → multiply by
+`per_expert_scale[ids]`.
+
+Both default to None for synthetic / Mixtral / Qwen routers, which
+skip the RMSNorm and the per-expert reweight.
 """
 
 import numpy as np
@@ -86,7 +94,7 @@ def route(
 
     Synthetic routers (Mixtral / Qwen / fake) leave both scale
     arguments as None; the RMSNorm and per-expert reweight are
-    skipped, behavior stays byte-identical to the pre-step-24 path.
+    skipped.
     """
     if hidden_state.ndim != 2:
         raise ValueError(
@@ -107,8 +115,9 @@ def route(
         # Step 26D: router applies its own RMSNorm on hidden BEFORE
         # projection. Effective scale weight is `hidden_scale *
         # (1/sqrt(hidden_dim))` per the reference; no +1 Gemma offset
-        # (the router's RMSNorm uses a plain scale, not the unit-offset
-        # convention the rest of the model uses on its norms).
+        # (the router's RMSNorm uses a plain scale — the same plain
+        # `x_normed * weight` convention every other norm in the model
+        # uses; the Gemma 1/2 unit-offset form does not apply to Gemma 4).
         effective_weight = hidden_scale.astype(np.float32) * (
             np.float32(hidden_dim) ** -0.5
         )
@@ -157,7 +166,10 @@ def route(
 
 
 def run_moe_layer(hidden_state, expert_ids, weights, expert_loader, backend):
-    """Load each selected expert, run SwiGLU, combine via weighted sum.
+    """Load each selected expert, run its gated FFN, combine via weighted sum.
+
+    (`backend.run_expert` is act(gate) * up → down; the activation is
+    SiLU or tanh-GELU per the checkpoint's `hidden_activation`.)
 
     Args:
       hidden_state:   shape (1, hidden_dim) -- batch=1 for now

@@ -6,12 +6,15 @@ caches it as fp32, and returns both top-k expert IDs and softmax
 weights so Runtime can use router-weighted MoE combination.
 
 Step 24A added support for the optional Gemma 4 stabilizer tensors
-`router.scale` (per-feature, multiplied into hidden BEFORE projection)
-and `router.per_expert_scale` (per-expert, multiplied into logits
-BEFORE top-k). Both are loaded eagerly on first router use for a layer
-and skipped silently when the layout doesn't expose them — keeps
-Mixtral / Qwen / synthetic routers byte-identical to the pre-step-24
-path.
+`router.scale` (per-feature; since step 26D the weight of an RMSNorm
+applied to the hidden BEFORE projection, pre-multiplied by
+`hidden_size ** -0.5`; see `apex.moe_layer.route`)
+and `router.per_expert_scale` (per-expert; since step 26D multiplied
+into the SELECTED top-k softmax weights, after top-k and softmax,
+with no renormalisation — top-k itself runs on the raw logits). Both
+are loaded eagerly on first router use for a layer and skipped
+silently when the layout doesn't expose them (Mixtral / Qwen /
+synthetic routers then do plain projection → top-k → softmax).
 """
 
 from pathlib import Path

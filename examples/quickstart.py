@@ -15,10 +15,11 @@ Run:
         --path /Users/spotta/Desktop/models/gemma4/gemma-4-26b-a4b-it-nvfp4 \
         --prompt "Explain MoE simply." --max-tokens 32
 
-Caveat (same as the step 18/19 demos): only the first 5 sliding-
-attention layers are loaded today. One layer's output isn't coherent
-text — the script proves wiring, not model quality. Pass `--num-layers 5`
-to drive all supported layers.
+Caveat: `--num-layers` defaults to every decoder layer the checkpoint
+has (30 on Gemma 4: sliding + full attention), so the default run loads
+the whole model. Pass a smaller `--num-layers` for a faster,
+lower-memory trial — but a truncated stack's output isn't meaningful
+text; that only proves wiring, not model quality.
 """
 
 import argparse

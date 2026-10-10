@@ -1,15 +1,16 @@
 """Step 21 quickstart: drive multiple decoder layers through MoEModel.
 
 `examples/quickstart.py` runs whatever `MoEModel.from_pretrained`'s
-`num_layers` default picks (= the sliding-attention cap, 5 on Gemma 4).
+`num_layers` default picks (= every decoder layer in the checkpoint,
+30 on Gemma 4).
 This script makes the layer-count knob explicit and prints a memory
 report after each generation, so the `1 → 2 → 4` scaling story is
 visible at a glance.
 
 Why this matters: until step 21 the demos all ran with `num_layers=1`
-because the wiring was new. The runtime supports up to the sliding
-cap; this script proves the multi-layer path with a simple
-`for L in [1, 2, 4]` driver.
+because the wiring was new. The runtime now supports every layer the
+checkpoint has (30 on Gemma 4, sliding + full attention); this script
+proves the multi-layer path with a simple `for L in [1, 2, 4]` driver.
 
 Run:
     uv run python examples/quickstart_multilayer.py \

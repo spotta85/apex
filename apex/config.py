@@ -192,7 +192,7 @@ class ModelConfig:
         # `hidden_activation: gelu_pytorch_tanh`; older configs use
         # `hidden_act` (also a string). Try both keys, default to silu
         # so synthetic / Mixtral / Qwen layouts that omit the field
-        # keep their pre-step-26 behavior byte-identical.
+        # keep the SiLU activation they were using before step 26.
         hidden_activation = text_cfg.get(
             "hidden_activation", text_cfg.get("hidden_act", "silu"),
         )
@@ -303,8 +303,11 @@ class ModelConfig:
         Step 26F: Gemma 4 full_attention layers use ProportionalRoPE
         (`rope_type: "proportional"` in `text_config.rope_parameters
         ["full_attention"]`); sliding layers use standard
-        (`rope_type: "default"`). Defaults to "default" for layouts
-        that don't differentiate (every other model in the suite).
+        (`rope_type: "default"`). The choice is keyed purely on
+        `is_full_attention(layer_id)` — the config's own `rope_type`
+        field is not read — so a model with no `full_attention` layers
+        (or an empty `layer_types`) gets "default" everywhere, while any
+        `full_attention` layer gets "proportional".
         """
         return "proportional" if self.is_full_attention(layer_id) else "default"
 
