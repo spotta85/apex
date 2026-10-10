@@ -144,7 +144,7 @@ class MoEModel:
         cls,
         path,
         *,
-        max_memory_gb: float = 8.0,
+        max_memory_gb: float = 4.0,
         layout: str | None = None,
         num_layers: int | None = None,
         backend: str = "numpy",
@@ -155,23 +155,36 @@ class MoEModel:
         Args:
             path: directory containing config.json, tokenizer.json,
                 and the sharded safetensors weights.
-            max_memory_gb: expert cache budget in GB. Real Gemma 4
-                weights at NVFP4_U32 dequant to ~30 MB per expert,
-                so 8 GB holds ~250 experts (roughly 2 layers' worth).
+            max_memory_gb: expert LRU cache budget in GB (default 4).
+                This is the WHOLE POINT of the offload design: keep only
+                a hot subset of experts in RAM, evict the rest. Real
+                Gemma 4 experts dequant to ~24 MB; 4 GB holds ~170, which
+                covers the experts a short generation actually reuses.
+                Do NOT set this huge — a 24 GB budget keeps ~1000 experts
+                warm (most never reused) and defeats the memory savings.
+                Total process RSS is this budget + ~13 GB fixed overhead
+                (fp32 embedding ~3 GB, dense MLPs ~2 GB, mmap'd shard
+                pages ~8 GB reclaimable page-cache).
             layout: optional layout-name override (e.g. "gemma-hf-moe").
                 When None, auto-detects via the same logic as the demos.
             num_layers: optional cap on how many decoder layers to
-                load. Defaults to `config.num_sliding_layers` (5 on
-                Gemma 4); larger values are rejected since layer 5+
-                isn't supported yet.
-            backend: "numpy" only today; passing anything else raises
+                load. Defaults to, and is capped at,
+                `config.num_hidden_layers` (30 on Gemma 4); both
+                sliding_attention and full_attention layers are
+                supported, and larger values are rejected.
+            backend: "numpy" (default, dense fp32 NumPy matmuls) or
+                "mlx" (expert matmuls on MLX / Apple-Silicon GPU via
+                unified memory; experts cached as mx.array so hits pay
+                no conversion cost). Both produce the same math; "mlx"
+                is faster on Apple Silicon. Anything else raises
                 ValueError so misconfiguration fails fast.
             verbose: print one-line load-progress traces.
 
         Raises:
             FileNotFoundError: missing checkpoint dir or tokenizer.json.
-            ValueError: unsupported backend, num_layers > sliding cap,
-                or non-positive max_memory_gb.
+            ValueError: unsupported backend, num_layers outside
+                1..config.num_hidden_layers, or non-positive
+                max_memory_gb.
         """
         if backend not in _SUPPORTED_BACKENDS:
             raise ValueError(

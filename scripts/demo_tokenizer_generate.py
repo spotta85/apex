@@ -73,7 +73,13 @@ _MAX_SLIDING_LAYERS = 5
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__.split("\n", 1)[0])
-    add_real_moe_args(parser, default_max_memory_mb=512)
+    # 4 GB default: the LRU holds a hot subset of experts (~170) and
+    # evicts the rest — that's the offload design. A short generation
+    # reuses far fewer than all 3840 (layer,expert) pairs, so 4 GB is
+    # enough for token 2+ to hit the cache without keeping the whole
+    # model resident. Don't set this huge: it just keeps cold experts
+    # warm and inflates RSS for no benefit.
+    add_real_moe_args(parser, default_max_memory_mb=4096)
     parser.add_argument(
         "--num-layers",
         type=int,

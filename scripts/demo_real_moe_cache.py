@@ -83,8 +83,10 @@ def main():
     print()
 
     # --- 3. Wire the cache stack: NVFP4 store → dequantizing wrapper →
-    # cache + manager. Cache budget is sized for ~8 dequantized experts
-    # (each ~24 MB at fp32 for Gemma 4's intermediate=704, hidden=2816).
+    # cache + manager. The budget comes from --max-memory-mb; it must
+    # hold all top-k dequantized experts at once (each ~24 MB at fp32
+    # for Gemma 4's intermediate=704, hidden=2816) or the no-eviction
+    # assertion below fails.
     quant_store = quantized_store_for_layout(path, layout)
     store = DequantizingExpertStore(quant_store, verbose=True)
     metrics = Metrics()

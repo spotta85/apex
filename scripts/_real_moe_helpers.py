@@ -82,7 +82,7 @@ def add_real_moe_args(
     *,
     include_layer: bool = True,
     include_max_memory: bool = True,
-    default_max_memory_mb: float = 256,
+    default_max_memory_mb: float = 8192,
 ):
     """Register the standard real-Gemma CLI flags."""
     parser.add_argument(
