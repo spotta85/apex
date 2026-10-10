@@ -410,7 +410,7 @@ def test_decode_step_k_eq_v_with_k_norm_applies_separate_v_norm():
             kv_cache=cache, layer_id=0,
         )
     keys, values = cache.get(0)
-    # K had learnable k_norm (gemma_unit_offset, +1 scale); V had
+    # K had learnable k_norm (scaled by its weight); V had
     # RMSNormNoScale (no scale). Different math ⇒ different values.
     assert not np.allclose(keys, values)
     # V's per-head magnitude should be ~unit RMS (RMSNormNoScale

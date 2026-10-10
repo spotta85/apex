@@ -3,8 +3,8 @@
 `attention_decode_step` is the canonical implementation: one new
 token, with a `KVCache` for past K/V and RoPE applied at the cache's
 current length. It supports GQA via `num_kv_heads < num_heads` and
-optional per-head q_norm / k_norm with the Gemma `+1` RMSNorm
-convention.
+optional per-head q_norm / k_norm in the plain RMSNorm convention
+(`x_normed * weight`, no `+1`; Gemma 4's norm weights are full-scale).
 
 `single_token_attention` is a thin wrapper that constructs a fresh
 1-layer KVCache, calls `attention_decode_step` at layer 0, and
@@ -27,7 +27,8 @@ What is intentionally NOT here:
 Step 23 added support for Gemma 4 full_attention layers via three
 keyword args without forking the function:
   - `v_weight=None` ⇒ K/V tied (full layers don't ship a v_proj on
-    disk; we project once via k_weight and use it for both).
+    disk; `k_weight` serves as both the K and the V projection — K
+    then gets k_norm + RoPE, V gets a plain RMS norm and no RoPE).
   - `rotary_dim` plumbs through to `apply_rope` for partial RoPE
     (full layers rotate only `head_dim * partial_rotary_factor` dims).
   - `head_dim`/`num_kv_heads`/`rope_theta` are already per-call.
@@ -71,7 +72,9 @@ def attention_decode_step(
     `hidden` is `(1, hidden_size)` — a single new token. Reads
     `kv_cache.length(layer_id)` for the RoPE position, projects q/k/v,
     applies q_norm/k_norm + RoPE, appends k/v to the cache for this
-    layer, and attends q over the full cached history (past + current).
+    layer, and attends q over the full cached history (past + current),
+    or only the last `window_size` entries when `window_size` is set
+    (sliding-attention layers).
 
     Returns `(1, hidden_size)`. No causal mask: seq_q=1 attends to
     `[past..., current]`, which is exactly what causal would allow
@@ -84,11 +87,19 @@ def attention_decode_step(
 
     `v_weight=None` enables the K=V-tied path used by Gemma 4
     full_attention layers (which don't ship a v_proj). When None,
-    `k_weight` is used for both K and V — one matmul instead of two,
-    consistent with how the model was trained.
+    `k_weight` is used for both K and V — there is no separate V
+    weight, consistent with how the model was trained.
 
     `rotary_dim=None` rotates the full head_dim (sliding behavior).
     Pass an integer < head_dim for partial RoPE (full layers).
+
+    `rope_type` is forwarded to `apply_rope`: "default" for sliding
+    layers, "proportional" for Gemma 4 full-attention layers (see
+    `ModelConfig.rope_type_for_layer`).
+
+    `window_size=None` attends over the whole cache; an integer limits
+    attention to the last `window_size` cached tokens (the cache itself
+    is not trimmed).
 
     `attn_scale=None` falls back to the standard `1/sqrt(head_dim)`
     scaling. Gemma 4 — which applies q_norm + k_norm to bring Q/K
@@ -102,9 +113,9 @@ def attention_decode_step(
     for stability, and APEX previously skipped it (V was either raw
     projected or aliased to post-k-norm K).
     """
-    # Project Q always; project K once. V either gets its own
-    # projection or is aliased to K below (after k_norm, before RoPE)
-    # for the `attention_k_eq_v` path.
+    # Project Q and K always. V either gets its own projection or,
+    # for the `attention_k_eq_v` path, is derived from `k_weight`
+    # below (un-normed K projection, taken before RoPE).
     q = linear(hidden, q_weight)
     k = linear(hidden, k_weight)
     v = None if v_weight is None else linear(hidden, v_weight)
@@ -122,10 +133,17 @@ def attention_decode_step(
     # logits explode but stay finite (the smoke contract still passes,
     # so a missing q_norm/k_norm would slip past unless we run the
     # full numerical check, which is a downstream concern).
+    #
+    # gemma_unit_offset=False: this NVFP4 checkpoint stores norm
+    # weights in the PLAIN convention (q_norm γ ≈ 1.02, already
+    # full-scale), NOT the Gemma 1/2 delta-from-1 convention. mlx's
+    # nn.RMSNorm applies `x_normed * weight` with no +1; matching it
+    # is what brings the per-layer state to ~1.0 cosine vs the
+    # reference. Flipping these to True re-breaks generation.
     if q_norm_weight is not None:
-        q = rms_norm(q, q_norm_weight, eps=rms_eps, gemma_unit_offset=True)
+        q = rms_norm(q, q_norm_weight, eps=rms_eps, gemma_unit_offset=False)
     if k_norm_weight is not None:
-        k = rms_norm(k, k_norm_weight, eps=rms_eps, gemma_unit_offset=True)
+        k = rms_norm(k, k_norm_weight, eps=rms_eps, gemma_unit_offset=False)
 
     # K=V-tied path: V picks up the K projection (alias) but NOT
     # k_norm or RoPE. Reference applies its own v_norm (RMSNormNoScale)
@@ -142,8 +160,8 @@ def attention_decode_step(
     # with no learnable scale weight — when q_norm/k_norm are
     # configured. (mlx_lm/models/gemma4_text.py:217 wires
     # `RMSNormNoScale(self.head_dim, eps=...)` whenever has_kv.)
-    # When q/k norms are absent (Mixtral / Qwen / synthetic), skip
-    # v_norm to keep those paths byte-identical.
+    # When q/k norms are absent (Mixtral / Qwen / synthetic), v_norm
+    # is skipped.
     if k_norm_weight is not None:
         v = rms_norm(v, weight=None, eps=rms_eps)
 
@@ -156,9 +174,9 @@ def attention_decode_step(
     #
     # Q and K both get RoPE so the q·k dot product carries positional
     # information. V deliberately does NOT — that's the standard
-    # transformer convention. In the K=V-tied path, `v` was aliased
-    # before this block to the un-rotated projection, so the rebind
-    # below leaves V with its pre-RoPE values (correct semantic;
+    # transformer convention. In the K=V-tied path, `v` was derived
+    # above from the un-rotated K projection and only `q` and `k` are
+    # rotated below, so V keeps its pre-RoPE values (correct semantic;
     # only K rotates).
     position_offset = kv_cache.length(layer_id)
     q = apply_rope(
@@ -229,9 +247,10 @@ def single_token_attention(hidden, **kwargs):
     matching the step 16C smoke contract.
 
     Useful for tests + demos that want to exercise the attention
-    math without managing a cache. Don't pass `kv_cache`, `layer_id`,
-    or `rope_theta` here — those belong on `attention_decode_step`
-    directly when callers need them.
+    math without managing a cache. Don't pass `kv_cache` or `layer_id`
+    here (they would collide with the ones this wrapper supplies);
+    call `attention_decode_step` directly when you need a real cache.
+    Every other keyword, `rope_theta` included, is forwarded as-is.
     """
     return attention_decode_step(
         hidden,

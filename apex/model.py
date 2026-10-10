@@ -719,7 +719,7 @@ class MoEModel:
                 })
         hidden = rms_norm(
             hidden, self.final_norm_w,
-            eps=config.rms_norm_eps, gemma_unit_offset=True,
+            eps=config.rms_norm_eps, gemma_unit_offset=False,
         )
         with nvfp4_matmul_warnings():
             logits = final_logits(

@@ -1,7 +1,8 @@
 """Tests for step 16D: full decoder layer composition.
 
-Synthetic tests pin the residual + sandwich-norm structure (zero
-norms ⇒ identity; zero MoE call ⇒ output equals attention residual).
+Synthetic tests pin the residual + sandwich-norm structure (unit
+norm weights ⇒ pure RMS normalization; zero MoE call ⇒ output equals
+the attention residual).
 The real-Gemma test (skipif) drives layer 0 end-to-end and asserts
 finite + correctly shaped output.
 """
@@ -44,18 +45,19 @@ def _attn_kwargs(rng, hidden_dim=64, num_heads=4, num_kv_heads=2, head_dim=16):
     )
 
 
-def _zero_norms(hidden_dim: int):
-    # gemma_unit_offset=True with weight=0 ⇒ scale = (1 + 0) = 1, so
-    # the norm becomes "RMSNorm with weight 1" = pure normalization.
-    z = np.zeros(hidden_dim, dtype=np.float32)
-    return {"input": z, "post_attn": z, "pre_ffn": z, "post_ffn": z}
+def _unit_norms(hidden_dim: int):
+    # The decoder uses the plain RMSNorm convention (output =
+    # x_normed * weight), so weight 1 is pure normalization. Zeros here
+    # would wipe every activation and make these tests pass vacuously.
+    w = np.ones(hidden_dim, dtype=np.float32)
+    return {"input": w, "post_attn": w, "pre_ffn": w, "post_ffn": w}
 
 
 def test_decoder_with_identity_moe_call_runs_end_to_end():
     """Identity MoE callable ⇒ decoder still produces finite, shaped output."""
     rng = np.random.default_rng(0)
     hidden = rng.standard_normal((1, 64)).astype(np.float32)
-    norms = _zero_norms(64)
+    norms = _unit_norms(64)
     attn_kwargs = _attn_kwargs(rng)
 
     with _silence_matmul_warnings():
@@ -79,7 +81,7 @@ def test_decoder_residual_carries_attention_output_through_to_final():
     """
     rng = np.random.default_rng(1)
     hidden = rng.standard_normal((1, 64)).astype(np.float32)
-    norms = _zero_norms(64)
+    norms = _unit_norms(64)
     attn_kwargs = _attn_kwargs(rng)
 
     with _silence_matmul_warnings():
@@ -90,13 +92,9 @@ def test_decoder_residual_carries_attention_output_through_to_final():
             moe_call=lambda h: np.zeros_like(h),
         )
         # Recompute the attention sub-block by hand.
-        h_normed = rms_norm(
-            hidden, norms["input"], eps=1e-6, gemma_unit_offset=True,
-        )
+        h_normed = rms_norm(hidden, norms["input"], eps=1e-6)
         attn_out = single_token_attention(h_normed, **attn_kwargs)
-        attn_normed = rms_norm(
-            attn_out, norms["post_attn"], eps=1e-6, gemma_unit_offset=True,
-        )
+        attn_normed = rms_norm(attn_out, norms["post_attn"], eps=1e-6)
         attention_residual = hidden + attn_normed
 
     np.testing.assert_allclose(full, attention_residual, rtol=1e-5, atol=1e-6)
@@ -106,7 +104,7 @@ def test_decoder_calls_moe_callable_with_normalized_hidden():
     """moe_call receives the pre-FFN-normalized hidden, not raw hidden."""
     rng = np.random.default_rng(2)
     hidden = rng.standard_normal((1, 64)).astype(np.float32)
-    norms = _zero_norms(64)
+    norms = _unit_norms(64)
     attn_kwargs = _attn_kwargs(rng)
     captured = {}
 
@@ -120,8 +118,8 @@ def test_decoder_calls_moe_callable_with_normalized_hidden():
         )
 
     # The captured arg must NOT equal the original hidden — there's a
-    # pre_ffn rms_norm applied first. With gemma_unit_offset=True and
-    # weight=0 the norm is pure RMS-normalization, which changes magnitudes.
+    # pre_ffn rms_norm applied first. With weight=1 the norm is pure
+    # RMS-normalization, which changes magnitudes.
     assert "arg" in captured
     assert captured["arg"].shape == hidden.shape
     assert not np.allclose(captured["arg"], hidden)
@@ -133,7 +131,7 @@ def test_decoder_decode_step_first_call_matches_single_token_layer():
     """First call (empty cache, RoPE = identity) ⇒ identical output."""
     rng = np.random.default_rng(10)
     hidden = rng.standard_normal((1, 64)).astype(np.float32)
-    norms = _zero_norms(64)
+    norms = _unit_norms(64)
     attn_kwargs = _attn_kwargs(rng)
 
     cache = KVCache(num_layers=1)
@@ -161,7 +159,7 @@ def test_decoder_decode_step_first_call_matches_single_token_layer():
 
 def test_decoder_decode_step_grows_kv_cache_per_call():
     rng = np.random.default_rng(11)
-    norms = _zero_norms(64)
+    norms = _unit_norms(64)
     attn_kwargs = _attn_kwargs(rng)
     cache = KVCache(num_layers=1)
     moe = lambda h: np.zeros_like(h)

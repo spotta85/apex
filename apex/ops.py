@@ -1,13 +1,17 @@
 """Tiny numerical primitives for transformer building blocks.
 
-Six pure functions, all NumPy:
+Six pure functions plus an activation lookup, all NumPy:
 
   - rms_norm(x, weight, eps, *, gemma_unit_offset=False)
   - linear(x, weight, bias=None)
   - softmax(x, axis=-1)
-  - apply_rope(x, *, position_offset, theta)
+  - apply_rope(x, *, position_offset, theta, rotary_dim, rope_type,
+               rope_factor)
   - silu(x)                   — x * sigmoid(x), the SwiGLU activation
   - gelu_tanh(x)              — Gemma 4's `gelu_pytorch_tanh` activation
+  - get_activation(name)      — resolves a config activation name
+                                ("silu", "gelu_pytorch_tanh", ...) via
+                                the `ACTIVATIONS` table
 
 Why "tiny": these are the lowest-cost layer of math that decoder layers
 need (attention pre-norm, projection matmuls, attention softmax). They
@@ -36,16 +40,17 @@ def rms_norm(x, weight, eps: float = 1e-6, *, gemma_unit_offset: bool = False):
     in Gemma 4 attention (V gets a plain RMS normalization with no
     learnable scale, while Q and K get the standard scaled RMSNorm).
 
-    `gemma_unit_offset=True` switches to Gemma's RMSNorm convention
-    where the stored weight is a delta-from-1.0
-    (``output = x_normed * (1 + weight)``). This matters because
-    Gemma's checkpoint weights are centered around zero, not one;
-    forgetting the +1 silently zeros out activations and the smoke
-    test would still "pass" (finite + correctly shaped, just wrong).
-    Mutually exclusive with `weight=None` (you can't unit-offset a
-    missing weight).
-
-    Verified against ``transformers/.../modeling_gemma.py:GemmaRMSNorm``.
+    `gemma_unit_offset=True` switches to the Gemma 1/2 RMSNorm
+    convention where the stored weight is a delta-from-1.0
+    (``output = x_normed * (1 + weight)``). Gemma 4 does NOT use it:
+    this checkpoint's norm weights are already full-scale (e.g. the
+    q_norm γ is ≈ 1), so every production call site passes False (the
+    default) and gets the plain ``x_normed * weight`` form, matching
+    mlx's `nn.RMSNorm`. Applying the +1 to full-scale weights inflates
+    every norm and the error compounds layer after layer while the
+    output stays finite and correctly shaped. The flag is
+    kept as an option; it is simply ignored when `weight=None` (there
+    is no weight to offset).
 
     Computation always runs in fp32 to keep variance accumulation
     stable, then casts back to the input dtype so callers can stack
