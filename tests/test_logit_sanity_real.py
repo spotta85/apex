@@ -10,18 +10,13 @@ across prompts. Catches regressions like:
   - logits exceed softcap (softcap accidentally bypassed)
   - shape drift (vocab_size mismatch with config)
 
-Step 24E adds *plausibility* checks: for canonical prompts like
-`"The capital of France is"` and `"2 + 2 ="` the top-K should
-contain a recognizable continuation token. These are marked
-`xfail(strict=False)` because the pre-coherence runtime may still
-produce gibberish-but-stable output — the marker documents the goal
-without blocking CI. When coherence lands they can be promoted to
-strict.
+The last section holds the quality bar: the full 30-layer model,
+prompted through the chat template, must give the right answer. It
+replaced step 24E's `xfail` raw-completion probes (see the note there).
 
-Reference-logits comparison against an HF/MLX baseline is deferred
-to its own sprint (it requires loading the same checkpoint via
-`transformers` or `mlx-lm` — a substantial dependency we don't want
-to take just for one test).
+Exact numerical agreement with mlx_lm — every layer, every position —
+is checked by `scripts/parity_mlx.py`, which runs each model in its own
+process because the two don't fit in memory together.
 """
 
 import numpy as np
@@ -136,78 +131,44 @@ def test_forward_empty_prompt_raises(model_4l):
         model_4l._forward_ids([])
 
 
-# --- Step 24E: plausible-top-K (xfail-tolerant) -----------------------------
+# --- Full-depth chat answers (strict) ---------------------------------------
+# These replaced three `xfail` probes that asked for a sensible top-20
+# after raw-completion prompts ("The capital of France is", "2 + 2 =",
+# "Once upon a time"). Those could never pass: this instruction-tuned
+# 4-bit checkpoint degenerates on raw completion in the mlx_lm
+# reference too ("作用作用作用…"), so they measured the prompt format
+# rather than the runtime. Through the chat template the reference
+# answers correctly, and so must APEX.
 
-# Full-depth fixture for the plausibility tests. Loaded once per module
-# because embedding dequant + 30-layer load is the expensive piece. We
-# keep a generous 10 GB cap so the LRU expert cache + ~2.1 GB of
-# non-evictable dense MLP weights both fit without thrashing.
+# Loaded once per module — embedding dequant + 30 layers is the
+# expensive part. 6 GB of expert cache is deliberate: the non-evictable
+# fp32 weights already occupy most of a 24 GB machine, and a larger
+# cache tips it into swap (slower, not faster).
 @pytest.fixture(scope="module")
 def model_30l():
     return apex.MoEModel.from_pretrained(
         real_checkpoint_path(),
-        max_memory_gb=10.0,
+        max_memory_gb=6.0,
         num_layers=30,
         verbose=False,
     )
 
 
-def _top_k_decoded(model, prompt: str, k: int = 20) -> list[str]:
-    """Return the top-`k` token strings (decoded) for `prompt`'s next token.
-
-    Used by the plausibility tests below. Decoding ids individually
-    via the tokenizer can produce odd whitespace / leading-space
-    fragments — that's expected and the assertions are case-insensitive
-    substring searches, not exact matches.
-    """
-    logits = model.forward(prompt)[0]
-    top_idx = np.argpartition(-logits, k - 1)[:k]
-    return [model.tokenizer.decode([int(i)]) for i in top_idx]
-
-
-@skip_if_no_real_checkpoint()
-@pytest.mark.xfail(
-    strict=False,
-    reason="step 24A+B brought routing + dense MLP online; coherence likely "
-           "still needs more (parallel norms, sliding window, reference parity).",
-)
-def test_plausible_capital_of_france(model_30l):
-    """Top-20 should mention 'paris' or 'france' for the capital prompt."""
-    decoded = _top_k_decoded(model_30l, "The capital of France is")
-    joined = " ".join(decoded).lower()
-    assert "paris" in joined or "france" in joined, (
-        f"top-20 = {decoded!r}"
+def _chat_reply(model, question: str, max_tokens: int = 24) -> str:
+    """Greedy single-turn reply to `question` via the chat template."""
+    return model.generate_chat(
+        [{"role": "user", "content": question}],
+        max_tokens=max_tokens, temperature=0.0,
     )
 
 
 @skip_if_no_real_checkpoint()
-@pytest.mark.xfail(
-    strict=False,
-    reason="step 24A+B brought routing + dense MLP online; coherence likely "
-           "still needs more (parallel norms, sliding window, reference parity).",
-)
-def test_plausible_two_plus_two(model_30l):
-    """Top-20 should contain '4' for '2 + 2 ='."""
-    decoded = _top_k_decoded(model_30l, "2 + 2 =")
-    joined = " ".join(decoded)
-    assert "4" in joined, f"top-20 = {decoded!r}"
+def test_chat_answers_capital_of_france(model_30l):
+    reply = _chat_reply(model_30l, "What is the capital of France?")
+    assert "Paris" in reply, f"reply = {reply!r}"
 
 
 @skip_if_no_real_checkpoint()
-@pytest.mark.xfail(
-    strict=False,
-    reason="step 24A+B brought routing + dense MLP online; coherence likely "
-           "still needs more (parallel norms, sliding window, reference parity).",
-)
-def test_plausible_once_upon_a_time(model_30l):
-    """Top-20 should contain a common narrative continuation token.
-
-    Permissive list: any of these would be a plausible next token for
-    `"Once upon a time"`.
-    """
-    decoded = _top_k_decoded(model_30l, "Once upon a time")
-    joined = " ".join(decoded).lower()
-    assert any(
-        marker in joined
-        for marker in (",", " in", " there", " a ", " the ", " ago", " when")
-    ), f"top-20 = {decoded!r}"
+def test_chat_answers_two_plus_two(model_30l):
+    reply = _chat_reply(model_30l, "What is 2+2?")
+    assert "4" in reply, f"reply = {reply!r}"

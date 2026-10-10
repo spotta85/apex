@@ -260,3 +260,63 @@ def test_finite_logits_per_prompt(model_l8):
         assert np.all(np.isfinite(logits)), (
             f"non-finite logits for prompt {prompt!r}"
         )
+
+
+# Helper for `test_no_special_token_only_output` below. Background:
+# tokens whose decoded form starts with `<` and ends with `>` and
+# contains no internal alphanumeric content other than the placeholder
+# itself. The pre-step-26 implementation collapsed every prompt's
+# argmax into these (`<unused14>`, `<unused10>`, ...) — recognizable
+# special-vocab tokens that the tokenizer reserves but the model is
+# never trained to emit at decode time. If we ever regress to that
+# mode, *every* canonical prompt's output will be entirely composed
+# of such tokens.
+def _is_alnum_bearing(text: str) -> bool:
+    """True iff `text` contains at least one alphanumeric character
+    that is not part of a `<...>` placeholder span.
+
+    A simple `any(c.isalnum() ...)` would be fooled by `<unused14>`
+    (the `unused14` substring is alphanumeric). So we strip
+    `<...>`-bracketed spans first, then check what's left.
+    """
+    import re
+    stripped = re.sub(r"<[^<>]*>", "", text)
+    return any(c.isalnum() for c in stripped)
+
+
+@skip_if_no_real_checkpoint()
+def test_no_special_token_only_output(model_l8):
+    """At least one canonical prompt must emit a real-vocabulary token.
+
+    Catches the catastrophic gibberish mode the pre-step-26 runtime
+    fell into: every prompt's greedy decode collapsed to `<unused14>`
+    / `<unused10>` / similar placeholder tokens reserved in the Gemma
+    4 vocabulary but never produced by a healthy model. With the
+    step-26 fixes (activation, parallel norms, embed scale, router,
+    attention, RoPE) and the plain RMSNorm convention (no `+1`
+    offset) in place, greedy decode emits real BPE pieces.
+
+    This test is intentionally LOOSE: it doesn't assert coherence,
+    only that *some* prompt produces alnum-bearing output outside
+    `<...>` placeholder spans (exact output is pinned separately by
+    `test_generation_regression` and its fixture). A future regression
+    that re-collapses every prompt to special tokens trips this
+    immediately.
+    """
+    bad = []
+    for prompt in _PROMPTS:
+        text = model_l8.generate(
+            prompt, max_tokens=_MAX_TOKENS, temperature=_TEMPERATURE,
+        )
+        # `generate` returns the continuation only (no prompt prefix),
+        # so this strip is normally a no-op; kept as a guard so we only
+        # ever look at *generated* content.
+        generated = text[len(prompt):] if text.startswith(prompt) else text
+        if _is_alnum_bearing(generated):
+            return  # at least one prompt produced real vocabulary — pass
+        bad.append((prompt, generated))
+    pytest.fail(
+        "all canonical prompts emitted only special-vocab tokens "
+        "(catastrophic gibberish mode). per-prompt output:\n"
+        + "\n".join(f"  {p!r} -> {g!r}" for p, g in bad)
+    )
