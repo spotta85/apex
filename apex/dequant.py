@@ -9,8 +9,12 @@ Single entry point: ``dequantize(t)``. Accepts:
                           RawTensors get an explicit fp32 conversion
                           (uint16 holding the BF16 bits → pad with 16
                           zero bits → view as float32).
-  - ``QuantizedTensor`` → routes to a per-scheme dequantizer. NVFP4 is
-                          implemented; other schemes raise
+  - ``QuantizedTensor`` → routes to a per-scheme dequantizer. Three
+                          schemes are implemented: ``NVFP4`` (uint8
+                          packed, tensor-wide scale), ``NVFP4_U32``
+                          (mlx-community uint32 packed, block scales
+                          only) and ``AFFINE_UINT8_U32`` (8-bit affine,
+                          scales + biases). Other schemes raise
                           ``UnsupportedQuantizationError`` with the
                           offending dtype + shape so the caller can
                           act on the gap rather than silently fall
@@ -294,10 +298,11 @@ def _dequantize_nvfp4_u32(t: QuantizedTensor, *, name: str) -> np.ndarray:
 def _dequantize_affine_uint8_u32(t: QuantizedTensor, *, name: str) -> np.ndarray:
     """Dequantize U32-packed affine uint8 weights.
 
-    Used by the lowercase Gemma router projection. Each uint32 stores
-    four quantized bytes. Per-group BF16 sidecars are represented on the
-    wrapper as `weight_scale` (.scales) and `weight_scale_2` (.biases),
-    with reconstruction `q * scale + bias`.
+    Used by the lowercase Gemma router projection and, in checkpoints
+    that ship a `.biases` sidecar, the dense MLP projections. Each
+    uint32 stores four quantized bytes. Per-group BF16 sidecars are
+    represented on the wrapper as `weight_scale` (.scales) and
+    `weight_scale_2` (.biases), with reconstruction `q * scale + bias`.
     """
     if t.weight_scale is None or t.weight_scale_2 is None:
         raise UnsupportedQuantizationError(

@@ -42,6 +42,25 @@ GemmaHFMoELayout):
   - final_norm()                  -> str
   - lm_head_tensors()             -> dict | None  (None ⇒ tied to embeddings)
 
+Further optional methods added in steps 24 and 26 for Gemma 4's
+router stabilizers, parallel dense MLP, parallel-branch norms and
+per-layer scalar. `_MoELayoutBase` supplies a `None` default for each
+(except `router_tensors`, which only `GemmaHFMoELayout` defines;
+callers probe it with `hasattr`), so Mixtral / Qwen / fake layouts need
+not implement them:
+
+  - router_tensors(layer_id)      -> {"weight", "scales", "biases"}
+  - router_scale(layer_id)        -> str | None
+  - router_per_expert_scale(layer_id) -> str | None
+  - dense_mlp_gate_proj / dense_mlp_up_proj / dense_mlp_down_proj
+        (layer_id)                -> {"weight", "scales", "biases"} | None
+                                     (`biases` names a sidecar only
+                                     8-bit-affine checkpoints contain)
+  - pre_feedforward_layernorm_2(layer_id)  -> str | None  routed-branch input
+  - post_feedforward_layernorm_1(layer_id) -> str | None  dense-branch output
+  - post_feedforward_layernorm_2(layer_id) -> str | None  routed-branch output
+  - layer_scalar(layer_id)        -> str | None
+
 Quantized-weight projections (NVFP4_U32 family) return both the base
 `weight` name and a `scales` sidecar name; pure BF16 single-tensor
 norms return a plain `str`. Callers that need to know whether to
@@ -107,9 +126,10 @@ class _MoELayoutBase:
 
     # --- Optional step-24B dense MLP (parallel to routed experts) -------
     # Returns a `{weight, scales, biases}` dict per projection — same
-    # shape contract as `router_tensors` so the loader can reuse the
-    # existing AFFINE_UINT8_U32 dequant pipeline. Default None for
-    # layouts that don't carry a dense MLP branch.
+    # shape contract as `router_tensors`. `biases` names a sidecar that
+    # only 8-bit-affine checkpoints contain; NVFP4 ones omit it, and
+    # `load_dense_mlp_weights` picks the dequant path by its presence.
+    # Default None for layouts that don't carry a dense MLP branch.
 
     def dense_mlp_gate_proj(self, layer_id: int) -> dict | None:
         return None
@@ -131,8 +151,9 @@ class _MoELayoutBase:
     #   - `post_feedforward_layernorm`    → output norm on the summed
     #                                       branches (before residual)
     # Default None so synthetic / Mixtral / Qwen layouts (no parallel
-    # branches) skip them and keep the pre-step-26B routed-only
-    # decoder behavior. Real Gemma layouts override.
+    # branches) skip them and keep the decoder's fallback path (one
+    # shared `pre_feedforward_layernorm` / `post_feedforward_layernorm`
+    # pair, no per-branch norms). Real Gemma layouts override.
 
     def pre_feedforward_layernorm_2(self, layer_id: int) -> str | None:
         return None

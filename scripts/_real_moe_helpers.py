@@ -26,6 +26,7 @@ from apex.checkpoint_index import read_safetensors_index
 _GEMMA_PATH_CANDIDATES = (
     Path("/Users/spotta/Desktop/models/Gemma-4-26B-A4B-NVFP4"),
     Path("/Users/spotta/Desktop/models/gemma4/Gemma-4-26B-A4B-NVFP4"),
+    Path("/Users/spotta/Desktop/models/gemma4/gemma-4-26b-a4b-it-nvfp4"),
 )
 DEFAULT_GEMMA_PATH = str(
     next((path for path in _GEMMA_PATH_CANDIDATES if path.is_dir()), _GEMMA_PATH_CANDIDATES[0])
