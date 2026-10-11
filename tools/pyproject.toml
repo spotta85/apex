@@ -9,4 +9,5 @@ dependencies = [
     "mlx-lm>=0.32.0",
     "numpy>=2.5.4",
     "safetensors>=0.8.0",
+    "transformers>=5.19.0",
 ]

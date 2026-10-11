@@ -768,6 +768,7 @@ dependencies = [
     { name = "mlx-lm" },
     { name = "numpy" },
     { name = "safetensors" },
+    { name = "transformers" },
 ]
 
 [package.metadata]
@@ -776,6 +777,7 @@ requires-dist = [
     { name = "mlx-lm", specifier = ">=0.32.0" },
     { name = "numpy", specifier = ">=2.5.4" },
     { name = "safetensors", specifier = ">=0.8.0" },
+    { name = "transformers", specifier = ">=5.19.0" },
 ]
 
 [[package]]
