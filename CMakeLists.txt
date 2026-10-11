@@ -10,12 +10,16 @@ target_include_directories(metal_cpp INTERFACE third_party/metal-cpp)
 target_link_libraries(metal_cpp INTERFACE
   "-framework Foundation" "-framework Metal" "-framework QuartzCore")
 
+# Header-only library: there is no separate .cpp file to compile.
+add_library(nlohmann_json INTERFACE)
+target_include_directories(nlohmann_json INTERFACE third_party)
+
 include(cmake/MetalShaders.cmake)
 add_metal_library(apex_shaders OUTPUT apex.metallib SOURCES shaders/hello.metal)
 
 # main stuff
 add_executable(apex src/main.cpp src/metal_impl.cpp)
-target_link_libraries(apex PRIVATE metal_cpp)
+target_link_libraries(apex PRIVATE metal_cpp nlohmann_json)
 add_dependencies(apex apex_shaders)
 
 # Dev only

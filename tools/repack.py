@@ -131,12 +131,9 @@ def read_headers(ckpt: Path) -> dict[str, TensorRef]:
     return tensors
 
 
-# --------------------------------------------------------------------
-# core.bin
-# --------------------------------------------------------------------
 
 def core_order(name: str) -> tuple[int, int, str]:
-    """embed_tokens first, then the final norm, then layers in numeric order."""
+    """embed_tokens, final norm, then layers in order."""
     parts = name.removeprefix(PREFIX).split(".")
     if parts[0] == "embed_tokens":
         return (0, 0, name)
@@ -260,9 +257,7 @@ def write_layer(headers: dict[str, TensorRef], layer: int, out_dir: Path) -> Lay
     }
 
 
-# --------------------------------------------------------------------
-# verify
-# --------------------------------------------------------------------
+
 
 def verify_piece(file: BinaryIO, offset: int, size: int, expected: str, label: str) -> None:
     file.seek(offset)
@@ -326,7 +321,7 @@ def main() -> None:
         raise ValueError("Unexpected expert tensors would be excluded from output")
 
     # Require a fresh directory so a failed run cannot leave a stale manifest.
-    out_dir.mkdir(parents=True, exist_ok=False)
+    out_dir.mkdir(parents=True, exist_ok=True)
     manifest: Manifest = {
         "version": 1,
         "alignment": PAGE_SIZE,

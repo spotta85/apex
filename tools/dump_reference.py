@@ -3,28 +3,6 @@
 This is the answer key the C++ engine checks itself against. For one
 fixed prompt it runs mlx_lm's `gemma4_text.Model` one token at a time
 and records, at every layer and every prompt position:
-
-    attn_out       post_attention_layernorm(attention(input_layernorm(h)))
-    dense_out      raw dense-MLP output (before post_feedforward_layernorm_1)
-    route_ids      router top-k expert ids, sorted ascending by id
-    route_weights  the matching router weights
-    moe_out        raw routed-experts output (before ..._layernorm_2)
-    layer_out      the layer's final output (after layer_scalar)
-
-plus `embed` (scaled token embeddings, the input to layer 0) and
-`logits` (after final norm and soft-capping). Everything is saved as
-fp32 .npy files under `dumps/<name>/` so a trivial C++ loader can read
-them; `meta.json` records the prompt, shapes and the model config.
-
-The layer body is `gemma4_text.DecoderLayer.__call__` unrolled, using
-the reference's own sub-modules so intermediates can be read out. To
-prove the unrolled copy hasn't drifted from the real forward, its
-logits are checked against `ref(...)` at every token.
-
-Usage (from the repo root):
-    uv --directory tools run python dump_reference.py --name paris \
-        --prompt "What is the capital of France?"
-    uv --directory tools run python dump_reference.py --name paris --raw   # no chat template
 """
 
 import argparse
