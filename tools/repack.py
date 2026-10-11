@@ -37,7 +37,7 @@ import json
 import struct
 from contextlib import ExitStack
 from pathlib import Path
-from typing import Any, TypedDict
+from typing import Any, BinaryIO, TypedDict
 
 PAGE_SIZE = 16_384          # macOS page size; Metal no-copy buffers need this alignment
 EXPERTS = 128
@@ -46,7 +46,6 @@ NUM_LAYERS = 30
 CKPT = Path("/Users/spotta/Desktop/models/gemma4/gemma-4-26b-a4b-it-nvfp4")
 PREFIX = "language_model.model."   # text tower only; vision_tower / embed_vision are dropped
 
-# Order of the six pieces inside one expert slot. Fixed forever; C++ hardcodes it.
 
 class TensorRef(TypedDict):
     """Where one tensor lives in the source shards (byte range is absolute)."""
@@ -89,11 +88,8 @@ class LayerEntry(TypedDict):
 
 Manifest = dict[str, Any]
 
-EXPERT_PIECES = (
-    "gate_proj.weight", "gate_proj.scales",
-    "up_proj.weight",   "up_proj.scales",
-    "down_proj.weight", "down_proj.scales",
-)
+# (name, source tensor, offset within the slot, bytes per expert)
+PieceLayout = tuple[str, TensorRef, int, int]
 
 
 def align_to_page(size: int) -> int:
@@ -135,18 +131,6 @@ def read_headers(ckpt: Path) -> dict[str, TensorRef]:
     return tensors
 
 
-def read_bytes(tensor: TensorRef, start: int | None = None, end: int | None = None) -> bytes:
-    """Raw bytes of a tensor, or of a sub-range [start, end) relative to it."""
-    lo = tensor["start"] + (start or 0)
-    hi = tensor["start"] + end if end is not None else tensor["end"]
-    with tensor["file"].open("rb") as file:
-        file.seek(lo)
-        data = file.read(hi - lo)
-    if len(data) != hi - lo:
-        raise ValueError(f"Truncated read from {tensor['file'].name}")
-    return data
-
-
 # --------------------------------------------------------------------
 # core.bin
 # --------------------------------------------------------------------
@@ -165,13 +149,20 @@ def write_core(headers: dict[str, TensorRef], out_dir: Path) -> list[CoreEntry]:
     """Write every non-expert text-tower tensor, page-aligned, to core.bin."""
     entries: list[CoreEntry] = []
     names = [n for n in headers if n.startswith(PREFIX) and ".experts." not in n]
+
     with (out_dir / "core.bin").open("wb") as output:
         for name in sorted(names, key=core_order):
             tensor = headers[name]
             offset = align_to_page(output.tell())
             output.seek(offset)
-            data = read_bytes(tensor)
+
+            with tensor["file"].open("rb") as source:
+                source.seek(tensor["start"])
+                data = source.read(tensor["end"] - tensor["start"])
+            if len(data) != tensor["end"] - tensor["start"]:
+                raise ValueError(f"Truncated tensor: {name}")
             output.write(data)
+
             entries.append({
                 "name": name.removeprefix(PREFIX),
                 "dtype": tensor["dtype"],
@@ -189,88 +180,115 @@ def write_core(headers: dict[str, TensorRef], out_dir: Path) -> list[CoreEntry]:
 # layer_NN.bin
 # --------------------------------------------------------------------
 
-def expert_layout(headers: dict[str, TensorRef], layer: int) -> tuple[list[Piece], list[TensorRef], int]:
+# Order of the six pieces inside one expert slot. Fixed forever; C++ hardcodes it.
+EXPERT_PIECES = (
+    "gate_proj.weight",
+    "gate_proj.scales",
+    "up_proj.weight",
+    "up_proj.scales",
+    "down_proj.weight",
+    "down_proj.scales",
+)
+
+
+def expert_layout(headers: dict[str, TensorRef], layer: int) -> tuple[list[PieceLayout], int]:
     """(pieces, stride) for one layer.
 
     Each expert tensor is stacked [128, R, C] and stored row-major, so
     expert e of a piece is the contiguous byte range
-    [e * piece_bytes, (e + 1) * piece_bytes) within that tensor.
+    [e * expert_bytes, (e + 1) * expert_bytes) within that tensor.
     """
-    pieces: list[Piece] = []
-    tensors: list[TensorRef] = []
+    pieces: list[PieceLayout] = []
     offset = 0
+
     for name in EXPERT_PIECES:
-        tensor = headers[f"{PREFIX}layers.{layer}.experts.switch_glu.{name}"]
-        total = tensor["end"] - tensor["start"]
-        if tensor["shape"][0] != EXPERTS or total % EXPERTS:
-            raise ValueError(f"Unexpected expert tensor shape: layer {layer} {name}")
-        piece_bytes = total // EXPERTS
-        pieces.append({
-            "name": name,
-            "dtype": tensor["dtype"],
-            "shape": tensor["shape"][1:],
-            "offset": offset,          # within the slot
-            "nbytes": piece_bytes,
-        })
-        tensors.append(tensor)
-        offset += piece_bytes
-    return pieces, tensors, align_to_page(offset)
+        key = f"{PREFIX}layers.{layer}.experts.switch_glu.{name}"
+        tensor = headers[key]
+        total_bytes = tensor["end"] - tensor["start"]
+
+        if tensor["shape"][0] != EXPERTS or total_bytes % EXPERTS:
+            raise ValueError(f"Invalid expert tensor: {key}")
+
+        expert_bytes = total_bytes // EXPERTS
+        pieces.append((name, tensor, offset, expert_bytes))
+        offset += expert_bytes
+
+    return pieces, align_to_page(offset)
 
 
 def write_layer(headers: dict[str, TensorRef], layer: int, out_dir: Path) -> LayerEntry:
     """Write one layer's 128 experts at a fixed stride. Returns the manifest entry."""
-    pieces, tensors, stride = expert_layout(headers, layer)
     hashes: list[str] = []
-    with (out_dir / f"layer_{layer:02d}.bin").open("wb") as output:
-        output.truncate(EXPERTS * stride)      # preallocate; the per-slot pad stays zero
+    pieces, stride = expert_layout(headers, layer)  # gate, up, and down weights and scales
+
+    with ExitStack() as stack:
+        sources: dict[Path, BinaryIO] = {
+            path: stack.enter_context(path.open("rb"))
+            for path in {tensor["file"] for _, tensor, _, _ in pieces}
+        }
+        output = stack.enter_context((out_dir / f"layer_{layer:02d}.bin").open("wb"))
+        output.truncate(EXPERTS * stride)       # preallocate; the per-slot pad stays zero
+
         for expert in range(EXPERTS):
             digest = hashlib.sha256()
-            for piece, tensor in zip(pieces, tensors):
-                data = read_bytes(tensor,
-                                  expert * piece["nbytes"], (expert + 1) * piece["nbytes"])
-                output.seek(expert * stride + piece["offset"])
+            for name, tensor, offset, expert_bytes in pieces:
+                source = sources[tensor["file"]]
+                source.seek(tensor["start"] + expert * expert_bytes)
+                data = source.read(expert_bytes)
+                if len(data) != expert_bytes:
+                    raise ValueError(f"Truncated piece: {name}")
+
+                output.seek(expert * stride + offset)
                 output.write(data)
                 digest.update(data)
             hashes.append(digest.hexdigest())
+
     return {
         "layer": layer,
         "file": f"layer_{layer:02d}.bin",
         "size": EXPERTS * stride,
         "num_experts": EXPERTS,
         "stride": stride,
-        "pieces": pieces,
+        "pieces": [{
+            "name": name,
+            "dtype": tensor["dtype"],
+            "shape": tensor["shape"][1:],
+            "offset": offset,
+            "nbytes": expert_bytes,
+        } for name, tensor, offset, expert_bytes in pieces],
         "expert_sha256": hashes,
     }
 
 
 # --------------------------------------------------------------------
-# verification (optoinal)
+# verify
 # --------------------------------------------------------------------
+
+def verify_piece(file: BinaryIO, offset: int, size: int, expected: str, label: str) -> None:
+    file.seek(offset)
+    data = file.read(size)
+    if len(data) != size:
+        raise ValueError(f"Truncated output: {label}")
+    if hashlib.sha256(data).hexdigest() != expected:
+        raise ValueError(f"Hash mismatch: {label}")
+
 
 def verify(out_dir: Path, manifest: Manifest) -> None:
     """Re-hash every core tensor and every expert slot against the manifest."""
-    def check(file: Any, offset: int, size: int, expected: str, label: str) -> None:
-        file.seek(offset)
-        if hashlib.sha256(file.read(size)).hexdigest() != expected:
-            raise ValueError(f"Hash mismatch: {label}")
-
-    core = manifest["core"]
-    with (out_dir / core["file"]).open("rb") as file:
-        if (out_dir / core["file"]).stat().st_size != core["size"]:
-            raise ValueError("core.bin size mismatch")
-        for t in core["tensors"]:
-            check(file, t["offset"], t["nbytes"], t["sha256"], t["name"])
-    print("verified core.bin", flush=True)
-
-    for entry in manifest["layers"]:
+    for entry in [manifest["core"], *manifest["layers"]]:
         path = out_dir / entry["file"]
         if path.stat().st_size != entry["size"]:
-            raise ValueError(f"size mismatch: {path.name}")
-        slot_bytes = sum(p["nbytes"] for p in entry["pieces"])   # pieces are contiguous
+            raise ValueError(f"File size mismatch: {path}")
         with path.open("rb") as file:
-            for expert, expected in enumerate(entry["expert_sha256"]):
-                check(file, expert * entry["stride"], slot_bytes, expected,
-                      f"{path.name} expert {expert}")
+            if "tensors" in entry:
+                for tensor in entry["tensors"]:
+                    verify_piece(file, tensor["offset"], tensor["nbytes"],
+                                 tensor["sha256"], tensor["name"])
+            else:
+                slot_bytes = sum(p["nbytes"] for p in entry["pieces"])  # pieces are contiguous
+                for expert, expected in enumerate(entry["expert_sha256"]):
+                    verify_piece(file, expert * entry["stride"], slot_bytes, expected,
+                                 f"{path.name}, expert {expert}")
         print(f"verified {path.name}", flush=True)
 
 
@@ -299,13 +317,15 @@ def main() -> None:
     headers = read_headers(args.ckpt)
     # Refuse to run if the expert tensors are not exactly the set we know how
     # to lay out; anything else would be silently dropped from the output.
-    expected = {f"{PREFIX}layers.{l}.experts.switch_glu.{p}"
-                for l in range(NUM_LAYERS) for p in EXPERT_PIECES}
-    actual = {n for n in headers if n.startswith(PREFIX) and ".experts." in n}
-    if actual != expected:
-        raise ValueError("Unexpected expert tensor set; refusing to pack")
+    expected_experts = {
+        f"{PREFIX}layers.{layer}.experts.switch_glu.{name}"
+        for layer in range(NUM_LAYERS) for name in EXPERT_PIECES
+    }
+    actual_experts = {n for n in headers if n.startswith(PREFIX) and ".experts." in n}
+    if actual_experts != expected_experts:
+        raise ValueError("Unexpected expert tensors would be excluded from output")
 
-    # Fresh directory only, so a failed run cannot leave a stale manifest.
+    # Require a fresh directory so a failed run cannot leave a stale manifest.
     out_dir.mkdir(parents=True, exist_ok=False)
     manifest: Manifest = {
         "version": 1,
@@ -317,6 +337,7 @@ def main() -> None:
     }
     manifest["core"]["size"] = (out_dir / "core.bin").stat().st_size
     print("wrote core.bin", flush=True)
+
     for layer in range(NUM_LAYERS):
         manifest["layers"].append(write_layer(headers, layer, out_dir))
         print(f"wrote layer_{layer:02d}.bin", flush=True)
