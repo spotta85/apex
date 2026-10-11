@@ -37,6 +37,7 @@ import json
 import struct
 from contextlib import ExitStack
 from pathlib import Path
+from typing import Any, TypedDict
 
 PAGE_SIZE = 16_384          # macOS page size; Metal no-copy buffers need this alignment
 EXPERTS = 128
@@ -46,6 +47,48 @@ CKPT = Path("/Users/spotta/Desktop/models/gemma4/gemma-4-26b-a4b-it-nvfp4")
 PREFIX = "language_model.model."   # text tower only; vision_tower / embed_vision are dropped
 
 # Order of the six pieces inside one expert slot. Fixed forever; C++ hardcodes it.
+
+class TensorRef(TypedDict):
+    """Where one tensor lives in the source shards (byte range is absolute)."""
+    dtype: str
+    shape: list[int]
+    file: Path
+    start: int
+    end: int
+
+
+class CoreEntry(TypedDict):
+    """One tensor's location inside core.bin."""
+    name: str
+    dtype: str
+    shape: list[int]
+    offset: int
+    nbytes: int
+    sha256: str
+
+
+class Piece(TypedDict):
+    """One of the six parts of an expert slot. 'offset' is within the slot."""
+    name: str
+    dtype: str
+    shape: list[int]
+    offset: int
+    nbytes: int
+
+
+class LayerEntry(TypedDict):
+    """One layer_NN.bin in the manifest."""
+    layer: int
+    file: str
+    size: int
+    num_experts: int
+    stride: int
+    pieces: list[Piece]
+    expert_sha256: list[str]
+
+
+Manifest = dict[str, Any]
+
 EXPERT_PIECES = (
     "gate_proj.weight", "gate_proj.scales",
     "up_proj.weight",   "up_proj.scales",
@@ -53,7 +96,7 @@ EXPERT_PIECES = (
 )
 
 
-def align_to_page(size):
+def align_to_page(size: int) -> int:
     """Round up to the next 16 KB boundary."""
     return (size + PAGE_SIZE - 1) // PAGE_SIZE * PAGE_SIZE
 
@@ -65,9 +108,9 @@ def align_to_page(size):
 # └─────────────┴────────────────────────┴─────────────────────────┘
 # Each header entry's data_offsets are relative to the start of the raw data.
 
-def read_headers(ckpt):
+def read_headers(ckpt: Path) -> dict[str, TensorRef]:
     """name -> {dtype, shape, file, start, end} for every tensor across all shards."""
-    tensors = {}
+    tensors: dict[str, TensorRef] = {}
     shards = sorted(ckpt.glob("*.safetensors"))
     if not shards:
         raise ValueError(f"No safetensors files in {ckpt}")
@@ -92,7 +135,7 @@ def read_headers(ckpt):
     return tensors
 
 
-def read_bytes(tensor, start=None, end=None):
+def read_bytes(tensor: TensorRef, start: int | None = None, end: int | None = None) -> bytes:
     """Raw bytes of a tensor, or of a sub-range [start, end) relative to it."""
     lo = tensor["start"] + (start or 0)
     hi = tensor["start"] + end if end is not None else tensor["end"]
@@ -108,7 +151,7 @@ def read_bytes(tensor, start=None, end=None):
 # core.bin
 # --------------------------------------------------------------------
 
-def core_order(name):
+def core_order(name: str) -> tuple[int, int, str]:
     """embed_tokens first, then the final norm, then layers in numeric order."""
     parts = name.removeprefix(PREFIX).split(".")
     if parts[0] == "embed_tokens":
@@ -118,9 +161,9 @@ def core_order(name):
     return (2, int(parts[1]), name)
 
 
-def write_core(headers, out_dir):
+def write_core(headers: dict[str, TensorRef], out_dir: Path) -> list[CoreEntry]:
     """Write every non-expert text-tower tensor, page-aligned, to core.bin."""
-    entries = []
+    entries: list[CoreEntry] = []
     names = [n for n in headers if n.startswith(PREFIX) and ".experts." not in n]
     with (out_dir / "core.bin").open("wb") as output:
         for name in sorted(names, key=core_order):
@@ -146,14 +189,15 @@ def write_core(headers, out_dir):
 # layer_NN.bin
 # --------------------------------------------------------------------
 
-def expert_layout(headers, layer):
+def expert_layout(headers: dict[str, TensorRef], layer: int) -> tuple[list[Piece], list[TensorRef], int]:
     """(pieces, stride) for one layer.
 
     Each expert tensor is stacked [128, R, C] and stored row-major, so
     expert e of a piece is the contiguous byte range
     [e * piece_bytes, (e + 1) * piece_bytes) within that tensor.
     """
-    pieces = []
+    pieces: list[Piece] = []
+    tensors: list[TensorRef] = []
     offset = 0
     for name in EXPERT_PIECES:
         tensor = headers[f"{PREFIX}layers.{layer}.experts.switch_glu.{name}"]
@@ -167,22 +211,22 @@ def expert_layout(headers, layer):
             "shape": tensor["shape"][1:],
             "offset": offset,          # within the slot
             "nbytes": piece_bytes,
-            "tensor": tensor,
         })
+        tensors.append(tensor)
         offset += piece_bytes
-    return pieces, align_to_page(offset)
+    return pieces, tensors, align_to_page(offset)
 
 
-def write_layer(headers, layer, out_dir):
+def write_layer(headers: dict[str, TensorRef], layer: int, out_dir: Path) -> LayerEntry:
     """Write one layer's 128 experts at a fixed stride. Returns the manifest entry."""
-    pieces, stride = expert_layout(headers, layer)
-    hashes = []
+    pieces, tensors, stride = expert_layout(headers, layer)
+    hashes: list[str] = []
     with (out_dir / f"layer_{layer:02d}.bin").open("wb") as output:
         output.truncate(EXPERTS * stride)      # preallocate; the per-slot pad stays zero
         for expert in range(EXPERTS):
             digest = hashlib.sha256()
-            for piece in pieces:
-                data = read_bytes(piece["tensor"],
+            for piece, tensor in zip(pieces, tensors):
+                data = read_bytes(tensor,
                                   expert * piece["nbytes"], (expert + 1) * piece["nbytes"])
                 output.seek(expert * stride + piece["offset"])
                 output.write(data)
@@ -194,7 +238,7 @@ def write_layer(headers, layer, out_dir):
         "size": EXPERTS * stride,
         "num_experts": EXPERTS,
         "stride": stride,
-        "pieces": [{k: v for k, v in p.items() if k != "tensor"} for p in pieces],
+        "pieces": pieces,
         "expert_sha256": hashes,
     }
 
@@ -203,9 +247,9 @@ def write_layer(headers, layer, out_dir):
 # verification (optoinal)
 # --------------------------------------------------------------------
 
-def verify(out_dir, manifest):
+def verify(out_dir: Path, manifest: Manifest) -> None:
     """Re-hash every core tensor and every expert slot against the manifest."""
-    def check(file, offset, size, expected, label):
+    def check(file: Any, offset: int, size: int, expected: str, label: str) -> None:
         file.seek(offset)
         if hashlib.sha256(file.read(size)).hexdigest() != expected:
             raise ValueError(f"Hash mismatch: {label}")
@@ -234,7 +278,7 @@ def verify(out_dir, manifest):
 # CLI
 # --------------------------------------------------------------------
 
-def main():
+def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.split("\n", 1)[0])
     parser.add_argument("cmd", nargs="?", choices=("pack", "verify"), default="pack")
     parser.add_argument("--ckpt", type=Path, default=CKPT)
@@ -263,7 +307,7 @@ def main():
 
     # Fresh directory only, so a failed run cannot leave a stale manifest.
     out_dir.mkdir(parents=True, exist_ok=False)
-    manifest = {
+    manifest: Manifest = {
         "version": 1,
         "alignment": PAGE_SIZE,
         "text_config": text_config,
