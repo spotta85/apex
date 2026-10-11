@@ -28,6 +28,10 @@ cmake --build build
 ./build/apex
 ```
 
+Build shortcut: run `python3 tools/run.py`, or open `tools/run.py` and use
+the editor's Python Run button. It configures and builds Release; run
+`./build/apex` separately to execute the GPU smoke test.
+
 
 
 ## Layout

@@ -5,3 +5,5 @@ __pycache__/
 *.metallib
 *.air
 dumps/
+.vscode/
+run.py
