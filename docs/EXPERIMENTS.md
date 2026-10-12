@@ -25,4 +25,18 @@ Memory: tracked 1296.7 MB, OS resident 1302.8 MB, OS footprint 2.5 MB. Mapped fi
 
 GPU kernel is slow because each thread reads 1024 consecutive words (uncoalesced across threads). Throwaway test kernel; lesson for B6: thread i reads word i, i+N, i+2N.
 
-**Memory, unconfirmed:** after the GPU read the 352 MB tensor, os footprint went from 2.5 MB to 388 MB and resident dropped from 1303 MB to 366 MB. Pages the GPU touches through a no-copy buffer appear to be charged to the process. If so, the A4 conclusion ("mapped weights are free for the budget") only holds for CPU reads, and core weights cost ~1.3 GB of footprint once kernels run over all of them. To confirm: checksum every core tensor and watch footprint.
+**Memory, confirmed (scratch program: wrap, CPU touch all, GPU checksum every core tensor, CPU re-touch, sampled with vm_stat and `footprint -p`):**
+
+| step | resident | footprint | system wired |
+|---|---|---|---|
+| mmap + wrapNoCopy | 14 MB | 6 MB | baseline |
+| CPU touch all pages | 1310 MB | 7 MB | baseline |
+| GPU reads all 1291 MB | 15 MB | 36 MB | **+1.26 GB** |
+| CPU re-touch all pages | 1311 MB | 1333 MB | unchanged |
+
+Three effects:
+1. CPU-only reads of the mapping: resident, not charged. (The A4 conclusion, still true.)
+2. First GPU use of the no-copy buffer: the driver **wires the entire 1.3 GB** (vm_stat wired pages +80k x 16 KB). Those pages leave the process's resident/footprint accounting but are real, non-evictable RAM. `task_info` cannot see them; the tracker's `core_weights` entry is the truth.
+3. CPU touching pages the GPU has wired reclassifies them as "Dirty mapped file" in `footprint`, so footprint jumps to 1.3 GB. No extra RAM is used (anonymous and wired counts unchanged). This is what the earlier bench run showed (388 MB = CPU re-read of the 352 MB tensor after the GPU had it).
+
+Consequences: the memory budget must count core weights as fully used once any kernel runs; OS footprint undercounts unless the CPU touches the pages; avoid CPU reads of core weights after wrapping (embedding gather should be a GPU kernel); try MAP_SHARED instead of MAP_PRIVATE at some point to see if effect 3 disappears.
