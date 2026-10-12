@@ -7,4 +7,5 @@ __pycache__/
 dumps/
 .vscode/
 run.py
-docs/
+docs/.cache/
+.clangd
