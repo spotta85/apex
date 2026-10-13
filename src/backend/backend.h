@@ -26,8 +26,6 @@ namespace apex {
             // free a buffer and update memory tracker
             virtual void release(Buffer* buffer) = 0;
 
-            /// FOR TEST: Sums unsigned 32 bit words on gpu to compare against cpu sum. 
-            virtual uint32_t checkSumU32(Buffer* buffer,std::size_t offset, std::size_t bytes) = 0;
 
     };
 

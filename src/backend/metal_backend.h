@@ -26,9 +26,6 @@ namespace apex {
             void* contents(Buffer* buffer) override;
             void release(Buffer* buffer) override;
 
-            std::uint32_t checkSumU32(
-                Buffer* buffer, std::size_t offset, std::size_t bytes) override;
-
             /// Returns the GPU's name for benchmark output.
             const char* deviceName() const;
 

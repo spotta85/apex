@@ -6,7 +6,7 @@ function(add_metal_library target)
     get_filename_component(name ${src} NAME_WE)
     set(air ${CMAKE_CURRENT_BINARY_DIR}/${name}.air)
     add_custom_command(OUTPUT ${air}
-      COMMAND xcrun -sdk macosx metal -O2 -c ${CMAKE_CURRENT_SOURCE_DIR}/${src} -o ${air}
+      COMMAND xcrun -sdk macosx metal -O2 -fno-fast-math -c ${CMAKE_CURRENT_SOURCE_DIR}/${src} -o ${air}
       DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/${src}
       COMMENT "metal ${src}")
     list(APPEND airs ${air})

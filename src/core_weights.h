@@ -93,7 +93,7 @@ namespace apex{
 
         {
             Timer timer("mmap_core");
-            base_ = mmap(nullptr, size_, PROT_READ, MAP_PRIVATE, fd, 0);
+            base_ = mmap(nullptr, size_, PROT_READ, MAP_SHARED, fd, 0);  // SHARED: no copy-on-write bookkeeping (see EXPERIMENTS.md)
         }
         close(fd);
 

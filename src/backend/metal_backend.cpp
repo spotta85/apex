@@ -148,43 +148,4 @@ namespace apex {
         delete buffer;
     }
 
-    /// @brief Checksum a buffer on the GPU. Sums 32 bit words and returns the sum.
-    /// @param buffer MTL Buffer
-    /// @param offset Offset into buffer to start summing
-    /// @param bytes Size of buffer to sum.
-    /// @return 
-    std::uint32_t MetalBackend::checkSumU32(Buffer* input, std::size_t offset, std::size_t bytes) {
-        Timer timer ("checkSumU32");
-        // setup
-        const std::uint32_t num_32 = static_cast<std::uint32_t>(bytes / 4);
-        const std::uint32_t per_thread = 1024; 
-        const std::uint32_t num_threads =(num_32 + per_thread - 1) / per_thread; // round up
-
-        Buffer *result = allocate(4, "scratch"); // allocate 4 bytes
-        *static_cast<std::uint32_t*>(contents(result)) = 0; // Clear buffer
-
-        // GPU stuff
-
-        NS::AutoreleasePool* pool = NS::AutoreleasePool::alloc()->init();        MTL::ComputePipelineState* pso = pipeline("checksum_u32");
-        MTL::CommandBuffer *cmd = queue_->commandBuffer();
-        MTL::ComputeCommandEncoder *enc = cmd->computeCommandEncoder();
-        enc->setComputePipelineState(pso);
-        enc->setBuffer(input->mtl, offset, 0);
-        enc->setBytes(&num_32, sizeof num_32, 1);
-        enc->setBytes(&per_thread, sizeof per_thread, 2);
-        enc->setBuffer(result->mtl, 0, 3);
-
-        const auto group_size = std::min<std::size_t>(num_threads, pso->maxTotalThreadsPerThreadgroup());
-
-        enc->dispatchThreads(MTL::Size::Make(num_threads, 1, 1), MTL::Size::Make(group_size, 1, 1));
-        enc->endEncoding(); // finish up updating the queueu
-        cmd->commit(); // send work to gpu
-        cmd->waitUntilCompleted(); // cpu waits until this is done.
-        pool->release();
-        const std::uint32_t sum = *static_cast<std::uint32_t*>(contents(result));
-        release(result);
-
-        return sum;
-    }
-
 } // namespace apex

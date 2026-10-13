@@ -40,3 +40,17 @@ Three effects:
 3. CPU touching pages the GPU has wired reclassifies them as "Dirty mapped file" in `footprint`, so footprint jumps to 1.3 GB. No extra RAM is used (anonymous and wired counts unchanged). This is what the earlier bench run showed (388 MB = CPU re-read of the 352 MB tensor after the GPU had it).
 
 Consequences: the memory budget must count core weights as fully used once any kernel runs; OS footprint undercounts unless the CPU touches the pages; avoid CPU reads of core weights after wrapping (embedding gather should be a GPU kernel); try MAP_SHARED instead of MAP_PRIVATE at some point to see if effect 3 disappears.
+
+## 2026-10-12 — B5 follow-up: MAP_SHARED vs MAP_PRIVATE, and idle under memory pressure
+
+Scratch program: own mmap of core.bin, wrapNoCopy, GPU checksum of every tensor, CPU re-touch, sampled with task_info and vm_stat wired pages.
+
+| step | MAP_SHARED footprint | MAP_PRIVATE footprint | wired delta (both) |
+|---|---|---|---|
+| after wrap | 6 MB | 6 MB | 0 |
+| GPU reads all | 35 MB | 35 MB | +1.3 GB |
+| CPU re-touch all | **36 MB** | **1333 MB** | 0 |
+
+1. The footprint jump on CPU re-touch is a MAP_PRIVATE artifact (copy-on-write bookkeeping marks the pages dirty). With MAP_SHARED it does not happen. **Decision: core_weights.h uses MAP_SHARED.** Read-only mapping, so semantics are identical.
+2. Idle under `memory_pressure -l critical` for 20 s: wired dropped by 1.28 GB (4101 -> 2817 MB) while the process slept. The driver unwires idle buffers under pressure; the next GPU use re-wired them (+1.33 GB). So "wired while the buffer exists" was too strong: wired while in use, reclaimable when idle. For the expert cache this means cold slots are not permanently lost RAM, but re-wiring a slot costs a page-in before the kernel can run.
+3. vm_stat wired does not drop immediately at release/munmap; it is reclaimed lazily. Benchmarks should sample wired after a settle period, or report the tracker total.

@@ -19,7 +19,7 @@ DUMP_ROOT = REPO_ROOT / "dumps"
 # Per-layer hidden-state stages, in execution order inside one layer.
 # The router sits between dense_out and moe_out (handled separately
 # because it is an id set + weights, not a hidden vector).
-STAGES = ("attn_out", "dense_out", "moe_out", "layer_out")
+STAGES = ("attn_in", "attn_out", "dense_out", "moe_out", "layer_out")
 
 
 # --------------------------------------------------------------------
@@ -200,7 +200,8 @@ def capture_reference(ckpt: Path, ids: list[int], ref_dtype: str):
             # --- attention block ---
             residual = h
             a = layer.input_layernorm(h)
-            a, _, _ = layer.self_attn(a, mask, cache)
+            attn_in = a                       # input_layernorm(h): the input to attention
+            a, _, _ = layer.self_attn(attn_in, mask, cache)
             attn_out = layer.post_attention_layernorm(a)
             h = residual + attn_out
 
@@ -219,7 +220,8 @@ def capture_reference(ckpt: Path, ids: list[int], ref_dtype: str):
             h = h * layer.layer_scalar
 
             # Force this layer now so the lazy graph never spans 30 layers.
-            mx.eval(attn_out, dense_out, moe_out, h, idx, w)
+            mx.eval(attn_in, attn_out, dense_out, moe_out, h, idx, w)
+            per_stage["attn_in"][l].append(to_np(attn_in))
             per_stage["attn_out"][l].append(to_np(attn_out))
             per_stage["dense_out"][l].append(to_np(dense_out))
             per_stage["moe_out"][l].append(to_np(moe_out))
@@ -303,7 +305,7 @@ def main():
         "layout": {
             "embed": "(positions, hidden)",
             "logits": "(positions, vocab)",
-            "attn_out/dense_out/moe_out/layer_out": "(layers, positions, hidden)",
+            "attn_in/attn_out/dense_out/moe_out/layer_out": "(layers, positions, hidden)",
             "route_ids/route_weights": "(layers, positions, top_k), sorted by expert id",
         },
         "text_config": text_cfg,

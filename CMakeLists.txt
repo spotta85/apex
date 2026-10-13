@@ -15,7 +15,7 @@ add_library(nlohmann_json INTERFACE)
 target_include_directories(nlohmann_json INTERFACE third_party)
 
 include(cmake/MetalShaders.cmake)
-add_metal_library(apex_shaders OUTPUT apex.metallib SOURCES shaders/hello.metal shaders/checksum.metal)
+add_metal_library(apex_shaders OUTPUT apex.metallib SOURCES shaders/norm.metal)
 
 # main stuff
 add_executable(apex src/main.cpp src/metal_impl.cpp src/backend/metal_backend.cpp)
