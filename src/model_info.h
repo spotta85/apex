@@ -1,4 +1,4 @@
-/// @file manifest.h
+/// @file model_info.h
 /// @brief Types to help us read packed binary files. 
 #pragma once 
 
@@ -75,7 +75,7 @@ struct ModelConfig {
     std::vector<std::string> layer_types;  // "sliding_attention" | "full_attention"
 };
 
-struct Manifest {
+struct ModelInfo {
     std::string dir;
     ModelConfig config;
 
@@ -90,7 +90,7 @@ struct Manifest {
     std::uint64_t expert_slot_size = 0;  // size of one expert slot in bytes
     std::map<std::string, ExpertPiece> expert_pieces;  // Tensor layout within each expert slot. name -> info
 
-    const TensorInfo& tensor(const std::string& name) const {
+    const TensorInfo& getTensor(const std::string& name) const {
         auto it = core.find(name); // returns an iterator for whatever reason.
         if (it == core.end()) {
             throw std::runtime_error("tensor not found: " + name);
@@ -98,7 +98,7 @@ struct Manifest {
         return it->second; 
     }
 
-    static Manifest load(const std::string& dir);  // load manifest.json from disk
+    static ModelInfo load(const std::string& dir);  // load manifest.json from disk
 
     /// Returns the path to a packed expert layer file.
     std::string layer_file(int layer) const {
@@ -108,27 +108,27 @@ struct Manifest {
     }
 };
 
-/// @brief Reads in the manifest.json and converts metadata into Manifest Config, and TensorInfo and ExpertPeices
+/// @brief Reads in the manifest.json and converts metadata into ModelInfo Config, and TensorInfo and ExpertPeices
 /// @param dir location of manifest.json file. 
-/// @return 
-inline Manifest Manifest::load(const std::string& dir) {
+/// @return ModelInfo Object with model config, shared tensor info with offsets, and expert peices info. 
+inline ModelInfo ModelInfo::load(const std::string& dir) {
     std::ifstream in(dir + "/manifest.json");
 
     if (!in) {
         throw std::runtime_error(
-            "manifest: cannot open " + dir + "/manifest.json");
+            "ModelInfo: cannot open " + dir + "/manifest.json");
     }
 
     // Parse the file. 
     const auto j = nlohmann::json::parse(in);
 
-    Manifest m;
-    m.dir = dir;
+    ModelInfo model_info;
+    model_info.dir = dir;
 
     const auto& tc = j.at("text_config");
 
-    // Reference to m's config, so assignments below update m directly.
-    ModelConfig& c = m.config;
+    // Update config. 
+    ModelConfig& c = model_info.config;
 
     c.hidden_size           = tc.at("hidden_size").get<int>();
     c.intermediate_size     = tc.at("intermediate_size").get<int>();
@@ -147,13 +147,13 @@ inline Manifest Manifest::load(const std::string& dir) {
 
     // Read how the weights were quantized.
     const auto& q = j.at("quantization");
-    m.quant_group_size = q.at("group_size").get<int>();
-    m.quant_bits = q.at("bits").get<int>();
-    m.quant_mode = q.at("mode").get<std::string>();
+    model_info.quant_group_size = q.at("group_size").get<int>();
+    model_info.quant_bits = q.at("bits").get<int>();
+    model_info.quant_mode = q.at("mode").get<std::string>();
 
     // Read the expected core.bin file size.
     const auto& core = j.at("core");
-    m.core_size = core.at("size").get<std::uint64_t>();
+    model_info.core_size = core.at("size").get<std::uint64_t>();
 
     // Each element of "tensors" describes one tensor in core.bin.
     for (const auto& t : core.at("tensors")) {
@@ -164,13 +164,13 @@ inline Manifest Manifest::load(const std::string& dir) {
         info.nbytes = t.at("nbytes").get<std::uint64_t>();
 
         // Store its metadata under its tensor name.
-        m.core.emplace(t.at("name").get<std::string>(), std::move(info));
+        model_info.core.emplace(t.at("name").get<std::string>(), std::move(info));
     }
 
 
     // All expert layers share the same slot layout; read it from layer 0.
     const auto& layer = j.at("layers").at(0);
-    m.expert_slot_size = layer.at("stride").get<std::uint64_t>();
+    model_info.expert_slot_size = layer.at("stride").get<std::uint64_t>();
 
     for (const auto& p : layer.at("pieces")) {
         ExpertPiece piece;
@@ -182,10 +182,10 @@ inline Manifest Manifest::load(const std::string& dir) {
 
         // Save the key before moving the piece, which also moves its name.
         const std::string name = piece.name;
-        m.expert_pieces.emplace(name, std::move(piece));
+        model_info.expert_pieces.emplace(name, std::move(piece));
     }
 
-    return m;
+    return model_info;
 }
     
 }  // namespace apex

@@ -7,7 +7,8 @@
 #include <cstdio>
 #include <limits>
 #include "../backend/metal_backend.h"
-#include "../core_weights.h"
+#include "../file.h"
+#include "../model_info.h"
 #include "../npy.h"
 #include "../ops.h"
 
@@ -48,16 +49,22 @@ static Diff diff(const float *a, const float *b, size_t n) {
 
 // Compare each layer's RMSNorm output against CPU and Python references.
 int run_test_norm(const std::string &packed_dir, const std::string &dump_dir) {
-    apex::Manifest m = apex::Manifest::load(packed_dir);
+    apex::ModelInfo model_info = apex::ModelInfo::load(packed_dir);
     apex::MetalBackend backend(APEX_METALLIB);
-    apex::CoreWeights core(m, backend); //creating mapping and shared gpu buffer.
+
+    // Map core.bin (CPU), then let the GPU read the same bytes without a copy.
+    apex::MappedFile core = apex::mapFile(model_info.dir + "/core.bin", "core_weights");
+    if (core.size != model_info.core_size) {
+        throw std::runtime_error("core.bin size != manifest");
+    }
+    apex::Buffer *core_buffer = backend.wrapNoCopy(core.data, core.size);
 
     apex::Npy embed = apex::loadNpy(dump_dir + "/embed.npy");         // (P, H)
     apex::Npy layer_out = apex::loadNpy(dump_dir + "/layer_out.npy"); // (L, P, H)
     apex::Npy attn_in = apex::loadNpy(dump_dir + "/attn_in.npy");     // (L, P, H)
 
-    const int64_t layer_count = m.config.num_hidden_layers;
-    const int64_t hidden_dim = m.config.hidden_size;
+    const int64_t layer_count = model_info.config.num_hidden_layers;
+    const int64_t hidden_dim = model_info.config.hidden_size;
 
     if (embed.dtype != "<f4" || layer_out.dtype != "<f4" || attn_in.dtype != "<f4" ||
         embed.shape.size() != 2) {
@@ -74,7 +81,7 @@ int run_test_norm(const std::string &packed_dir, const std::string &dump_dir) {
     // allocate buffesr
     const size_t value_count = static_cast<size_t>(token_count) * static_cast<size_t>(hidden_dim);
     const size_t buffer_bytes = value_count * sizeof(float);
-    const float eps = static_cast<float>(m.config.rms_norm_eps);
+    const float eps = static_cast<float>(model_info.config.rms_norm_eps);
 
     apex::Buffer *input = backend.allocate(buffer_bytes, "activations");
     apex::Buffer *result = backend.allocate(buffer_bytes, "activations");
@@ -96,14 +103,15 @@ int run_test_norm(const std::string &packed_dir, const std::string &dump_dir) {
         // Kernel launch
         const std::string weight_name =
             "layers." + std::to_string(layer) + ".input_layernorm.weight";
-        apex::TensorView weights = core.tensor(weight_name);
+        const apex::TensorInfo &weights = model_info.getTensor(weight_name);
 
-        apex::rmsNorm(backend, input, weights.buffer, weights.offset, result,
+        apex::rmsNorm(backend, input, core_buffer, weights.offset, result,
                       static_cast<uint32_t>(token_count), static_cast<uint32_t>(hidden_dim), eps);
         backend.sync();
-        
+
         //calculate cpu answer
-        const uint16_t *cpu_weights = static_cast<const uint16_t *>(core.cpu(weight_name));
+        const uint16_t *cpu_weights = reinterpret_cast<const uint16_t *>(
+            static_cast<const char *>(core.data) + weights.offset);
 
         const size_t width = static_cast<size_t>(hidden_dim);
         for (int64_t token = 0; token < token_count; ++token) {
@@ -127,6 +135,10 @@ int run_test_norm(const std::string &packed_dir, const std::string &dump_dir) {
     }
     backend.release(input);
     backend.release(result);
+
+    // GPU lets go of core.bin before it is unmapped.
+    backend.release(core_buffer);
+    apex::unmapFile(core);
     apex::Profile::get().print(stdout);
     std::printf("%lld layers tested, %d failures\n",
                 static_cast<long long>(layer_count), failures);

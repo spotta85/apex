@@ -7,6 +7,8 @@ __pycache__/
 dumps/
 .vscode/
 run.py
-docs/*.excalidraw
+docs/
 .cache/
 .clangd
+.agents
+

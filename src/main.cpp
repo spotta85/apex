@@ -6,37 +6,45 @@
 #include "profiling/memory.h"
 #include "profiling/timer.h"
 #include "backend/metal_backend.h"
-#include "core_weights.h"
-#include "manifest.h"
+#include "file.h"
+#include "model_info.h"
 
 static int run_bench(const std::string& packed_dir) {
-  const auto manifest = apex::Manifest::load(packed_dir);
+  const auto model_info = apex::ModelInfo::load(packed_dir);
   apex::MetalBackend backend(APEX_METALLIB);
   std::printf("device: %s\n", backend.deviceName());
 
-  // One mapping and one GPU buffer for the entire core file.
-  apex::CoreWeights core(manifest, backend);
-  core.touchAll();
+  // Map core.bin (CPU), let the GPU see the same bytes, then pull every page into RAM.
+  apex::MappedFile core = apex::mapFile(model_info.dir + "/core.bin", "core_weights");
+  if (core.size != model_info.core_size) {
+    throw std::runtime_error("core.bin size != manifest");
+  }
+  apex::Buffer* core_buffer = backend.wrapNoCopy(core.data, core.size);
+  apex::touchAll(core);
 
-  // Print while core_weights is still alive and counted in the ledger.
+  // Print while core_weights is still mapped and counted in the ledger.
   apex::Profile::get().print(stdout);
   apex::MemoryTracker::get().print(stdout);
+
+  // GPU lets go of core.bin before it is unmapped.
+  backend.release(core_buffer);
+  apex::unmapFile(core);
   return 0;
 }
 
 /// Loads and prints packed model metadata without reading weight files.
-static int run_manifest(const std::string& packed_dir) {
-    const auto m = apex::Manifest::load(packed_dir);
+static int run_model_info(const std::string& packed_dir) {
+    const auto model_info = apex::ModelInfo::load(packed_dir);
 
-    std::printf("core tensors: %zu\n", m.core.size());
+    std::printf("core tensors: %zu\n", model_info.core.size());
 
     // Cast to match %llu, which expects unsigned long long.
     std::printf("core bytes: %llu\n",
-                static_cast<unsigned long long>(m.core_size));
+                static_cast<unsigned long long>(model_info.core_size));
     std::printf("expert stride: %llu\n",
-                static_cast<unsigned long long>(m.expert_slot_size));
+                static_cast<unsigned long long>(model_info.expert_slot_size));
     std::printf("norm.weight offset: %llu\n",
-                static_cast<unsigned long long>(m.tensor("norm.weight").offset));
+                static_cast<unsigned long long>(model_info.getTensor("norm.weight").offset));
 
     return 0;  // Successful command.
 }
@@ -50,7 +58,7 @@ int main(int argc, char** argv) {
   }
   if (argc == 3 && std::strcmp(argv[1], "bench") == 0) return run_bench(argv[2]);
   if (argc == 3 && std::strcmp(argv[1], "manifest") == 0) {
-    return run_manifest(argv[2]);
+    return run_model_info(argv[2]);
   }
   std::fprintf(stderr,
              "usage: apex bench <packed_dir> | apex manifest <packed_dir> | "

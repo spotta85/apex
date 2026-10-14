@@ -1,3 +1,12 @@
 {
-  "cmake.sourceDirectory": "${workspaceFolder}"
+  "cmake.sourceDirectory": "${workspaceFolder}",
+  "C_Cpp.formatting": "clangFormat",
+  "[cpp]": {
+    "editor.defaultFormatter": "ms-vscode.cpptools",
+    "editor.formatOnSave": true
+  },
+  "[metal]": {
+    "editor.defaultFormatter": "rayanhtt.metal-lsp",
+    "editor.formatOnSave": true
+  }
 }
