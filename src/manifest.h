@@ -108,6 +108,9 @@ struct Manifest {
     }
 };
 
+/// @brief Reads in the manifest.json and converts metadata into Manifest Config, and TensorInfo and ExpertPeices
+/// @param dir location of manifest.json file. 
+/// @return 
 inline Manifest Manifest::load(const std::string& dir) {
     std::ifstream in(dir + "/manifest.json");
 
