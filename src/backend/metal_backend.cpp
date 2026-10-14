@@ -147,5 +147,39 @@ namespace apex {
         // Delte c++ warpper
         delete buffer;
     }
-
+  
+    void MetalBackend::run(const char* kernel, std::initializer_list<Arg> args,
+                       Dim3 threadgroups, Dim3 threads_per_group) {
+        if (!cmd_) {
+            // One pool per batch: commandBuffer() and computeCommandEncoder() are
+            // autoreleased; the pool drains them in sync().
+            pool_ = NS::AutoreleasePool::alloc()->init();
+            cmd_ = queue_->commandBuffer();
+            enc_ = cmd_->computeCommandEncoder();
+        }
+        MTL::ComputePipelineState* pso = pipeline(kernel);
+        enc_->setComputePipelineState(pso);
+        uint32_t index = 0;
+        for (const Arg& a : args) {
+            if (a.buffer) enc_->setBuffer(a.buffer->mtl, a.offset, index);
+            else          enc_->setBytes(a.bytes, a.size, index);
+            ++index;
+        }
+        // Metal's limit is on the threadgroup's total thread count, not per axis.
+        if (threads_per_group.total() > pso->maxTotalThreadsPerThreadgroup()) {
+            throw std::runtime_error(std::string(kernel) + ": threadgroup too large");
+        }
+        enc_->dispatchThreadgroups(MTL::Size::Make(threadgroups.x, threadgroups.y, threadgroups.z),
+                                MTL::Size::Make(threads_per_group.x, threads_per_group.y, threads_per_group.z));
+    }
+    
+    void MetalBackend::sync() {
+        if (!cmd_) return;
+        Timer t("gpu_sync");
+        enc_->endEncoding();
+        cmd_->commit();
+        cmd_->waitUntilCompleted();
+        pool_->release();            // releases cmd_ and enc_
+        pool_ = nullptr; cmd_ = nullptr; enc_ = nullptr;
+    }
 } // namespace apex
