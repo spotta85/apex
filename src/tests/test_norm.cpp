@@ -11,41 +11,7 @@
 #include "../model_info.h"
 #include "../npy.h"
 #include "../ops.h"
-
-// Normalize one token vector on the CPU using BF16 weights.
-static void rmsNormCpu(const float *x, const uint16_t *w_bf16, float *y, size_t n, float eps) {
-    double ss = 0;
-    for (size_t i = 0; i < n; ++i)
-        ss += double(x[i]) * x[i];
-    float inv = 1.0f / std::sqrt(float(ss / n) + eps);
-    for (size_t i = 0; i < n; ++i) {
-        uint32_t bits = uint32_t(w_bf16[i]) << 16;
-        float wf;
-        std::memcpy(&wf, &bits, 4);
-        y[i] = x[i] * inv * wf;
-    }
-}
-
-// max |a-b| and relative L2 ||a-b|| / ||b||
-struct Diff {
-    double max_abs = 0, rel_l2 = 0;
-};
-static Diff diff(const float *a, const float *b, size_t n) {
-    double num = 0, den = 0;
-    Diff d;
-    for (size_t i = 0; i < n; ++i) {
-        if (!std::isfinite(a[i]) || !std::isfinite(b[i])) {
-            return {std::numeric_limits<double>::infinity(),
-                    std::numeric_limits<double>::infinity()};
-        }
-        double e = double(a[i]) - b[i];
-        num += e * e;
-        den += double(b[i]) * b[i];
-        d.max_abs = std::max(d.max_abs, std::fabs(e));
-    }
-    d.rel_l2 = den > 0.0 ? std::sqrt(num / den) : std::sqrt(num);
-    return d;
-}
+#include "cpu_ref.h"
 
 // Compare each layer's RMSNorm output against CPU and Python references.
 int run_test_norm(const std::string &packed_dir, const std::string &dump_dir) {

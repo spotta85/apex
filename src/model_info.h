@@ -75,6 +75,7 @@ struct ModelConfig {
     std::vector<std::string> layer_types;  // "sliding_attention" | "full_attention"
 };
 
+/// @brief Contains info about the model itself including model config and location of tensors (core and experts)
 struct ModelInfo {
     std::string dir;
     ModelConfig config;

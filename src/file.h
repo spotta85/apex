@@ -20,8 +20,10 @@ struct MappedFile {
     const char* category = "";  // memory tracker category
 };
 
-/// Maps a whole file read-only and records it in the memory tracker.
+/// @brief Maps a whole file read-only and records it in the memory tracker.
 /// Nothing is read from disk here; pages load on first touch.
+/// @category Category
+/// @path path
 inline MappedFile mapFile(const std::string& path, const char* category) {
     const int fd = open(path.c_str(), O_RDONLY);
     if (fd < 0) {

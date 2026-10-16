@@ -52,9 +52,15 @@ static int run_model_info(const std::string& packed_dir) {
 // Run the RMSNorm parity test.
 int run_test_norm(const std::string &packed_dir, const std::string &dump_dir); 
 
+// Run the dense MLP parity test.
+int run_test_mlp(const std::string &packed_dir, const std::string &dump_dir);
+
 int main(int argc, char** argv) {
   if (argc == 4 && std::strcmp(argv[1], "test-norm") == 0) {
     return run_test_norm(argv[2], argv[3]);
+  }
+  if (argc == 4 && std::strcmp(argv[1], "test-mlp") == 0) {
+    return run_test_mlp(argv[2], argv[3]);
   }
   if (argc == 3 && std::strcmp(argv[1], "bench") == 0) return run_bench(argv[2]);
   if (argc == 3 && std::strcmp(argv[1], "manifest") == 0) {
@@ -62,6 +68,6 @@ int main(int argc, char** argv) {
   }
   std::fprintf(stderr,
              "usage: apex bench <packed_dir> | apex manifest <packed_dir> | "
-             "apex test-norm <packed_dir> <dump_dir>\n");
+             "apex test-norm <packed_dir> <dump_dir> | apex test-mlp <packed_dir> <dump_dir>\n");
   return 2;
 }
