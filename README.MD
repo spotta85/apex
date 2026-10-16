@@ -12,8 +12,7 @@ where the GPU will read them, with no upload step.
 
 ## Status
 
-Step A1 of the plan: build skeleton and a GPU smoke test. Nothing model
-related runs yet.
+Currently writing the Attention Kernels. 
 
 ## Build
 
