@@ -17,6 +17,7 @@ target_include_directories(nlohmann_json INTERFACE third_party)
 include(cmake/MetalShaders.cmake)
 add_metal_library(apex_shaders OUTPUT apex.metallib
   SOURCES shaders/norm.metal shaders/matmul.metal shaders/geglu.metal
+          shaders/head_norm_rope.metal
   DEPENDS shaders/quant.h)
 
 # main stuff

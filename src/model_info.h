@@ -73,6 +73,14 @@ struct ModelConfig {
     double rms_norm_eps = 0;        // 1e-6
     double final_logit_softcapping = 0;  // 30.0
     std::vector<std::string> layer_types;  // "sliding_attention" | "full_attention"
+
+    // attention and rope stuff. 
+    int global_head_dim = 0;               // 512  (full-attention layers)
+    int num_global_key_value_heads = 0;    // 2    (full-attention layers)
+    bool attention_k_eq_v = false;         // true: full layers have no v_proj
+    double rope_theta_sliding = 0;         // 1e4
+    double rope_theta_full = 0;            // 1e6
+    double partial_rotary_factor_full = 0; // 0.25
 };
 
 /// @brief Contains info about the model itself including model config and location of tensors (core and experts)
@@ -145,6 +153,15 @@ inline ModelInfo ModelInfo::load(const std::string& dir) {
     c.rms_norm_eps          = tc.at("rms_norm_eps").get<double>();
     c.final_logit_softcapping = tc.at("final_logit_softcapping").get<double>();
     c.layer_types           = tc.at("layer_types").get<std::vector<std::string>>();
+    // attentoin and rope stuff. 
+    c.global_head_dim = tc.at("global_head_dim").get<int>();
+    c.num_global_key_value_heads = tc.at("num_global_key_value_heads").get<int>();
+    c.attention_k_eq_v = tc.at("attention_k_eq_v").get<bool>();
+    const auto &rp = tc.at("rope_parameters");
+    c.rope_theta_sliding = rp.at("sliding_attention").at("rope_theta").get<double>();
+    c.rope_theta_full = rp.at("full_attention").at("rope_theta").get<double>();
+    c.partial_rotary_factor_full =
+    rp.at("full_attention").at("partial_rotary_factor").get<double>();
 
     // Read how the weights were quantized.
     const auto& q = j.at("quantization");
