@@ -18,7 +18,7 @@ include(cmake/MetalShaders.cmake)
 add_metal_library(apex_shaders OUTPUT apex.metallib
   SOURCES shaders/norm.metal shaders/matmul.metal
           shaders/head_norm_rope.metal shaders/attention.metal
-          shaders/router.metal
+          shaders/router.metal shaders/experts.metal
   DEPENDS shaders/quant.h shaders/shared.h shaders/reduce.h)
 
 # main stuff

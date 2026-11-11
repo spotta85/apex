@@ -61,6 +61,8 @@ int run_test_attn_synth(const std::string &packed_dir);
 
 // Router parity test (dumps, core weights only).
 int run_test_router(const std::string &packed_dir, const std::string &dump_dir);
+// Expert parity test (dumps; routed experts pread from one layer file at a time).
+int run_test_moe(const std::string &packed_dir, const std::string &dump_dir);
 
 int main(int argc, char** argv) {
   if (argc == 4 && std::strcmp(argv[1], "test-norm") == 0) {
@@ -78,6 +80,9 @@ int main(int argc, char** argv) {
   if (argc == 4 && std::strcmp(argv[1], "test-router") == 0) {
     return run_test_router(argv[2], argv[3]);
   }
+  if (argc == 4 && std::strcmp(argv[1], "test-moe") == 0) {
+    return run_test_moe(argv[2], argv[3]);
+  }
   if (argc == 3 && std::strcmp(argv[1], "bench") == 0) return run_bench(argv[2]);
   if (argc == 3 && std::strcmp(argv[1], "manifest") == 0) {
     return run_model_info(argv[2]);
@@ -86,6 +91,6 @@ int main(int argc, char** argv) {
              "usage: apex bench <packed_dir> | apex manifest <packed_dir> | "
              "apex test-norm <packed_dir> <dump_dir> | apex test-mlp <packed_dir> <dump_dir> | "
              "apex test-attn <packed_dir> <dump_dir> | apex test-attn-synth <packed_dir> | "
-             "apex test-router <packed_dir> <dump_dir>\n");
+             "apex test-router <packed_dir> <dump_dir> | apex test-moe <packed_dir> <dump_dir>\n");
   return 2;
 }

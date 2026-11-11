@@ -3,7 +3,15 @@
 // test-router: GPU router on h = layer_in + attn_out (the raw post-attention hidden the
 //              reference router reads). Expert ids must match the dump exactly (as sets,
 //              sorted by id); weights are compared by rel L2. Core weights only.
+// test-moe:    GPU router + pre_feedforward_layernorm_2 + both expert kernels on the same h,
+//              compared with the moe_out dump and a CPU reference. The routed experts of
+//              each layer are pread into a small slot buffer (slot != expert id), which
+//              exercises the slot interface a disk cache will use and never wraps a whole
+//              layer file.
+#include <fcntl.h>
+#include <unistd.h>
 #include <algorithm>
+#include <map>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -108,5 +116,127 @@ int run_test_router(const std::string &packed_dir, const std::string &dump_dir) 
     }
     std::printf("%lld layers tested, %d failures (smallest 8th-vs-9th score gap %.2e)\n",
                 static_cast<long long>(L), failures, worst_margin);
+    return failures ? 1 : 0;
+}
+
+namespace {
+
+/// Read `bytes` at `offset` of `path` into dst, or throw.
+void preadAll(int fd, void *dst, size_t bytes, off_t offset) {
+    char *p = static_cast<char *>(dst);
+    while (bytes > 0) {
+        const ssize_t n = pread(fd, p, bytes, offset);
+        if (n <= 0) throw std::runtime_error("pread failed");
+        p += n;
+        bytes -= size_t(n);
+        offset += n;
+    }
+}
+
+/// One expert of one token on the CPU: y = down(gelu(gate x) * up x). slot points at the
+/// expert's bytes, laid out like the packed slot.
+void expertCpu(const char *slot, const ExpertLayout &l, const float *x, float *y, size_t hidden,
+               size_t inter) {
+    std::vector<float> g(inter), u(inter);
+    matvecNvfp4Cpu(reinterpret_cast<const uint32_t *>(slot + l.gate_w),
+                   reinterpret_cast<const uint8_t *>(slot + l.gate_s), x, g.data(), 1, inter,
+                   hidden);
+    matvecNvfp4Cpu(reinterpret_cast<const uint32_t *>(slot + l.up_w),
+                   reinterpret_cast<const uint8_t *>(slot + l.up_s), x, u.data(), 1, inter,
+                   hidden);
+    for (size_t i = 0; i < inter; ++i) g[i] = geluTanh(g[i]) * u[i];
+    matvecNvfp4Cpu(reinterpret_cast<const uint32_t *>(slot + l.down_w),
+                   reinterpret_cast<const uint8_t *>(slot + l.down_s), g.data(), y, 1, hidden,
+                   inter);
+}
+
+} // namespace
+
+int run_test_moe(const std::string &packed_dir, const std::string &dump_dir) {
+    apex::TestContext ctx(packed_dir);
+    const apex::ModelConfig &c = ctx.info.config;
+    const int64_t L = c.num_hidden_layers, H = c.hidden_size, K = c.top_k_experts;
+    const size_t inter = size_t(c.moe_intermediate_size);
+    const apex::Npy embed = apex::loadNpy(dump_dir + "/embed.npy");
+    const int64_t T = embed.shape[0];
+    const apex::Npy layer_out = apex::loadDump(dump_dir, "layer_out", {L, T, H});
+    const apex::Npy attn_out = apex::loadDump(dump_dir, "attn_out", {L, T, H});
+    const apex::Npy moe_out = apex::loadDump(dump_dir, "moe_out", {L, T, H});
+    const RouteDump dump = loadRoutes(dump_dir, L, T, K);
+    const size_t count = size_t(T * H);
+    const ExpertLayout &layout = ctx.weights.expert_layout;
+
+    apex::Buffer *h_buf = ctx.alloc(count * sizeof(float));
+    apex::Buffer *x_buf = ctx.alloc(count * sizeof(float));
+    apex::Buffer *routes = ctx.alloc(size_t(T * K) * sizeof(ExpertRoute));
+    apex::Buffer *counts = ctx.alloc(size_t(T) * sizeof(uint32_t));
+    apex::Buffer *act = ctx.alloc(size_t(T * K) * inter * sizeof(float));
+    apex::Buffer *out_buf = ctx.alloc(count * sizeof(float));
+    std::vector<float> h(count), x(count), cpu_out(count), y(H);
+
+    int failures = 0;
+    for (int layer = 0; layer < L; ++layer) {
+        const apex::LayerWeights &w = ctx.weights.layers[layer];
+        const apex::RouterWeights &r = w.router;
+        postAttentionHidden(embed, layer_out, attn_out, layer, count, h.data());
+        std::memcpy(ctx.f32(h_buf), h.data(), count * sizeof(float));
+
+        // 1. Router and the experts' input norm on the GPU.
+        ctx.ops.router(h_buf, ctx.core_buffer, r.scale, r.proj_weight, r.proj_scales,
+                       r.proj_biases, r.per_expert_scale, routes, counts,
+                       apex::routerParams(c, r.group_size), uint32_t(T));
+        ctx.ops.rmsNorm(h_buf, ctx.core_buffer, w.pre_ffn_norm_2, x_buf, uint32_t(T),
+                        uint32_t(H), ctx.eps);
+        ctx.backend.sync();
+
+        // 2. Load each routed expert once into a compact slot buffer and remap the routes.
+        auto *route = static_cast<ExpertRoute *>(ctx.backend.contents(routes));
+        std::map<uint32_t, uint32_t> slot_of; // expert id -> slot
+        for (int64_t i = 0; i < T * K; ++i) slot_of.emplace(route[i].slot, 0);
+        uint32_t next = 0;
+        for (auto &[id, slot] : slot_of) slot = next++;
+        const size_t slot_bytes = size_t(layout.stride);
+        apex::Buffer *slots = ctx.backend.allocate(slot_of.size() * slot_bytes, "expert_slots");
+        char *slot_cpu = static_cast<char *>(ctx.backend.contents(slots));
+        const int fd = open(ctx.info.layer_file(layer).c_str(), O_RDONLY);
+        if (fd < 0) throw std::runtime_error("cannot open " + ctx.info.layer_file(layer));
+        for (auto &[id, slot] : slot_of)
+            preadAll(fd, slot_cpu + slot * slot_bytes, slot_bytes, off_t(id) * off_t(slot_bytes));
+        close(fd);
+        for (int64_t i = 0; i < T * K; ++i) route[i].slot = slot_of[route[i].slot];
+
+        // 3. Experts on the GPU.
+        ctx.ops.experts(x_buf, slots, routes, counts, act, out_buf,
+                        apex::expertParams(c, layout, uint32_t(T)));
+        ctx.backend.sync();
+
+        // CPU reference with the DUMP's routing (independent of the GPU router).
+        const uint16_t *norm_w = ctx.cpu<uint16_t>(w.pre_ffn_norm_2);
+        for (int64_t t = 0; t < T; ++t) {
+            rmsNormCpu(h.data() + t * H, norm_w, x.data() + t * H, H, ctx.eps);
+            std::vector<double> acc(H, 0.0);
+            for (int64_t k = 0; k < K; ++k) {
+                const int64_t id = dump.ids.i64()[(layer * T + t) * K + k];
+                const float wk = dump.weights.f32()[(layer * T + t) * K + k];
+                const auto it = slot_of.find(uint32_t(id));
+                if (it == slot_of.end()) throw std::runtime_error("dump expert not loaded");
+                expertCpu(slot_cpu + it->second * slot_bytes, layout, x.data() + t * H, y.data(),
+                          H, inter);
+                for (int64_t i = 0; i < H; ++i) acc[i] += double(wk) * y[i];
+            }
+            for (int64_t i = 0; i < H; ++i) cpu_out[t * H + i] = float(acc[i]);
+        }
+        ctx.backend.release(slots);
+
+        const float *expected = moe_out.f32() + size_t(layer) * count;
+        const float *gpu = ctx.f32(out_buf);
+        char label[32];
+        std::snprintf(label, sizeof label, "%zu slots", slot_of.size());
+        failures += !apex::report(label, layer, diff(gpu, expected, count),
+                                  diff(cpu_out.data(), expected, count),
+                                  diff(gpu, cpu_out.data(), count), 1e-5);
+    }
+    apex::Profile::get().print(stdout);
+    std::printf("%lld layers tested, %d failures\n", static_cast<long long>(L), failures);
     return failures ? 1 : 0;
 }

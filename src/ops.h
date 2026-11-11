@@ -88,7 +88,9 @@ class Ops {
           matmul_(backend.kernel("matmul_nvfp4")),
           gate_up_geglu_(backend.kernel("gate_up_geglu_nvfp4")),
           qkv_norm_rope_(backend.kernel("qkv_norm_rope_f32")),
-          attention_(backend.kernel("attention_f32")), router_(backend.kernel("router_f32")) {}
+          attention_(backend.kernel("attention_f32")), router_(backend.kernel("router_f32")),
+          expert_gate_up_(backend.kernel("expert_gate_up_nvfp4")),
+          expert_down_(backend.kernel("expert_down_nvfp4")) {}
 
     Backend &backend() { return backend_; }
 
@@ -230,6 +232,27 @@ class Ops {
                      Dim3{tokens}, Dim3{APEX_ROUTER_THREADS});
     }
 
+    /// @brief Routed experts, two dispatches:
+    ///   gate+up+GeGLU for all of each token's routed slots → act [tokens, max_k, inter]
+    ///   down + weighted sum over the slots                → output [tokens, in_dim]
+    /// experts is the layer's slot buffer; routes/counts are what the router wrote (or a
+    /// remapped copy when slots are not expert ids).
+    void experts(Buffer *input, Buffer *experts, Buffer *routes, Buffer *counts, Buffer *act,
+                 Buffer *output, const ExpertParams &p) {
+        if (p.inter % APEX_MATMUL_ROWS_PER_GROUP || p.in_dim % APEX_MATMUL_ROWS_PER_GROUP)
+            throw std::runtime_error("experts: sizes must be multiples of 8 rows");
+        backend_.run(expert_gate_up_,
+                     {Arg::buf(input), Arg::buf(experts), Arg::buf(routes), Arg::buf(counts),
+                      Arg::buf(act), Arg::val(p)},
+                     Dim3{p.inter / APEX_MATMUL_ROWS_PER_GROUP, p.max_k, p.tokens},
+                     Dim3{APEX_MATMUL_ROWS_PER_GROUP * 32});
+        backend_.run(expert_down_,
+                     {Arg::buf(act), Arg::buf(experts), Arg::buf(routes), Arg::buf(counts),
+                      Arg::buf(output), Arg::val(p)},
+                     Dim3{p.in_dim / APEX_MATMUL_ROWS_PER_GROUP, p.tokens},
+                     Dim3{APEX_MATMUL_ROWS_PER_GROUP * 32});
+    }
+
   private:
     Backend &backend_;
     Kernel *rms_norm_;
@@ -238,6 +261,8 @@ class Ops {
     Kernel *qkv_norm_rope_;
     Kernel *attention_;
     Kernel *router_;
+    Kernel *expert_gate_up_;
+    Kernel *expert_down_;
 };
 
 } // namespace apex

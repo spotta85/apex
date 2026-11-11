@@ -36,6 +36,18 @@ inline RouterParams routerParams(const ModelConfig &c, uint32_t group_size) {
     return p;
 }
 
+/// Expert launch parameters for `tokens` tokens.
+inline ExpertParams expertParams(const ModelConfig &c, const ExpertLayout &layout,
+                                 uint32_t tokens) {
+    ExpertParams p;
+    p.in_dim = uint32_t(c.hidden_size);
+    p.inter = uint32_t(c.moe_intermediate_size);
+    p.tokens = tokens;
+    p.max_k = uint32_t(c.top_k_experts);
+    p.layout = layout;
+    return p;
+}
+
 /// Everything one decoder layer reads from core.bin, as byte offsets into the core buffer.
 struct LayerWeights {
     AttentionShape shape;
