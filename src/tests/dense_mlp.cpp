@@ -21,6 +21,7 @@ static void denseMlpCpu(const apex::ModelInfo &model_info, const apex::MappedFil
 int run_test_mlp(const std::string &packed_dir, const std::string &dump_dir) {
     apex::ModelInfo model_info = apex::ModelInfo::load(packed_dir);
     apex::MetalBackend backend(APEX_METALLIB);
+    apex::Ops ops(backend);
 
     // Map core.bin - core weights (CPU), then let the GPU read the same bytes without a copy.
     apex::MappedFile core = apex::mapFile(model_info.dir + "/core.bin", "core_weights");
@@ -62,8 +63,8 @@ int run_test_mlp(const std::string &packed_dir, const std::string &dump_dir) {
     // Allocate activation buffers for intermediate values. 
     apex::Buffer *input = backend.allocate(hidden_count * sizeof(float), "activations");
     apex::Buffer *norm_output = backend.allocate(hidden_count * sizeof(float), "activations");
-    apex::Buffer *gate_buffer = backend.allocate(intermediate_count * sizeof(float), "activations");
-    apex::Buffer *up_buffer = backend.allocate(intermediate_count * sizeof(float), "activations");
+    // GeGLU output (gate and up are fused in one kernel and never stored).
+    apex::Buffer *act_buffer = backend.allocate(intermediate_count * sizeof(float), "activations");
     apex::Buffer *output_buffer = backend.allocate(hidden_count * sizeof(float), "activations");
 
     // CPU side: the MLP input (built per layer) and the CPU reference answer.
@@ -93,12 +94,13 @@ int run_test_mlp(const std::string &packed_dir, const std::string &dump_dir) {
         const apex::Nvfp4Matrix down_weights =
             quantMatrix(model_info, core_buffer, prefix + "mlp.down_proj");
 
-        // GPU: norm, then the MLP. Kernels run in queue order; sync waits for all of them.
+        // GPU: norm, then the MLP (fused gate+up+GeGLU, then down). Kernels run in queue
+        // order; sync waits for all of them.
         std::memcpy(backend.contents(input), h.data(), hidden_count * sizeof(float));
-        apex::rmsNorm(backend, input, core_buffer, norm.offset, norm_output,
-                      static_cast<uint32_t>(token_count), static_cast<uint32_t>(hidden_dim), eps);
-        apex::denseMlp(backend, norm_output, gate_weights, up_weights, down_weights, gate_buffer,
-                       up_buffer, output_buffer, static_cast<uint32_t>(token_count));
+        ops.rmsNorm(input, core_buffer, norm.offset, norm_output,
+                    static_cast<uint32_t>(token_count), static_cast<uint32_t>(hidden_dim), eps);
+        ops.denseMlp(norm_output, gate_weights, up_weights, down_weights, act_buffer,
+                     output_buffer, static_cast<uint32_t>(token_count));
         backend.sync();
 
         // CPU reference from the same h, independent of the GPU path.
@@ -121,7 +123,7 @@ int run_test_mlp(const std::string &packed_dir, const std::string &dump_dir) {
     }
 
     // Free activations, then let the GPU go of core.bin before unmapping it.
-    for (apex::Buffer *buffer : {input, norm_output, gate_buffer, up_buffer, output_buffer}) {
+    for (apex::Buffer *buffer : {input, norm_output, act_buffer, output_buffer}) {
         backend.release(buffer);
     }
     backend.release(core_buffer);

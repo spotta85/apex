@@ -17,6 +17,7 @@
 int run_test_norm(const std::string &packed_dir, const std::string &dump_dir) {
     apex::ModelInfo model_info = apex::ModelInfo::load(packed_dir);
     apex::MetalBackend backend(APEX_METALLIB);
+    apex::Ops ops(backend);
 
     // Map core.bin (CPU), then let the GPU read the same bytes without a copy.
     apex::MappedFile core = apex::mapFile(model_info.dir + "/core.bin", "core_weights");
@@ -71,7 +72,7 @@ int run_test_norm(const std::string &packed_dir, const std::string &dump_dir) {
             "layers." + std::to_string(layer) + ".input_layernorm.weight";
         const apex::TensorInfo &weights = model_info.getTensor(weight_name);
 
-        apex::rmsNorm(backend, input, core_buffer, weights.offset, result,
+        ops.rmsNorm(input, core_buffer, weights.offset, result,
                       static_cast<uint32_t>(token_count), static_cast<uint32_t>(hidden_dim), eps);
         backend.sync();
 
