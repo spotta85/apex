@@ -36,8 +36,9 @@ namespace apex {
 
     /// @brief Just a boring old destructor. Releases all Metal objects we own.
     MetalBackend::~MetalBackend() {
-        for (const auto& [name, pso] : pipelines_) {
-            pso->release();
+        for (const auto& [name, k] : kernels_) {
+            k->pso->release();
+            delete k;
         }
         library_->release();
         queue_->release();
@@ -48,12 +49,13 @@ namespace apex {
         return device_->name()->utf8String();
     }
 
-    /// @brief Helper to create a compute pipeline state object for a function
-    /// @param name name of the metal kernel. 
-    /// @return cps object for that kernel. 
-    MTL::ComputePipelineState* MetalBackend::pipeline(const char* name) {
-        auto it = pipelines_.find(name);
-        if (it != pipelines_.end()) {
+    /// @brief Creates (once) the compute pipeline state object for a function.
+    /// Callers keep the returned handle, so the map lookup happens at load time only.
+    /// @param name name of the metal kernel.
+    /// @return handle owning the pipeline for that kernel.
+    Kernel* MetalBackend::kernel(const char* name) {
+        auto it = kernels_.find(name);
+        if (it != kernels_.end()) {
             return it->second;
         }
 
@@ -76,9 +78,9 @@ namespace apex {
         }
 
         // The cache owns this pipeline until the backend destructor releases it.
-        pipelines_[name] = pso;
-
-        return pso;
+        Kernel* k = new Kernel{pso, name, static_cast<uint32_t>(pso->maxTotalThreadsPerThreadgroup())};
+        kernels_[name] = k;
+        return k;
     }
 
     /// @brief Creates a metal buffer which is bsically a wrapper around cpu pointer. You create a buffer and then pass the pointer here. 
@@ -148,38 +150,54 @@ namespace apex {
         delete buffer;
     }
   
-    void MetalBackend::run(const char* kernel, std::initializer_list<Arg> args,
-                       Dim3 threadgroups, Dim3 threads_per_group) {
+    void MetalBackend::run(Kernel* kernel, std::initializer_list<Arg> args,
+                           Dim3 threadgroups, Dim3 threads_per_group) {
         if (!cmd_) {
             // One pool per batch: commandBuffer() and computeCommandEncoder() are
             // autoreleased; the pool drains them in sync().
             pool_ = NS::AutoreleasePool::alloc()->init();
-            cmd_ = queue_->commandBuffer();
+            // Unretained references: the engine keeps every buffer alive until sync()
+            // returns, so Metal does not need to retain/release each one per dispatch.
+            cmd_ = queue_->commandBufferWithUnretainedReferences();
+            // Serial dispatch (the default): each dispatch sees the previous one's writes.
             enc_ = cmd_->computeCommandEncoder();
+            bound_ = nullptr;
         }
-        MTL::ComputePipelineState* pso = pipeline(kernel);
-        enc_->setComputePipelineState(pso);
+        // Metal's limit is on the threadgroup's total thread count, not per axis.
+        if (threads_per_group.total() > kernel->max_threads) {
+            throw std::runtime_error(kernel->name + ": threadgroup too large (" +
+                                     std::to_string(threads_per_group.total()) + " > " +
+                                     std::to_string(kernel->max_threads) + ")");
+        }
+        if (bound_ != kernel) {
+            enc_->setComputePipelineState(kernel->pso);
+            bound_ = kernel;
+        }
         uint32_t index = 0;
         for (const Arg& a : args) {
             if (a.buffer) enc_->setBuffer(a.buffer->mtl, a.offset, index);
             else          enc_->setBytes(a.bytes, a.size, index);
             ++index;
         }
-        // Metal's limit is on the threadgroup's total thread count, not per axis.
-        if (threads_per_group.total() > pso->maxTotalThreadsPerThreadgroup()) {
-            throw std::runtime_error(std::string(kernel) + ": threadgroup too large");
-        }
         enc_->dispatchThreadgroups(MTL::Size::Make(threadgroups.x, threadgroups.y, threadgroups.z),
-                                MTL::Size::Make(threads_per_group.x, threads_per_group.y, threads_per_group.z));
+                                   MTL::Size::Make(threads_per_group.x, threads_per_group.y, threads_per_group.z));
     }
-    
+
     void MetalBackend::sync() {
         if (!cmd_) return;
         Timer t("gpu_sync");
         enc_->endEncoding();
         cmd_->commit();
         cmd_->waitUntilCompleted();
+        if (cmd_->status() == MTL::CommandBufferStatusError) {
+            const char* detail = cmd_->error() ? cmd_->error()->localizedDescription()->utf8String()
+                                               : "unknown";
+            std::string message = std::string("GPU command buffer failed: ") + detail;
+            pool_->release();
+            pool_ = nullptr; cmd_ = nullptr; enc_ = nullptr; bound_ = nullptr;
+            throw std::runtime_error(message);
+        }
         pool_->release();            // releases cmd_ and enc_
-        pool_ = nullptr; cmd_ = nullptr; enc_ = nullptr;
+        pool_ = nullptr; cmd_ = nullptr; enc_ = nullptr; bound_ = nullptr;
     }
 } // namespace apex
