@@ -153,3 +153,58 @@ struct Lcg {
         return float((state >> 40) & 0xFFFFFF) / float(1 << 23) - 1.0f;
     }
 };
+
+// Router for one token on the CPU (mlx_lm gemma4_text.Router):
+//   x = rms_norm(h, scale * root), scores = affine8(proj) . x, top-k, softmax, * per_expert.
+// Writes ids in descending score order (ties: lower id first) and their weights.
+// margin gets score[k-1] - score[k], the gap that decides whether the top-k set is fragile.
+inline void routerCpu(const float *h, const uint16_t *scale, const uint32_t *proj_w,
+                      const uint16_t *proj_s, const uint16_t *proj_b, const uint16_t *per_expert,
+                      size_t hidden, size_t experts, size_t group, size_t top_k, float eps,
+                      float root, int64_t *ids, float *weights, double *margin) {
+    std::vector<float> x(hidden);
+    double ss = 0;
+    for (size_t i = 0; i < hidden; ++i)
+        ss += double(h[i]) * h[i];
+    const float inv = 1.0f / std::sqrt(float(ss / hidden) + eps);
+    for (size_t i = 0; i < hidden; ++i)
+        x[i] = (h[i] * inv) * (bf16Cpu(scale[i]) * root);
+    std::vector<double> scores(experts);
+    const size_t groups = hidden / group;
+    for (size_t e = 0; e < experts; ++e) {
+        double acc = 0;
+        for (size_t i = 0; i < hidden; ++i) {
+            const uint32_t word = proj_w[e * (hidden / 4) + i / 4];
+            const double q = double((word >> (8 * (i % 4))) & 0xFF);
+            const size_t g = e * groups + i / group;
+            acc += (q * bf16Cpu(proj_s[g]) + bf16Cpu(proj_b[g])) * x[i];
+        }
+        scores[e] = acc;
+    }
+    std::vector<size_t> order(experts);
+    for (size_t e = 0; e < experts; ++e) order[e] = e;
+    std::stable_sort(order.begin(), order.end(),
+                     [&](size_t a, size_t b) { return scores[a] > scores[b]; });
+    double top = scores[order[0]], sum = 0;
+    std::vector<double> ex(top_k);
+    for (size_t k = 0; k < top_k; ++k) {
+        ex[k] = std::exp(scores[order[k]] - top);
+        sum += ex[k];
+    }
+    for (size_t k = 0; k < top_k; ++k) {
+        ids[k] = int64_t(order[k]);
+        weights[k] = float(ex[k] / sum * bf16Cpu(per_expert[order[k]]));
+    }
+    *margin = top_k < experts ? scores[order[top_k - 1]] - scores[order[top_k]] : 0.0;
+}
+
+// Sort (id, weight) pairs by id, like dump_reference.py's sort_route.
+inline void sortRoute(int64_t *ids, float *weights, size_t k) {
+    std::vector<std::pair<int64_t, float>> v(k);
+    for (size_t i = 0; i < k; ++i) v[i] = {ids[i], weights[i]};
+    std::sort(v.begin(), v.end());
+    for (size_t i = 0; i < k; ++i) {
+        ids[i] = v[i].first;
+        weights[i] = v[i].second;
+    }
+}

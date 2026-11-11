@@ -2,6 +2,7 @@
 /// @brief Resolve every core tensor the forward pass needs into plain structs, once, at load.
 /// After this nothing in the per-token path looks a tensor up by name.
 #pragma once
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <string>
@@ -20,6 +21,20 @@ struct RouterWeights {
     size_t proj_biases;      // BF16 [experts, hidden/64]
     uint32_t group_size;     // 64
 };
+
+/// Router launch parameters for this model (hidden, experts, top-k, group, eps, root scale).
+inline RouterParams routerParams(const ModelConfig &c, uint32_t group_size) {
+    RouterParams p;
+    p.hidden = uint32_t(c.hidden_size);
+    p.experts = uint32_t(c.num_experts);
+    p.top_k = uint32_t(c.top_k_experts);
+    p.group_size = group_size;
+    p.eps = float(c.rms_norm_eps);
+    // mlx: self._root_size = hidden_size ** -0.5 (a Python double), multiplied into the fp32
+    // scale vector, so it enters the math rounded to float.
+    p.root_scale = float(std::pow(double(c.hidden_size), -0.5));
+    return p;
+}
 
 /// Everything one decoder layer reads from core.bin, as byte offsets into the core buffer.
 struct LayerWeights {

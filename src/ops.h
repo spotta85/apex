@@ -88,7 +88,7 @@ class Ops {
           matmul_(backend.kernel("matmul_nvfp4")),
           gate_up_geglu_(backend.kernel("gate_up_geglu_nvfp4")),
           qkv_norm_rope_(backend.kernel("qkv_norm_rope_f32")),
-          attention_(backend.kernel("attention_f32")) {}
+          attention_(backend.kernel("attention_f32")), router_(backend.kernel("router_f32")) {}
 
     Backend &backend() { return backend_; }
 
@@ -213,6 +213,23 @@ class Ops {
         matmulNvfp4(tmp.o, w.o, output, tokens);
     }
 
+    /// @brief Fused router for `tokens` rows of h: writes routes [tokens, top_k] (slot = expert
+    /// id, weight) and counts [tokens], all on the GPU.
+    /// core holds the router tensors; offsets come from RouterWeights (weights.h).
+    void router(Buffer *h, Buffer *core, size_t scale, size_t proj_weight, size_t proj_scales,
+                size_t proj_biases, size_t per_expert_scale, Buffer *routes, Buffer *counts,
+                const RouterParams &p, uint32_t tokens) {
+        if (p.hidden > APEX_MAX_HIDDEN || p.experts > APEX_MAX_EXPERTS || p.top_k > 32 ||
+            p.top_k > APEX_MAX_TOP_K || p.hidden % p.group_size || p.group_size % 4)
+            throw std::runtime_error("router: shape outside the kernel's limits");
+        backend_.run(router_,
+                     {Arg::buf(h), Arg::buf(core, scale), Arg::buf(core, proj_weight),
+                      Arg::buf(core, proj_scales), Arg::buf(core, proj_biases),
+                      Arg::buf(core, per_expert_scale), Arg::buf(routes), Arg::buf(counts),
+                      Arg::val(p)},
+                     Dim3{tokens}, Dim3{APEX_ROUTER_THREADS});
+    }
+
   private:
     Backend &backend_;
     Kernel *rms_norm_;
@@ -220,6 +237,7 @@ class Ops {
     Kernel *gate_up_geglu_;
     Kernel *qkv_norm_rope_;
     Kernel *attention_;
+    Kernel *router_;
 };
 
 } // namespace apex
