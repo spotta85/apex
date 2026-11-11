@@ -25,7 +25,8 @@ add_metal_library(apex_shaders OUTPUT apex.metallib
 # main stuff
 add_executable(apex src/main.cpp src/metal_impl.cpp src/backend/metal_backend.cpp
   src/tests/test_norm.cpp src/tests/dense_mlp.cpp src/tests/attention.cpp
-  src/tests/moe.cpp src/tests/tail.cpp)
+  src/tests/moe.cpp src/tests/tail.cpp
+  src/tests/forward.cpp)
 target_link_libraries(apex PRIVATE metal_cpp nlohmann_json)
 add_dependencies(apex apex_shaders)
 
