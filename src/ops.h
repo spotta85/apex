@@ -6,6 +6,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <stdexcept>
+#include <string>
 #include "backend/backend.h"
 #include "model_info.h"
 #include "../shaders/shared.h"
@@ -63,13 +64,34 @@ struct AttentionWeights {
     size_t q_norm_offset, k_norm_offset; // BF16 [head_dim] each, in the core buffer
 };
 
-// One layer's KV cache: K and V are [kv_heads][capacity][head_dim] float32.
-// Position p lives in slot p (linear cache; capacity >= the longest sequence).
+// Element type of the KV cache. Math is float either way; F16 halves the cache's memory and
+// read bandwidth at the cost of rounding the stored keys and values.
+enum class KvDtype { F32, F16 };
+inline size_t kvElementBytes(KvDtype d) { return d == KvDtype::F16 ? 2 : 4; }
+
+// One layer's KV cache: K and V are [kv_heads][capacity][head_dim] of `dtype`.
+// Position p lives in slot p % capacity. A full-attention layer's capacity covers the longest
+// sequence (no wrap); a sliding layer is a ring of window + slack slots.
 struct KvCache {
     Buffer *k = nullptr;
     Buffer *v = nullptr;
     uint32_t capacity = 0;
+    KvDtype dtype = KvDtype::F32;
 };
+
+/// Throws unless `tokens` tokens can be written at pos0 and attended without overwriting a key
+/// one of them still needs: a linear cache must hold pos0 + tokens positions; a ring must keep
+/// window - 1 older keys for the first token while the last one is written, i.e.
+/// tokens <= capacity - window + 1.
+inline void checkKvWrite(const KvCache &cache, uint32_t window, uint32_t pos0, uint32_t tokens) {
+    const bool wraps = pos0 + tokens > cache.capacity;
+    if (!wraps) return;
+    if (window == 0 || window > cache.capacity || tokens > cache.capacity - window + 1)
+        throw std::runtime_error("KV cache: write of " + std::to_string(tokens) +
+                                 " tokens at " + std::to_string(pos0) +
+                                 " does not fit (capacity " + std::to_string(cache.capacity) +
+                                 ", window " + std::to_string(window) + ")");
+}
 
 // Scratch for one attention call, sized for the largest layer (head_dim 512).
 struct AttentionScratch {
@@ -87,8 +109,9 @@ class Ops {
         : backend_(backend), rms_norm_(backend.kernel("rms_norm_f32")),
           matmul_(backend.kernel("matmul_nvfp4")),
           gate_up_geglu_(backend.kernel("gate_up_geglu_nvfp4")),
-          qkv_norm_rope_(backend.kernel("qkv_norm_rope_f32")),
-          attention_(backend.kernel("attention_f32")), router_(backend.kernel("router_f32")),
+          qkv_norm_rope_{backend.kernel("qkv_norm_rope_kv_f32"),
+                         backend.kernel("qkv_norm_rope_kv_f16")},
+          attention_{backend.kernel("attention_kv_f32"), backend.kernel("attention_kv_f16")}, router_(backend.kernel("router_f32")),
           expert_gate_up_(backend.kernel("expert_gate_up_nvfp4")),
           expert_down_(backend.kernel("expert_down_nvfp4")),
           embed_norm_(backend.kernel("embed_norm_nvfp4")),
@@ -177,13 +200,15 @@ class Ops {
     }
 
     /// @brief q/K/V per-head norm + RoPE in one dispatch; K and V go straight into the cache
-    /// at positions pos0 .. pos0 + tokens - 1. v_raw is the k projection on full layers.
+    /// at positions pos0 .. pos0 + tokens - 1 (slots pos % capacity). v_raw is the k
+    /// projection on full layers.
     void qkvNormRope(Buffer *q, Buffer *k_raw, Buffer *v_raw, const AttentionWeights &w,
                      const AttentionShape &s, const KvCache &cache, uint32_t tokens,
                      uint32_t pos0, float eps) {
+        checkKvWrite(cache, s.window, pos0, tokens);
         const QkvNormRopeParams p{s.q_heads, s.kv_heads, s.head_dim, s.rope_pairs,
                                   s.rope_base, pos0,      cache.capacity, eps};
-        backend_.run(qkv_norm_rope_,
+        backend_.run(qkv_norm_rope_[cache.dtype == KvDtype::F16],
                      {Arg::buf(q), Arg::buf(k_raw), Arg::buf(v_raw),
                       Arg::buf(w.norms, w.q_norm_offset), Arg::buf(w.norms, w.k_norm_offset),
                       Arg::buf(cache.k), Arg::buf(cache.v), Arg::val(p)},
@@ -195,7 +220,7 @@ class Ops {
                    uint32_t tokens, uint32_t pos0) {
         const AttentionParams p{s.q_heads, s.kv_heads, s.head_dim, cache.capacity,
                                 pos0,      s.window,   tokens};
-        backend_.run(attention_,
+        backend_.run(attention_[cache.dtype == KvDtype::F16],
                      {Arg::buf(q), Arg::buf(cache.k), Arg::buf(cache.v), Arg::buf(output),
                       Arg::val(p)},
                      Dim3{tokens, s.q_heads}, Dim3{APEX_ATTN_THREADS});
@@ -207,9 +232,6 @@ class Ops {
     void attentionBlock(Buffer *x, const AttentionWeights &w, const AttentionShape &s,
                         const KvCache &cache, const AttentionScratch &tmp, Buffer *output,
                         uint32_t tokens, uint32_t pos0, float eps) {
-        if (pos0 + tokens > cache.capacity) {
-            throw std::runtime_error("attentionBlock: sequence longer than the KV cache");
-        }
         const Nvfp4Matrix mats[3] = {w.q, w.k, w.v};
         const BufferRef outs[3] = {{tmp.q, 0}, {tmp.k, 0}, {tmp.v, 0}};
         matmulNvfp4(x, 0, mats, outs, w.has_v ? 3 : 2, tokens);
@@ -315,8 +337,8 @@ class Ops {
     Kernel *rms_norm_;
     Kernel *matmul_;
     Kernel *gate_up_geglu_;
-    Kernel *qkv_norm_rope_;
-    Kernel *attention_;
+    Kernel *qkv_norm_rope_[2]; // [KvDtype::F32, KvDtype::F16]
+    Kernel *attention_[2];
     Kernel *router_;
     Kernel *expert_gate_up_;
     Kernel *expert_down_;

@@ -13,11 +13,15 @@
 #include <stdexcept>
 #include <string>
 #include <vector>
+#include "../kv_cache.h"
 #include "test_util.h"
 
 namespace {
 
 constexpr uint32_t DECODE_STEPS = 3; // single-token steps after the prefill chunk
+// fp16 keys/values round each element to 11 significant bits (~2.4e-4 relative), so the
+// attention output cannot match the fp32 reference to 1e-5; this gate catches real bugs only.
+constexpr double F16_TOLERANCE = 2e-3;
 
 /// One layer's attention block on the CPU: x → q/k/v → norms + RoPE → softmax → o_proj.
 void attentionBlockCpu(const apex::TestContext &ctx, const apex::LayerWeights &w,
@@ -70,11 +74,17 @@ int run_test_attn(const std::string &packed_dir, const std::string &dump_dir) {
     apex::Buffer *x_buf = ctx.alloc(hidden_count * sizeof(float));
     const apex::AttentionScratch tmp{ctx.alloc(q_bytes), ctx.alloc(kv_bytes), ctx.alloc(kv_bytes),
                                      ctx.alloc(q_bytes)};
-    apex::KvCache cache{ctx.alloc(kv_bytes, "kv_cache"), ctx.alloc(kv_bytes, "kv_cache"), T};
+    // One linear cache per element type (the dumps are shorter than the window, so a ring
+    // would never wrap here; test-attn-synth covers the ring).
+    const apex::KvCache caches[2] = {
+        {ctx.alloc(kv_bytes, "kv_cache"), ctx.alloc(kv_bytes, "kv_cache"), T, apex::KvDtype::F32},
+        {ctx.alloc(kv_bytes, "kv_cache"), ctx.alloc(kv_bytes, "kv_cache"), T, apex::KvDtype::F16}};
     apex::Buffer *o_chunk = ctx.alloc(hidden_count * sizeof(float));
     apex::Buffer *o_all = ctx.alloc(hidden_count * sizeof(float));
-    apex::Buffer *out_buf = ctx.alloc(hidden_count * sizeof(float));
+    apex::Buffer *out_buf[2] = {ctx.alloc(hidden_count * sizeof(float)),
+                                ctx.alloc(hidden_count * sizeof(float))};
     std::vector<float> cpu_out(hidden_count), cpu_normed(hidden_count);
+    double worst_f16 = 0;
 
     // Chunks: [0, prefill) then one token at a time.
     const uint32_t prefill = T > DECODE_STEPS ? T - DECODE_STEPS : T;
@@ -88,14 +98,19 @@ int run_test_attn(const std::string &packed_dir, const std::string &dump_dir) {
         const float *expected = attn_out.f32() + size_t(layer) * hidden_count;
 
         // GPU: chunked attention into the same cache, then the post norm over all tokens.
-        for (auto [t0, n] : chunks) {
-            std::memcpy(ctx.f32(x_buf), x + size_t(t0) * H, n * row_bytes);
-            ctx.ops.attentionBlock(x_buf, w.attn, w.shape, cache, tmp, o_chunk, n, t0, ctx.eps);
+        // Once with an fp32 cache, once with an fp16 one.
+        for (int d = 0; d < 2; ++d) {
+            for (auto [t0, n] : chunks) {
+                std::memcpy(ctx.f32(x_buf), x + size_t(t0) * H, n * row_bytes);
+                ctx.ops.attentionBlock(x_buf, w.attn, w.shape, caches[d], tmp, o_chunk, n, t0,
+                                       ctx.eps);
+                ctx.backend.sync();
+                std::memcpy(ctx.f32(o_all) + size_t(t0) * H, ctx.f32(o_chunk), n * row_bytes);
+            }
+            ctx.ops.rmsNorm(o_all, ctx.core_buffer, w.post_attn_norm, out_buf[d], T, uint32_t(H),
+                            ctx.eps);
             ctx.backend.sync();
-            std::memcpy(ctx.f32(o_all) + size_t(t0) * H, ctx.f32(o_chunk), n * row_bytes);
         }
-        ctx.ops.rmsNorm(o_all, ctx.core_buffer, w.post_attn_norm, out_buf, T, uint32_t(H), ctx.eps);
-        ctx.backend.sync();
 
         // CPU reference over the whole sequence at once.
         attentionBlockCpu(ctx, w, x, cpu_out.data(), T);
@@ -103,15 +118,23 @@ int run_test_attn(const std::string &packed_dir, const std::string &dump_dir) {
         for (uint32_t t = 0; t < T; ++t)
             rmsNormCpu(cpu_out.data() + t * H, post_w, cpu_normed.data() + t * H, H, ctx.eps);
 
-        const float *gpu = ctx.f32(out_buf);
+        const float *gpu = ctx.f32(out_buf[0]);
         failures += !apex::report(w.shape.window ? "sliding" : "full", layer,
                                   diff(gpu, expected, hidden_count),
                                   diff(cpu_normed.data(), expected, hidden_count),
                                   diff(gpu, cpu_normed.data(), hidden_count), 1e-5);
+        const Diff f16 = diff(ctx.f32(out_buf[1]), expected, hidden_count);
+        worst_f16 = std::max(worst_f16, f16.rel_l2);
+        const bool f16_ok = f16.rel_l2 < F16_TOLERANCE;
+        failures += !f16_ok;
+        std::printf("         fp16 KV  gpu-vs-ref rel %.2e max %.2e  %s\n", f16.rel_l2,
+                    f16.max_abs, f16_ok ? "ok" : "FAIL");
     }
     apex::Profile::get().print(stdout);
-    std::printf("%lld layers tested (prefill %u + %u decode steps), %d failures\n",
-                static_cast<long long>(L), prefill, T - prefill, failures);
+    std::printf("%lld layers tested (prefill %u + %u decode steps; fp32 KV gate 1e-5, fp16 KV "
+                "gate %.0e, worst fp16 %.2e), %d failures\n",
+                static_cast<long long>(L), prefill, T - prefill, F16_TOLERANCE, worst_f16,
+                failures);
     return failures ? 1 : 0;
 }
 
@@ -124,110 +147,180 @@ uint16_t toBf16(float f) {
     return uint16_t(u >> 16);
 }
 
-struct SynthConfig {
-    const char *name;
-    uint32_t q_heads, kv_heads, head_dim, rope_pairs;
-    float rope_base;
-    uint32_t window;
-};
+// Expect `fn` to throw; returns 1 (a failure) if it does not.
+template <class F> int expectThrow(const char *what, F fn) {
+    try {
+        fn();
+    } catch (const std::exception &) {
+        std::printf("  rejects %-52s ok\n", what);
+        return 0;
+    }
+    std::printf("  rejects %-52s FAIL (accepted)\n", what);
+    return 1;
+}
 
-// One synthetic run. Returns the rel L2 of GPU vs CPU over all real tokens.
-double runSynth(apex::TestContext &ctx, const SynthConfig &cfg, uint32_t tokens,
-                uint32_t capacity, uint32_t max_chunk) {
-    const uint32_t hd = cfg.head_dim, nq = cfg.q_heads, nkv = cfg.kv_heads;
-    const apex::AttentionShape shape{nq, nkv, hd, cfg.rope_pairs, cfg.rope_base, cfg.window};
-    Lcg rng(hd * 31 + cfg.window);
+// A two-layer toy model: layer 0 sliding (4 q heads, 2 kv heads, hd 256, window 8), layer 1
+// full attention (4 q heads, 1 kv head, hd 512, RoPE on a quarter of the dims). Only the
+// fields attentionShape() reads are set.
+apex::ModelConfig synthConfig(uint32_t window) {
+    apex::ModelConfig c;
+    c.num_hidden_layers = 2;
+    c.layer_types = {"sliding_attention", "full_attention"};
+    c.num_attention_heads = 4;
+    c.num_key_value_heads = 2;
+    c.head_dim = 256;
+    c.num_global_key_value_heads = 1;
+    c.global_head_dim = 512;
+    c.partial_rotary_factor_full = 0.25;
+    c.rope_theta_sliding = 1e4;
+    c.rope_theta_full = 1e6;
+    c.sliding_window = int(window);
+    return c;
+}
 
-    // Real inputs for the whole sequence, plus junk for speculative writes that get rolled back.
-    const size_t qn = size_t(nq) * hd, kvn = size_t(nkv) * hd;
-    std::vector<float> q_raw(tokens * qn), k_raw(tokens * kvn), v_raw(tokens * kvn);
-    for (float &v : q_raw) v = 3.0f * rng.next();
-    for (float &v : k_raw) v = 3.0f * rng.next();
-    for (float &v : v_raw) v = rng.next();
-    std::vector<uint16_t> norms(2 * hd);
-    for (uint16_t &v : norms) v = toBf16(1.0f + 0.5f * rng.next());
+// One synthetic run over both toy layers with the given cache dtype. Returns failures.
+int runSynth(apex::TestContext &ctx, const apex::ModelConfig &cfg, apex::KvDtype dtype,
+             uint32_t tokens, uint32_t slack) {
+    apex::KvCacheOptions kv;
+    kv.max_context = tokens;
+    kv.slack = slack;
+    kv.dtype = dtype;
+    apex::KvCacheSet caches(ctx.backend, cfg, kv);
+    const uint32_t max_chunk = caches.maxRollback(); // slack + 1: the largest legal ring write
+    const int layers = cfg.num_hidden_layers;
 
-    // CPU reference.
-    std::vector<float> o_ref(tokens * qn);
-    attentionCoreCpu(q_raw.data(), k_raw.data(), v_raw.data(), norms.data(), norms.data() + hd,
-                     o_ref.data(), tokens, nq, nkv, hd, cfg.rope_pairs, cfg.rope_base, cfg.window,
-                     ctx.eps);
+    struct LayerData {
+        apex::AttentionShape shape;
+        apex::AttentionWeights w{};
+        size_t qn, kvn;
+        std::vector<float> q_raw, k_raw, v_raw, junk_q, junk_k, junk_v, o_ref, o_gpu;
+        apex::Buffer *q_buf, *k_buf, *v_buf, *o_buf;
+    };
+    std::vector<LayerData> data(static_cast<size_t>(layers));
+    for (int l = 0; l < layers; ++l) {
+        LayerData &d = data[size_t(l)];
+        d.shape = apex::attentionShape(cfg, l);
+        const uint32_t hd = d.shape.head_dim;
+        d.qn = size_t(d.shape.q_heads) * hd;
+        d.kvn = size_t(d.shape.kv_heads) * hd;
+        Lcg rng(uint64_t(hd) * 31 + uint64_t(l));
+        auto fill = [&](std::vector<float> &v, size_t n, float scale) {
+            v.resize(n);
+            for (float &x : v) x = scale * rng.next();
+        };
+        fill(d.q_raw, tokens * d.qn, 3.0f);
+        fill(d.k_raw, tokens * d.kvn, 3.0f);
+        fill(d.v_raw, tokens * d.kvn, 1.0f);
+        // Junk for speculative writes that get rolled back.
+        fill(d.junk_q, max_chunk * d.qn, 5.0f);
+        fill(d.junk_k, max_chunk * d.kvn, 5.0f);
+        fill(d.junk_v, max_chunk * d.kvn, 5.0f);
+        std::vector<uint16_t> norms(2 * hd);
+        for (uint16_t &v : norms) v = toBf16(1.0f + 0.5f * rng.next());
 
-    // GPU buffers.
-    apex::Buffer *norm_buf = ctx.alloc(norms.size() * sizeof(uint16_t));
-    std::memcpy(ctx.backend.contents(norm_buf), norms.data(), norms.size() * sizeof(uint16_t));
-    apex::AttentionWeights w{};
-    w.norms = norm_buf;
-    w.q_norm_offset = 0;
-    w.k_norm_offset = hd * sizeof(uint16_t);
-    apex::Buffer *q_buf = ctx.alloc(max_chunk * qn * sizeof(float));
-    apex::Buffer *k_buf = ctx.alloc(max_chunk * kvn * sizeof(float));
-    apex::Buffer *v_buf = ctx.alloc(max_chunk * kvn * sizeof(float));
-    apex::Buffer *o_buf = ctx.alloc(max_chunk * qn * sizeof(float));
-    const size_t cache_bytes = size_t(nkv) * capacity * hd * sizeof(float);
-    apex::KvCache cache{ctx.alloc(cache_bytes, "kv_cache"), ctx.alloc(cache_bytes, "kv_cache"),
-                        capacity};
-    std::vector<float> o_gpu(tokens * qn);
+        d.o_ref.resize(tokens * d.qn);
+        d.o_gpu.resize(tokens * d.qn);
+        attentionCoreCpu(d.q_raw.data(), d.k_raw.data(), d.v_raw.data(), norms.data(),
+                         norms.data() + hd, d.o_ref.data(), tokens, d.shape.q_heads,
+                         d.shape.kv_heads, hd, d.shape.rope_pairs, d.shape.rope_base,
+                         d.shape.window, ctx.eps);
 
-    // Write n tokens at position pos from the given rows and attend; returns nothing, the
-    // caller copies o_buf if it wants the result.
-    auto step = [&](const float *q, const float *k, const float *v, uint32_t n, uint32_t pos) {
-        std::memcpy(ctx.f32(q_buf), q, n * qn * sizeof(float));
-        std::memcpy(ctx.f32(k_buf), k, n * kvn * sizeof(float));
-        std::memcpy(ctx.f32(v_buf), v, n * kvn * sizeof(float));
-        ctx.ops.qkvNormRope(q_buf, k_buf, v_buf, w, shape, cache, n, pos, ctx.eps);
-        ctx.ops.attention(q_buf, cache, o_buf, shape, n, pos);
+        apex::Buffer *norm_buf = ctx.alloc(norms.size() * sizeof(uint16_t));
+        std::memcpy(ctx.backend.contents(norm_buf), norms.data(), norms.size() * sizeof(uint16_t));
+        d.w.norms = norm_buf;
+        d.w.q_norm_offset = 0;
+        d.w.k_norm_offset = hd * sizeof(uint16_t);
+        d.q_buf = ctx.alloc(max_chunk * d.qn * sizeof(float));
+        d.k_buf = ctx.alloc(max_chunk * d.kvn * sizeof(float));
+        d.v_buf = ctx.alloc(max_chunk * d.kvn * sizeof(float));
+        d.o_buf = ctx.alloc(max_chunk * d.qn * sizeof(float));
+    }
+
+    // Write n tokens at pos into every layer (real rows, or junk) and attend, like forward().
+    auto step = [&](uint32_t n, uint32_t pos, bool junk) {
+        caches.checkWrite(pos, n);
+        for (int l = 0; l < layers; ++l) {
+            LayerData &d = data[size_t(l)];
+            const float *q = junk ? d.junk_q.data() : d.q_raw.data() + pos * d.qn;
+            const float *k = junk ? d.junk_k.data() : d.k_raw.data() + pos * d.kvn;
+            const float *v = junk ? d.junk_v.data() : d.v_raw.data() + pos * d.kvn;
+            std::memcpy(ctx.f32(d.q_buf), q, n * d.qn * sizeof(float));
+            std::memcpy(ctx.f32(d.k_buf), k, n * d.kvn * sizeof(float));
+            std::memcpy(ctx.f32(d.v_buf), v, n * d.kvn * sizeof(float));
+            const apex::KvCache &cache = caches.layer(l);
+            ctx.ops.qkvNormRope(d.q_buf, d.k_buf, d.v_buf, d.w, d.shape, cache, n, pos, ctx.eps);
+            ctx.ops.attention(d.q_buf, cache, d.o_buf, d.shape, n, pos);
+        }
         ctx.backend.sync();
+        caches.commitWrite(pos, n);
+        if (!junk) {
+            for (LayerData &d : data)
+                std::memcpy(d.o_gpu.data() + pos * d.qn, ctx.f32(d.o_buf),
+                            n * d.qn * sizeof(float));
+        }
     };
 
     // Chunk schedule: varying sizes up to max_chunk; every third chunk is preceded by a
-    // speculative junk write of up to max_chunk tokens that is then rolled back (the next real
-    // write starts at the same position and overwrites it).
-    std::vector<float> junk_q(max_chunk * qn), junk_k(max_chunk * kvn), junk_v(max_chunk * kvn);
-    for (float &v : junk_q) v = 5.0f * rng.next();
-    for (float &v : junk_k) v = 5.0f * rng.next();
-    for (float &v : junk_v) v = 5.0f * rng.next();
+    // speculative junk write of max_chunk tokens that is truncated away again, so the ring's
+    // rollback limit is exercised at its edge.
     const uint32_t pattern[] = {max_chunk, 1, 1, 3, 1, 2, 1, max_chunk, 1, 1};
     uint32_t pos = 0, chunk_index = 0;
     while (pos < tokens) {
         const uint32_t n = std::min({pattern[chunk_index % 10], max_chunk, tokens - pos});
         if (chunk_index % 3 == 2) {
-            // A ring cache (capacity < tokens) takes any write; a linear one only up to its end.
-            const bool ring = capacity < tokens;
-            const uint32_t junk = ring ? max_chunk : std::min(max_chunk, capacity - pos);
-            if (junk > 0) {
-                step(junk_q.data(), junk_k.data(), junk_v.data(), junk, pos);
-            }
+            const uint32_t junk = std::min(max_chunk, tokens - pos); // full layer is linear
+            step(junk, pos, true);
+            caches.truncate(pos);
         }
-        step(q_raw.data() + pos * qn, k_raw.data() + pos * kvn, v_raw.data() + pos * kvn, n,
-             pos);
-        std::memcpy(o_gpu.data() + pos * qn, ctx.f32(o_buf), n * qn * sizeof(float));
+        step(n, pos, false);
         pos += n;
         ++chunk_index;
     }
-    const Diff d = diff(o_gpu.data(), o_ref.data(), o_gpu.size());
-    std::printf("%-8s hd %3u q %u kv %u window %2u capacity %2u chunks<=%u tokens %u  "
-                "gpu-vs-cpu rel %.2e max %.2e\n",
-                cfg.name, hd, nq, nkv, cfg.window, capacity, max_chunk, tokens, d.rel_l2,
-                d.max_abs);
-    return d.rel_l2;
+
+    int failures = 0;
+    const double tolerance = dtype == apex::KvDtype::F16 ? F16_TOLERANCE : 1e-5;
+    for (int l = 0; l < layers; ++l) {
+        const LayerData &d = data[size_t(l)];
+        const apex::KvCache &cache = caches.layer(l);
+        const Diff diff_l = diff(d.o_gpu.data(), d.o_ref.data(), d.o_gpu.size());
+        const bool ok = diff_l.rel_l2 < tolerance;
+        failures += !ok;
+        std::printf("%s KV %-7s hd %3u q %u kv %u window %2u capacity %2u writes<=%u tokens %u  "
+                    "gpu-vs-cpu rel %.2e max %.2e  %s\n",
+                    dtype == apex::KvDtype::F16 ? "fp16" : "fp32",
+                    d.shape.window ? "sliding" : "full", d.shape.head_dim, d.shape.q_heads,
+                    d.shape.kv_heads, d.shape.window, cache.capacity, max_chunk, tokens,
+                    diff_l.rel_l2, diff_l.max_abs, ok ? "ok" : "FAIL");
+    }
+
+    // The cache must refuse what would silently corrupt the ring.
+    const uint32_t len = caches.length();
+    failures += expectThrow("a rollback of slack + 2 positions", [&] {
+        caches.truncate(len - (max_chunk + 1));
+    });
+    failures += expectThrow("a ring write of slack + 2 tokens", [&] {
+        caches.truncate(len - max_chunk); // legal rollback, then an oversized write
+        caches.checkWrite(caches.length(), max_chunk + 1);
+    });
+    failures += expectThrow("a write that leaves a gap", [&] {
+        caches.checkWrite(caches.length() + 1, 1);
+    });
+    return failures;
 }
 
 } // namespace
 
-// Synthetic attention: tiny window, chunked and rolled-back writes, vs the CPU reference.
+// Synthetic attention: tiny window and ring, chunked and rolled-back writes, vs the CPU
+// reference, for both KV cache element types.
 int run_test_attn_synth(const std::string &packed_dir) {
     apex::TestContext ctx(packed_dir); // only for the backend and eps; no weights are read
     constexpr uint32_t TOKENS = 40;
     constexpr uint32_t WINDOW = 8;
-    const SynthConfig sliding{"sliding", 4, 2, 256, 128, 1e4f, WINDOW};
-    const SynthConfig full{"full", 4, 1, 512, 64, 1e6f, 0};
-    // Linear cache: one slot per position.
-    const uint32_t capacity = TOKENS;
-    const uint32_t max_chunk = 5;
+    constexpr uint32_t SLACK = 4; // ring capacity 12: wraps three times over 40 tokens
+    const apex::ModelConfig cfg = synthConfig(WINDOW);
     int failures = 0;
-    for (const SynthConfig &cfg : {sliding, full}) {
-        failures += runSynth(ctx, cfg, TOKENS, capacity, max_chunk) > 1e-5;
+    for (apex::KvDtype dtype : {apex::KvDtype::F32, apex::KvDtype::F16}) {
+        failures += runSynth(ctx, cfg, dtype, TOKENS, SLACK);
     }
     std::printf("synthetic attention: %d failures\n", failures);
     return failures ? 1 : 0;

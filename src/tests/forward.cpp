@@ -22,7 +22,7 @@
 #include "cpu_ref.h"
 
 int run_test_forward(const std::string &packed_dir, const std::string &dump_dir,
-                     int prefill_arg) {
+                     int prefill_arg, bool fp16_kv) {
     const apex::ModelInfo info = apex::ModelInfo::load(packed_dir);
     const apex::ModelConfig &c = info.config;
     const int64_t L = c.num_hidden_layers, H = c.hidden_size, V = c.vocab_size;
@@ -44,7 +44,14 @@ int run_test_forward(const std::string &packed_dir, const std::string &dump_dir,
     options.residency = apex::ExpertResidency::LayerStreamed;
     options.max_context = uint32_t(T);
     options.max_tokens = uint32_t(T);
+    options.kv_dtype = fp16_kv ? apex::KvDtype::F16 : apex::KvDtype::F32;
     apex::Model model(backend, info, options);
+    // fp32 KV: every stage is held to 1e-5 and the routing must match exactly. fp16 KV rounds
+    // the cached keys/values (~3e-4 per attention call, see test-attn), which can flip
+    // near-tied router picks, so ids are reported but not gated and the hidden-state gate is
+    // loose; argmax must still match everywhere.
+    const double layer_gate = fp16_kv ? 1e-2 : 1e-5;
+    const double logit_gate = fp16_kv ? 1e-2 : 1e-4;
 
     // Captured per layer by the hook (streamed mode syncs after every layer).
     std::vector<float> gpu_h(size_t(L * T * H));
@@ -85,7 +92,7 @@ int run_test_forward(const std::string &packed_dir, const std::string &dump_dir,
             const int64_t *g = gpu_ids.data() + (l * T + t) * K;
             match += std::equal(g, g + K, route_ids.i64() + (l * T + t) * K);
         }
-        const bool ok = d.rel_l2 < 1e-5 && match == T;
+        const bool ok = d.rel_l2 < layer_gate && (fp16_kv || match == T);
         failures += !ok;
         std::printf("layer %2lld layer_out rel %.2e max %.2e | expert ids %d/%lld positions  %s\n",
                     static_cast<long long>(l), d.rel_l2, d.max_abs, match,
@@ -101,13 +108,14 @@ int run_test_forward(const std::string &packed_dir, const std::string &dump_dir,
         std::printf(" %u/%lld", gpu_argmax[t], static_cast<long long>(ref));
     }
     std::printf("\n");
-    const bool ok = argmax_match == T && dl.rel_l2 < 1e-4;
+    const bool ok = argmax_match == T && dl.rel_l2 < logit_gate;
     failures += !ok;
     std::printf("logits rel %.2e max %.2e | argmax %d/%lld  %s\n", dl.rel_l2, dl.max_abs,
                 argmax_match, static_cast<long long>(T), ok ? "ok" : "FAIL");
     apex::Profile::get().print(stdout);
     apex::MemoryTracker::get().print(stdout);
-    std::printf("test-forward (streamed, prefill %u + %lld decode): %d failures\n", prefill,
-                static_cast<long long>(T - prefill), failures);
+    std::printf("test-forward (streamed, %s KV, prefill %u + %lld decode): %d failures\n",
+                fp16_kv ? "fp16" : "fp32", prefill, static_cast<long long>(T - prefill),
+                failures);
     return failures ? 1 : 0;
 }

@@ -76,7 +76,8 @@ int run_test_moe(const std::string &packed_dir, const std::string &dump_dir);
 int run_test_tail(const std::string &packed_dir, const std::string &dump_dir);
 
 // Full forward pass in layer-streamed mode vs the dumps (core + one layer file at a time).
-int run_test_forward(const std::string &packed_dir, const std::string &dump_dir, int prefill);
+int run_test_forward(const std::string &packed_dir, const std::string &dump_dir, int prefill,
+                     bool fp16_kv);
 
 // Parse "1,2,3" (commas and/or whitespace) into token ids.
 static std::vector<uint32_t> parseIdList(const std::string& text) {
@@ -115,7 +116,7 @@ static std::vector<uint32_t> loadIds(const std::string& arg) {
 }
 
 // apex generate <packed_dir> --ids <file|list> [--max-tokens N] [--streamed]
-//                [--max-context N] [--stop ids]
+//                [--max-context N] [--stop ids] [--kv f16|f32]
 // Greedy generation. Prints the generated ids and tokens/second. Decode text with
 // `uv run tools/chat_ids.py decode <ids>`.
 static int run_generate(int argc, char** argv) {
@@ -136,6 +137,12 @@ static int run_generate(int argc, char** argv) {
     else if (a == "--max-context") options.max_context = static_cast<uint32_t>(std::stoul(value()));
     else if (a == "--streamed") options.residency = apex::ExpertResidency::LayerStreamed;
     else if (a == "--stop") stop = parseIdList(value());
+    else if (a == "--kv") {
+      const std::string kv = value();
+      if (kv == "f16") options.kv_dtype = apex::KvDtype::F16;
+      else if (kv == "f32") options.kv_dtype = apex::KvDtype::F32;
+      else throw std::runtime_error("--kv must be f16 or f32");
+    }
     else throw std::runtime_error("generate: unknown option " + a);
   }
   if (ids_arg.empty()) throw std::runtime_error("generate: --ids is required");
@@ -146,10 +153,11 @@ static int run_generate(int argc, char** argv) {
 
   const auto info = apex::ModelInfo::load(packed_dir);
   apex::MetalBackend backend(APEX_METALLIB);
-  std::printf("device: %s  experts: %s  prompt: %zu tokens  max new: %u  context: %u\n",
+  std::printf("device: %s  experts: %s  kv: %s  prompt: %zu tokens  max new: %u  context: %u\n",
               backend.deviceName(),
               options.residency == apex::ExpertResidency::Resident ? "resident" : "layer-streamed",
-              prompt.size(), max_new, options.max_context);
+              options.kv_dtype == apex::KvDtype::F16 ? "fp16" : "fp32", prompt.size(), max_new,
+              options.max_context);
   apex::Model model(backend, info, options);
 
   apex::GenerateStats stats;
@@ -192,8 +200,16 @@ static int dispatch(int argc, char** argv) {
   if (argc == 4 && std::strcmp(argv[1], "test-tail") == 0) {
     return run_test_tail(argv[2], argv[3]);
   }
-  if ((argc == 4 || argc == 5) && std::strcmp(argv[1], "test-forward") == 0) {
-    return run_test_forward(argv[2], argv[3], argc == 5 ? std::atoi(argv[4]) : 0);
+  if (argc >= 4 && argc <= 6 && std::strcmp(argv[1], "test-forward") == 0) {
+    // Optional: a prefill token count and/or "f16" (default: fp32 KV, prefill T - 1).
+    int prefill = 0;
+    bool fp16_kv = false;
+    for (int i = 4; i < argc; ++i) {
+      if (std::strcmp(argv[i], "f16") == 0) fp16_kv = true;
+      else if (std::strcmp(argv[i], "f32") == 0) fp16_kv = false;
+      else prefill = std::atoi(argv[i]);
+    }
+    return run_test_forward(argv[2], argv[3], prefill, fp16_kv);
   }
   if (argc >= 3 && std::strcmp(argv[1], "generate") == 0) return run_generate(argc, argv);
   if (argc == 3 && std::strcmp(argv[1], "bench") == 0) return run_bench(argv[2]);
@@ -203,11 +219,11 @@ static int dispatch(int argc, char** argv) {
   std::fprintf(stderr,
              "usage:\n"
              "  apex generate <packed_dir> --ids <file|list> [--max-tokens N] [--streamed]\n"
-             "                [--max-context N] [--stop id,id]\n"
+             "                [--max-context N] [--stop id,id] [--kv f16|f32]\n"
              "  apex bench <packed_dir> | apex manifest <packed_dir>\n"
              "  apex test-norm|test-mlp|test-attn|test-router|test-moe|test-tail <packed_dir> <dump_dir>\n"
              "  apex test-attn-synth <packed_dir>\n"
-             "  apex test-forward <packed_dir> <dump_dir> [prefill_tokens]   (layer-streamed)\n");
+             "  apex test-forward <packed_dir> <dump_dir> [prefill_tokens] [f16]   (layer-streamed)\n");
   return 2;
 }
 

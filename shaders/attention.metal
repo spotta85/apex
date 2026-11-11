@@ -20,17 +20,16 @@ using namespace metal;
 //      sum, so no reduction is needed for them.
 //
 // q  : [tokens, q_heads, head_dim]
-// K,V: [kv_heads][capacity][head_dim], positions 0 .. pos0 + tokens - 1 are valid
+// K,V: [kv_heads][capacity][head_dim] of KV (float or half); position j is in slot
+//      j % capacity. Sliding layers are a ring of window + slack slots: every key a query can
+//      see (the last `window` positions) is still there as long as a single write or rollback
+//      covers at most `slack` positions (the host checks that).
 // out: [tokens, q_heads, head_dim]
-kernel void attention_f32(device const float *q [[buffer(0)]],
-                          device const float *K [[buffer(1)]],
-                          device const float *V [[buffer(2)]],
-                          device float *out [[buffer(3)]],
-                          constant AttentionParams &p [[buffer(4)]],
-                          uint2 tg [[threadgroup_position_in_grid]],
-                          uint tid [[thread_index_in_threadgroup]],
-                          uint lane [[thread_index_in_simdgroup]],
-                          uint simd_id [[simdgroup_index_in_threadgroup]]) {
+template <typename KV>
+inline void attentionImpl(device const float *q, device const KV *K, device const KV *V,
+                          device float *out, constant AttentionParams &p,
+                          threadgroup float *scores, // [APEX_ATTN_KEY_CHUNK]
+                          uint2 tg, uint tid, uint lane, uint simd_id) {
     constexpr uint THREADS = APEX_ATTN_THREADS;
     constexpr uint SIMDS = THREADS / 32;
     constexpr uint CHUNK = APEX_ATTN_KEY_CHUNK;
@@ -47,8 +46,8 @@ kernel void attention_f32(device const float *q [[buffer(0)]],
 
     q += (token * p.q_heads + head) * hd;
     out += (token * p.q_heads + head) * hd;
-    K += kv_head * p.capacity * hd;
-    V += kv_head * p.capacity * hd;
+    K += ulong(kv_head) * p.capacity * hd;
+    V += ulong(kv_head) * p.capacity * hd;
 
     // This lane's slice of q, matching the key elements it will read.
     const uint q_per_lane = hd / 32;
@@ -56,8 +55,6 @@ kernel void attention_f32(device const float *q [[buffer(0)]],
     for (uint i = 0; i < MAX_Q_PER_LANE; ++i) {
         qr[i] = i < q_per_lane ? q[lane + 32 * i] : 0.0f;
     }
-
-    threadgroup float scores[CHUNK];
 
     float m = -INFINITY; // running max
     float l = 0.0f;      // running sum of exp(s - m)
@@ -69,10 +66,10 @@ kernel void attention_f32(device const float *q [[buffer(0)]],
 
         // 1. Scores, one simdgroup per key.
         for (uint kk = simd_id; kk < n; kk += SIMDS) {
-            device const float *k = K + (start + kk) * hd;
+            device const KV *k = K + ((start + kk) % p.capacity) * hd;
             float s = 0.0f;
             for (uint i = 0; i < q_per_lane; ++i) {
-                s += qr[i] * k[lane + 32 * i];
+                s += qr[i] * float(k[lane + 32 * i]);
             }
             s = simd_sum(s);
             if (lane == 0) {
@@ -91,10 +88,10 @@ kernel void attention_f32(device const float *q [[buffer(0)]],
         for (uint i = 0; i < n; ++i) {
             const float e = exp(scores[i] - m_new);
             chunk_sum += e;
-            device const float *v = V + (start + i) * hd;
+            device const KV *v = V + ((start + i) % p.capacity) * hd;
             for (uint d = 0; d < MAX_D_PER_THREAD; ++d) {
                 const uint dim = tid + d * THREADS;
-                if (dim < hd) acc[d] += e * v[dim];
+                if (dim < hd) acc[d] += e * float(v[dim]);
             }
         }
         l = l * alpha + chunk_sum;
@@ -107,3 +104,18 @@ kernel void attention_f32(device const float *q [[buffer(0)]],
         if (dim < hd) out[dim] = acc[d] / l;
     }
 }
+
+#define ATTENTION_KERNEL(NAME, KV)                                                              \
+    kernel void NAME(device const float *q [[buffer(0)]], device const KV *K [[buffer(1)]],    \
+                     device const KV *V [[buffer(2)]], device float *out [[buffer(3)]],        \
+                     constant AttentionParams &p [[buffer(4)]],                                \
+                     uint2 tg [[threadgroup_position_in_grid]],                                \
+                     uint tid [[thread_index_in_threadgroup]],                                 \
+                     uint lane [[thread_index_in_simdgroup]],                                  \
+                     uint simd_id [[simdgroup_index_in_threadgroup]]) {                        \
+        threadgroup float scores[APEX_ATTN_KEY_CHUNK]; /* this chunk's scores */               \
+        attentionImpl<KV>(q, K, V, out, p, scores, tg, tid, lane, simd_id);                    \
+    }
+
+ATTENTION_KERNEL(attention_kv_f32, float)
+ATTENTION_KERNEL(attention_kv_f16, half)

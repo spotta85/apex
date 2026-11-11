@@ -8,8 +8,9 @@
 ///
 /// Dispatches per layer (11):
 ///   1  matmul_nvfp4            q, k, v projections in one dispatch (q, k on full layers)
-///   2  qkv_norm_rope_f32       q/k/v head norms + RoPE; K and V land in the KV cache
-///   3  attention_f32           online softmax over the cached keys
+///   2  qkv_norm_rope_kv_f16    q/k/v head norms + RoPE; K and V land in the KV cache
+///   3  attention_kv_f16        online softmax over the cached keys
+///      (the _kv_f32 variants when ModelOptions::kv_dtype is F32)
 ///   4  matmul_nvfp4            o_proj
 ///   5  attn_residual_norms_f32 h += norm(o); x_mlp = norm(h, pre_ffn); x_moe = norm(h, pre_ffn_2)
 ///   6  gate_up_geglu_nvfp4     dense gate + up + GeGLU
@@ -43,8 +44,11 @@ namespace apex {
 
 struct ModelOptions {
     ExpertResidency residency = ExpertResidency::Resident;
-    uint32_t max_context = 2048; // longest sequence the KV cache holds
+    uint32_t max_context = 4096; // longest sequence the KV cache holds
     uint32_t max_tokens = 64;    // most tokens one forward() call takes (scratch size)
+    KvDtype kv_dtype = KvDtype::F16;
+    // Sliding-layer rings hold window + max(KV_RING_MIN_SLACK, max_tokens) positions, so any
+    // forward() batch and any rollback of up to that many speculative tokens is legal.
 };
 
 class Model {
@@ -58,7 +62,11 @@ class Model {
         core_buffer_ = backend.wrapNoCopy(core_.data, core_.size);
         weights_ = resolveWeights(info, core_buffer_);
         experts_ = makeExpertSource(options.residency, backend, info);
-        cache_ = std::make_unique<KvCacheSet>(backend, config_, options.max_context);
+        KvCacheOptions kv;
+        kv.max_context = options.max_context;
+        kv.slack = std::max(KV_RING_MIN_SLACK, options.max_tokens);
+        kv.dtype = options.kv_dtype;
+        cache_ = std::make_unique<KvCacheSet>(backend, config_, kv);
         allocateScratch();
         eps_ = float(config_.rms_norm_eps);
     }
@@ -119,7 +127,8 @@ class Model {
 
     /// Cache length (tokens whose keys and values are stored).
     uint32_t length() const { return cache_->length(); }
-    /// Drop positions >= new_length (rejected speculative tokens).
+    /// Drop positions >= new_length (rejected speculative tokens); at most slack + 1 at a time
+    /// once a sliding ring has wrapped.
     void truncate(uint32_t new_length) { cache_->truncate(new_length); }
 
     // --- State reachable from outside forward() (for multi-token prediction later) ---
