@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <stdexcept>
 #include "backend/backend.h"
+#include "model_info.h"
 #include "../shaders/shared.h"
 
 namespace apex {
@@ -31,6 +32,53 @@ struct BufferRef {
 
 inline uint32_t ceilDiv(uint32_t a, uint32_t b) { return (a + b - 1) / b; }
 
+// Per-layer attention geometry, derived from ModelConfig and the layer type.
+struct AttentionShape {
+    uint32_t q_heads;    // 16
+    uint32_t kv_heads;   // 8 sliding, 2 full
+    uint32_t head_dim;   // 256 sliding, 512 full
+    uint32_t rope_pairs; // 128 sliding, 64 full
+    float rope_base;     // 1e4 sliding, 1e6 full
+    uint32_t window;     // 1024 sliding, 0 full
+};
+
+inline AttentionShape attentionShape(const ModelConfig &c, int layer) {
+    const bool full = c.layer_types[layer] == "full_attention";
+    AttentionShape s;
+    s.q_heads = uint32_t(c.num_attention_heads);
+    s.kv_heads = uint32_t(full ? c.num_global_key_value_heads : c.num_key_value_heads);
+    s.head_dim = uint32_t(full ? c.global_head_dim : c.head_dim);
+    s.rope_pairs = uint32_t(full ? (c.global_head_dim * c.partial_rotary_factor_full) / 2
+                                 : c.head_dim / 2);
+    s.rope_base = float(full ? c.rope_theta_full : c.rope_theta_sliding);
+    s.window = uint32_t(full ? 0 : c.sliding_window);
+    return s;
+}
+
+// One layer's attention weights. v is unused when has_v is false (full layers: v_raw = k_raw).
+struct AttentionWeights {
+    Nvfp4Matrix q, k, v, o;
+    bool has_v;
+    Buffer *norms;
+    size_t q_norm_offset, k_norm_offset; // BF16 [head_dim] each, in the core buffer
+};
+
+// One layer's KV cache: K and V are [kv_heads][capacity][head_dim] float32.
+// Position p lives in slot p (linear cache; capacity >= the longest sequence).
+struct KvCache {
+    Buffer *k = nullptr;
+    Buffer *v = nullptr;
+    uint32_t capacity = 0;
+};
+
+// Scratch for one attention call, sized for the largest layer (head_dim 512).
+struct AttentionScratch {
+    Buffer *q; // [tokens, 16, hd]  projection, then normed+roped in place
+    Buffer *k; // [tokens, kv, hd]  projection
+    Buffer *v; // [tokens, kv, hd]  projection (sliding layers only)
+    Buffer *o; // [tokens, 16, hd]  attention output
+};
+
 /// @brief Every kernel handle, resolved once from the backend, plus their launchers.
 /// Construct one per backend at load time; launching is then free of string lookups.
 class Ops {
@@ -38,7 +86,9 @@ class Ops {
     explicit Ops(Backend &backend)
         : backend_(backend), rms_norm_(backend.kernel("rms_norm_f32")),
           matmul_(backend.kernel("matmul_nvfp4")),
-          gate_up_geglu_(backend.kernel("gate_up_geglu_nvfp4")) {}
+          gate_up_geglu_(backend.kernel("gate_up_geglu_nvfp4")),
+          qkv_norm_rope_(backend.kernel("qkv_norm_rope_f32")),
+          attention_(backend.kernel("attention_f32")) {}
 
     Backend &backend() { return backend_; }
 
@@ -121,11 +171,55 @@ class Ops {
         matmulNvfp4(act_tmp, down_weights, output, tokens);
     }
 
+    /// @brief q/K/V per-head norm + RoPE in one dispatch; K and V go straight into the cache
+    /// at positions pos0 .. pos0 + tokens - 1. v_raw is the k projection on full layers.
+    void qkvNormRope(Buffer *q, Buffer *k_raw, Buffer *v_raw, const AttentionWeights &w,
+                     const AttentionShape &s, const KvCache &cache, uint32_t tokens,
+                     uint32_t pos0, float eps) {
+        const QkvNormRopeParams p{s.q_heads, s.kv_heads, s.head_dim, s.rope_pairs,
+                                  s.rope_base, pos0,      cache.capacity, eps};
+        backend_.run(qkv_norm_rope_,
+                     {Arg::buf(q), Arg::buf(k_raw), Arg::buf(v_raw),
+                      Arg::buf(w.norms, w.q_norm_offset), Arg::buf(w.norms, w.k_norm_offset),
+                      Arg::buf(cache.k), Arg::buf(cache.v), Arg::val(p)},
+                     Dim3{tokens, s.q_heads + 2 * s.kv_heads}, Dim3{APEX_HEAD_NORM_THREADS});
+    }
+
+    /// Queue the softmax-over-keys for every (token, q head).
+    void attention(Buffer *q, const KvCache &cache, Buffer *output, const AttentionShape &s,
+                   uint32_t tokens, uint32_t pos0) {
+        const AttentionParams p{s.q_heads, s.kv_heads, s.head_dim, cache.capacity,
+                                pos0,      s.window,   tokens};
+        backend_.run(attention_,
+                     {Arg::buf(q), Arg::buf(cache.k), Arg::buf(cache.v), Arg::buf(output),
+                      Arg::val(p)},
+                     Dim3{tokens, s.q_heads}, Dim3{APEX_ATTN_THREADS});
+    }
+
+    /// @brief Whole attention block for `tokens` tokens starting at position pos0, 4 dispatches:
+    ///   x → q/k/v proj (one dispatch) → norms + RoPE (K,V into the cache) → attention → o_proj
+    /// output is [tokens, hidden], before post_attention_layernorm.
+    void attentionBlock(Buffer *x, const AttentionWeights &w, const AttentionShape &s,
+                        const KvCache &cache, const AttentionScratch &tmp, Buffer *output,
+                        uint32_t tokens, uint32_t pos0, float eps) {
+        if (pos0 + tokens > cache.capacity) {
+            throw std::runtime_error("attentionBlock: sequence longer than the KV cache");
+        }
+        const Nvfp4Matrix mats[3] = {w.q, w.k, w.v};
+        const BufferRef outs[3] = {{tmp.q, 0}, {tmp.k, 0}, {tmp.v, 0}};
+        matmulNvfp4(x, 0, mats, outs, w.has_v ? 3 : 2, tokens);
+        qkvNormRope(tmp.q, tmp.k, w.has_v ? tmp.v : tmp.k, w, s, cache, tokens, pos0, eps);
+        attention(tmp.q, cache, tmp.o, s, tokens, pos0);
+        matmulNvfp4(tmp.o, w.o, output, tokens);
+    }
+
   private:
     Backend &backend_;
     Kernel *rms_norm_;
     Kernel *matmul_;
     Kernel *gate_up_geglu_;
+    Kernel *qkv_norm_rope_;
+    Kernel *attention_;
 };
 
 } // namespace apex

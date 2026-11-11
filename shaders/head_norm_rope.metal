@@ -1,74 +1,96 @@
 #include <metal_stdlib>
+#include "quant.h"
+#include "reduce.h"
+#include "shared.h"
 using namespace metal;
 
-// Normalize each head, optionally apply RoPE, and write to the output.
-kernel void head_norm_rope_f32(device const float *input [[buffer(0)]], // [T, heads, head_dim]
-                               device const ushort *weight [[buffer(1)]], // [head_dim]
-                               device float *output [[buffer(2)]], // 
-                               constant uint &heads [[buffer(3)]],    //
-                               constant uint &head_dim [[buffer(4)]], //
-                               constant uint &has_weight [[buffer(5)]],
-                               constant uint &rope_pairs [[buffer(6)]], // pairs to rotate (128 or 64 or 0)
-                               constant float &rope_base [[buffer(7)]], // rot_freq_base
-                               constant uint &abs_pos [[buffer(8)]],
-                               constant uint &out_token_stride [[buffer(9)]],
-                               constant uint &out_head_stride [[buffer(10)]],
-                               constant float &eps [[buffer(11)]],
-                               uint2 group [[threadgroup_position_in_grid]],
-                               uint tid [[thread_index_in_threadgroup]],
-                               uint lane [[thread_index_in_simdgroup]],
-                               uint simd_id [[simdgroup_index_in_threadgroup]]) {
+// Per-head RMSNorm + RoPE for q, K and V of one layer, in ONE dispatch.
+//
+// Grid: x = token, y = head slot in [0, q_heads + 2 * kv_heads):
+//   [0, q_heads)                    q head:  norm with q_norm, RoPE, written back in place
+//   [q_heads, q_heads + kv_heads)   K head:  norm with k_norm, RoPE, written into the K cache
+//   [q_heads + kv_heads, ...)       V head:  norm without weight, no RoPE, into the V cache
+//
+// Cache layout: [kv_heads][capacity][head_dim]; token t lands at slot pos0 + t.
+//
+// RoPE (mlx traditional=False) pairs element i with i + head_dim/2 and rotates the first
+// rope_pairs pairs by angle = pos * base^(-2i / head_dim). On full-attention layers only 64
+// of the 256 pairs rotate but the exponent still uses the full head_dim (verified in B6_3).
+//
+// Reading and writing q in place is safe: each threadgroup reads its own (token, head) row
+// into threadgroup memory before writing it back.
+kernel void qkv_norm_rope_f32(device float *q [[buffer(0)]],             // [T, q_heads, hd]
+                              device const float *k_raw [[buffer(1)]],   // [T, kv_heads, hd]
+                              device const float *v_raw [[buffer(2)]],   // [T, kv_heads, hd]
+                              device const ushort *q_norm [[buffer(3)]], // BF16 [hd]
+                              device const ushort *k_norm [[buffer(4)]], // BF16 [hd]
+                              device float *k_cache [[buffer(5)]],
+                              device float *v_cache [[buffer(6)]],
+                              constant QkvNormRopeParams &p [[buffer(7)]],
+                              uint2 tg [[threadgroup_position_in_grid]],
+                              uint tid [[thread_index_in_threadgroup]],
+                              uint lane [[thread_index_in_simdgroup]],
+                              uint simd_id [[simdgroup_index_in_threadgroup]]) {
+    constexpr uint THREADS = APEX_HEAD_NORM_THREADS;
+    const uint token = tg.x;
+    const uint slot = tg.y;
+    const uint hd = p.head_dim;
+    const uint pos = p.pos0 + token;
 
-    const uint token = group.x;
-    const uint head = group.y;
+    // Pick the row this threadgroup normalizes and where it goes.
+    device const float *input;
+    device float *output;
+    device const ushort *weight = nullptr; // nullptr: plain RMSNorm (v_norm)
+    bool rope = true;
+    if (slot < p.q_heads) {
+        input = q + (token * p.q_heads + slot) * hd;
+        output = q + (token * p.q_heads + slot) * hd;
+        weight = q_norm;
+    } else if (slot < p.q_heads + p.kv_heads) {
+        const uint kv = slot - p.q_heads;
+        input = k_raw + (token * p.kv_heads + kv) * hd;
+        output = k_cache + (kv * p.capacity + pos) * hd;
+        weight = k_norm;
+    } else {
+        const uint kv = slot - p.q_heads - p.kv_heads;
+        input = v_raw + (token * p.kv_heads + kv) * hd;
+        output = v_cache + (kv * p.capacity + pos) * hd;
+        rope = false;
+    }
 
-    input += (token * heads + head) * head_dim;
-    output += token * out_token_stride + head * out_head_stride;
-
+    // RMSNorm over head_dim.
+    threadgroup float scratch[32];
     float ss = 0.0f;
-    for (uint i = tid; i < head_dim; i += 256) {
-        ss += input[i]* input[i];
+    for (uint i = tid; i < hd; i += THREADS) {
+        ss += input[i] * input[i];
     }
-    ss = simd_sum(ss);
-    threadgroup float partial [8]; // sum up every simd group in tg
-    if (lane == 0) {
-        partial[simd_id] = ss;
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (simd_id == 0) {
-        float v = (lane < 8) ? partial[lane] : 0;
-        v = simd_sum(v); // use 8 lanes to sum up values from partial
-        if (lane == 0) partial[0] = v; // put total sum in 0
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    const float inv = rsqrt(partial[0] / float(head_dim) + eps);
+    ss = threadgroupSum(ss, scratch, lane, simd_id, THREADS / 32);
+    const float inv = rsqrt(ss / float(hd) + p.eps);
 
-    threadgroup float row[512]; // shared threadgroup memory
-    for (uint i = tid; i < head_dim; i += 256) { // 256 threads in tg
-        const float w = has_weight ? as_type<float>(uint(weight[i]) << 16) : 1.0f;
-        row[i] = input[i] * inv * w;
+    // Normalized row staged in threadgroup memory: RoPE pairs (i, i + half) are owned by
+    // different threads.
+    threadgroup float row[APEX_MAX_HEAD_DIM];
+    for (uint i = tid; i < hd; i += THREADS) {
+        const float x = input[i] * inv;
+        row[i] = weight ? x * bf16ToFloat(weight[i]) : x;
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    // now we have the row in shared threadgroup memory and we need to do rotation. 
-    const uint half_dim = head_dim / 2;
-    // Rotation angle is per token and per pair. Each thread does one pair
-    if (tid < rope_pairs) {
-        const float pos = float(abs_pos + token);
-        // frequency  = inner then we mutliply by pos for angle.
-        const float angle = pos * pow(rope_base, -2.0f * float(tid) / float(head_dim));
-
-        const float c = cos(angle);
-        const float s = sin(angle);
-        const float a = row[tid];
-        const float b = row[half_dim + tid];
-
-        row[tid] = a * c - b * s;
-        row[half_dim + tid] = a * s + b * c;
+    if (rope) {
+        const uint half_dim = hd / 2;
+        for (uint i = tid; i < p.rope_pairs; i += THREADS) {
+            const float angle = float(pos) * pow(p.rope_base, -2.0f * float(i) / float(hd));
+            const float c = cos(angle);
+            const float s = sin(angle);
+            const float a = row[i];
+            const float b = row[half_dim + i];
+            row[i] = a * c - b * s;
+            row[half_dim + i] = a * s + b * c;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
     }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    for (uint i = tid; i < head_dim; i += 256) {
+    for (uint i = tid; i < hd; i += THREADS) {
         output[i] = row[i];
     }
 }
