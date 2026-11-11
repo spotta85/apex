@@ -12,7 +12,20 @@ where the GPU will read them, with no upload step.
 
 ## Status
 
-Currently writing the Attention Kernels. 
+All kernels and the forward pass are written (resident engine, one command buffer per
+forward call, fp16 KV cache with ring buffers for the sliding layers). Every stage is
+parity-checked against the mlx-lm dumps; the full forward pass has been checked in
+layer-streamed mode only.
+
+```bash
+P=/Users/spotta/Desktop/models/gemma4/packed
+./build/apex test-attn-synth $P                    # ring/window/rollback, synthetic
+./build/apex test-attn|test-router|test-moe|test-tail|test-mlp|test-norm $P dumps/paris
+./build/apex test-forward $P dumps/paris [f16]     # full forward, one layer file at a time
+./build/apex generate $P --ids dumps/paris/ids.npy --max-tokens 64   # resident: ~14 GB
+(cd tools && uv run chat_ids.py encode "your prompt" -o /tmp/ids.txt)  # then --ids /tmp/ids.txt
+(cd tools && uv run chat_ids.py decode 818,5279,...)                   # the printed ids
+```
 
 ## Build
 
