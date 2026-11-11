@@ -90,7 +90,10 @@ class Ops {
           qkv_norm_rope_(backend.kernel("qkv_norm_rope_f32")),
           attention_(backend.kernel("attention_f32")), router_(backend.kernel("router_f32")),
           expert_gate_up_(backend.kernel("expert_gate_up_nvfp4")),
-          expert_down_(backend.kernel("expert_down_nvfp4")) {}
+          expert_down_(backend.kernel("expert_down_nvfp4")),
+          embed_norm_(backend.kernel("embed_norm_nvfp4")),
+          attn_residual_(backend.kernel("attn_residual_norms_f32")),
+          layer_tail_(backend.kernel("layer_tail_f32")), argmax_(backend.kernel("argmax_f32")) {}
 
     Backend &backend() { return backend_; }
 
@@ -253,7 +256,61 @@ class Ops {
                      Dim3{APEX_MATMUL_ROWS_PER_GROUP * 32});
     }
 
+    /// h [tokens, hidden] = embed_tokens[ids] * sqrt(hidden); x = norm(h, norm_w).
+    /// ids is a GPU buffer of uint32 token ids.
+    void embedNorm(Buffer *ids, const Nvfp4Matrix &embed, Buffer *norm_w, size_t norm_offset,
+                   Buffer *h, Buffer *x, uint32_t tokens, float eps) {
+        checkHidden(embed.hidden_dim);
+        const RowParams p{embed.hidden_dim, eps, std::sqrt(float(embed.hidden_dim)), tokens};
+        backend_.run(embed_norm_,
+                     {Arg::buf(ids), Arg::buf(embed.weights, embed.weights_offset),
+                      Arg::buf(embed.scales, embed.scales_offset), Arg::buf(norm_w, norm_offset),
+                      Arg::buf(h), Arg::buf(x), Arg::val(p)},
+                     Dim3{tokens}, Dim3{APEX_ROW_THREADS});
+    }
+
+    /// h += norm(o, post_attn); x_mlp = norm(h, pre_ffn); x_moe = norm(h, pre_ffn_2).
+    /// The three weights are offsets into `norms` (the core buffer).
+    void attnResidualNorms(Buffer *o, Buffer *h, Buffer *norms, size_t post_attn,
+                           size_t pre_ffn, size_t pre_ffn_2, Buffer *x_mlp, Buffer *x_moe,
+                           uint32_t tokens, uint32_t hidden, float eps) {
+        checkHidden(hidden);
+        const RowParams p{hidden, eps, 0.0f, tokens};
+        backend_.run(attn_residual_,
+                     {Arg::buf(o), Arg::buf(h), Arg::buf(norms, post_attn),
+                      Arg::buf(norms, pre_ffn), Arg::buf(norms, pre_ffn_2), Arg::buf(x_mlp),
+                      Arg::buf(x_moe), Arg::val(p)},
+                     Dim3{tokens}, Dim3{APEX_ROW_THREADS});
+    }
+
+    /// f = norm(dense, post_1) + norm(moe, post_2); h = (h + norm(f, post)) * scalar;
+    /// x = norm(h, next_norm). All weights are offsets into `norms` (the core buffer).
+    void layerTail(Buffer *dense, Buffer *moe, Buffer *h, Buffer *norms, size_t post_1,
+                   size_t post_2, size_t post, size_t layer_scalar, size_t next_norm, Buffer *x,
+                   uint32_t tokens, uint32_t hidden, float eps) {
+        checkHidden(hidden);
+        const RowParams p{hidden, eps, 0.0f, tokens};
+        backend_.run(layer_tail_,
+                     {Arg::buf(dense), Arg::buf(moe), Arg::buf(h), Arg::buf(norms, post_1),
+                      Arg::buf(norms, post_2), Arg::buf(norms, post),
+                      Arg::buf(norms, layer_scalar), Arg::buf(norms, next_norm), Arg::buf(x),
+                      Arg::val(p)},
+                     Dim3{tokens}, Dim3{APEX_ROW_THREADS});
+    }
+
+    /// out[t] = argmax(logits[t, :cols]) as uint32, lowest index on ties.
+    void argmax(Buffer *logits, Buffer *out, uint32_t tokens, uint32_t cols) {
+        const ArgmaxParams p{cols};
+        backend_.run(argmax_, {Arg::buf(logits), Arg::buf(out), Arg::val(p)}, Dim3{tokens},
+                     Dim3{APEX_ARGMAX_THREADS});
+    }
+
   private:
+    static void checkHidden(uint32_t hidden) {
+        if (hidden > APEX_MAX_HIDDEN || hidden % 16)
+            throw std::runtime_error("row kernel: hidden size outside APEX_MAX_HIDDEN");
+    }
+
     Backend &backend_;
     Kernel *rms_norm_;
     Kernel *matmul_;
@@ -263,6 +320,10 @@ class Ops {
     Kernel *router_;
     Kernel *expert_gate_up_;
     Kernel *expert_down_;
+    Kernel *embed_norm_;
+    Kernel *attn_residual_;
+    Kernel *layer_tail_;
+    Kernel *argmax_;
 };
 
 } // namespace apex
